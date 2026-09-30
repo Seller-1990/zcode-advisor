@@ -541,3 +541,29 @@ test('inject.js：window.__ZCODE_ADVISOR_ANCHOR 可覆盖模式（便于试用�
   assert.ok(badge, '应创建角标');
   assert.ok(dom.byId.get('zca-topbar'), '运行时覆盖应优先于注入期默认值');
 });
+
+// ---------------- 端点归一化：controller 与 hook 两端规则一致 ----------------
+// 用户实测报告 Ping 404：配置 baseUrl 填 `http://host:port/v1`（面板 placeholder 就是这么引导的），
+// controller.ping() 直接 POST 该地址 → 打到 /v1 本身 → 404。
+// 这里锁住两端规则一致，避免只修一处造成行为漂移。
+
+test('controller / reviewer 的端点归一化规则一致（修复 Ping 404）', () => {
+  const ctrl = require('../tools/companion/controller.cjs');
+  const { normalizeChatEndpoint: hookNorm } = require('../hooks/lib/reviewer.js');
+  const ctrlNorm = ctrl.normalizeChatEndpoint;
+
+  const cases = [
+    'http://192.168.50.139:8788/v1',
+    'http://192.168.50.139:8788/v1/chat/completions',
+    'https://open.bigmodel.cn/api/paas/v4',
+    'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    'https://x.com/v1/',
+    ''
+  ];
+  for (const c of cases) {
+    assert.strictEqual(ctrlNorm(c), hookNorm(c), `两端对 ${JSON.stringify(c)} 的归一化应一致`);
+  }
+  // 关键行为：基地址必须补全
+  assert.strictEqual(ctrlNorm('http://192.168.50.139:8788/v1'),
+    'http://192.168.50.139:8788/v1/chat/completions', '基地址应补全路径');
+});

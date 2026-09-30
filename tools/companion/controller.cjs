@@ -320,9 +320,25 @@ function cors(res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
 }
 
+// 端点归一化（与 hooks/lib/reviewer.js 的 normalizeChatEndpoint 保持同一规则）。
+// 为什么这里也需要：配置面板的 placeholder 引导用户填 `https://…/v1` 这类基地址，
+// 但早期实现直接 POST baseUrl —— 请求打到 `/v1` 本身，端点返回 404，
+// 用户看到的是误导性的「模型 id 或端点路径不对」（实测复现）。
+// 两处独立实现是刻意的：controller 与 hook 各自是独立进程，不共享模块加载路径；
+// 规则若变更需同步修改（本地已有测试覆盖两端）。
+function normalizeChatEndpoint(baseUrl) {
+  const u = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (!u) return '';
+  if (/\/chat\/completions$/i.test(u)) return u;
+  if (/\/messages$/i.test(u)) return u;   // Anthropic 协议端点不改写
+  return `${u}/chat/completions`;
+}
+
 async function ping(body) {
   const cfg = readUserConfig();
-  const baseUrl = body.baseUrl || cfg.baseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
+  const baseUrl = normalizeChatEndpoint(
+    body.baseUrl || cfg.baseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+  );
   const model = body.model || cfg.model || 'glm-5.3-flash';
   const apiKey = body.apiKey || cfg.apiKey || '';
   const t0 = Date.now();
@@ -338,7 +354,7 @@ async function ping(body) {
     clearTimeout(t);
     if (!r.ok) {
       const hint = r.status === 401 || r.status === 403 ? 'key 无效或无权限' : (r.status === 404 || r.status === 400 ? '模型 id 或端点路径不对' : '');
-      return { ok: false, error: `llm_http_${r.status}`, hint };
+      return { ok: false, error: `llm_http_${r.status}`, hint, endpoint: baseUrl };
     }
     const note = '；响应体为空是 max_tokens=1 下的正常现象';
     return { ok: true, ms: Date.now() - t0, note };
@@ -488,4 +504,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { findZcodePath, main };
+module.exports = { findZcodePath, normalizeChatEndpoint, main };
