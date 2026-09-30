@@ -30,14 +30,17 @@ function version4(v) {
 // "no files found" —— makensis 对「绝对路径 + 通配符」的组合在 Windows 上解析不可靠。
 // 改为把 .nsi 放在 srcDir 的**父目录**、引用相对路径 `SRCFILES\*.*`，
 // 并让 makensis 以脚本所在目录为工作目录（cd 到该目录再调用），两侧一致后解析稳定。
+//
+// **srcDirName 必须等于 srcDir 的 basename**：三者（.nsi 位置 / SRCFILES / 实际目录）
+// 不一致就会出现 "no files found"——实测踩过（目录叫 .stage-win-nsis 而脚本里写的 stage）。
 function nsisScript(opts) {
-  const { outFile, iconPath, version } = opts;
+  const { outFile, iconPath, srcDirName, version } = opts;
   return `Unicode true
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 
-; 待打包目录（相对本脚本）：由构建脚本保证 .nsi 与 srcDir 同级
-!define SRCFILES "stage"
+; 待打包目录（相对本脚本）：由构建脚本保证与 .nsi 同级
+!define SRCFILES "${srcDirName}"
 
 Name "ZCode Advisor"
 OutFile "${outFile}"
@@ -123,8 +126,10 @@ function buildNsisInstaller(opts) {
   const { workDir, srcDir, iconPath, version, outFile } = opts;
   fs.mkdirSync(workDir, { recursive: true });
 
-  // 脚本写到 srcDir 的**父目录**，使 File /r 的相对路径（stage\*.*）可解析。
-  // 背景见 nsisScript 的注释：绝对路径 + 通配符在 Windows 的 makensis 上解析不可靠。
+  // 脚本写到 srcDir 的**父目录**，使 File /r 的相对路径可解析。
+  // SRCFILES 用 srcDir 的 basename——三者（.nsi 位置 / SRCFILES / 实际目录）必须一致，
+  // 否则 makensis 报 "no files found"（实测踩过：目录名与脚本内写的不一致）。
+  const srcDirName = path.basename(srcDir);
   const nsiPath = path.join(path.dirname(srcDir), `zcode-advisor-${version}.nsi`);
   const iconRel = path.relative(path.dirname(nsiPath), iconPath).replace(/\\/g, '/');
 
@@ -135,6 +140,7 @@ function buildNsisInstaller(opts) {
   const nsiSource = Buffer.from(nsisScript({
     outFile: outFile.replace(/\\/g, '/'),
     iconPath: iconRel,
+    srcDirName,
     version
   }), 'utf8');
   fs.writeFileSync(nsiPath, Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), nsiSource]));

@@ -37,6 +37,7 @@ test('nsisScript：构建期路径用正斜杠、含关键段落与卸载项', (
   const script = P.nsisScript({
     outFile: 'C:/out/setup.exe',
     iconPath: 'stage/advisor.ico',
+    srcDirName: 'stage',
     version: '0.2.0'
   });
   // 说明：脚本中会有 `$LOCALAPPDATA\ZCodeAdvisor` 这类 **Windows 目标路径**（反斜杠是语义要求）。
@@ -44,6 +45,7 @@ test('nsisScript：构建期路径用正斜杠、含关键段落与卸载项', (
   // （CI 实测 "no files found"，导致 setup.exe 静默缺失）。
   assert.match(script, /OutFile "C:\/out\/setup\.exe"/);
   assert.match(script, /!define MUI_ICON "stage\/advisor\.ico"/);
+  // srcDirName 由调用方传入（必须等于实际目录的 basename）
   assert.match(script, /!define SRCFILES "stage"/);
   assert.match(script, /File \/r "\$\{SRCFILES\}\\\*\.\*"/);
   assert.match(script, /Unicode true/);
@@ -54,7 +56,7 @@ test('nsisScript：构建期路径用正斜杠、含关键段落与卸载项', (
 });
 
 test('nsisScript：快捷方式指向原始 node.exe 且最小化显示（非隐藏）', () => {
-  const script = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', version: '1.0.0' });
+  const script = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', srcDirName: 'stage', version: '1.0.0' });
   // 不改名：直接指向 bin\node.exe
   assert.match(script, /CreateShortCut "\$DESKTOP\\ZCode Advisor\.lnk" "\$INSTDIR\\bin\\node\.exe"/);
   // SW_SHOWMINIMIZED (=7)，不隐藏控制台
@@ -63,7 +65,7 @@ test('nsisScript：快捷方式指向原始 node.exe 且最小化显示（非隐
 });
 
 test('nsisScript：卸载保留用户级配置（含 API key，不静默删除）', () => {
-  const script = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', version: '1.0.0' });
+  const script = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', srcDirName: 'stage', version: '1.0.0' });
   assert.match(script, /Section "Uninstall"/);
   assert.match(script, /卸载保留用户级配置/);
   // 只看实际删除指令（注释里提到 .zcode 是说明，不是行为）：
@@ -128,7 +130,7 @@ test('buildNsisInstaller：写出的 .nsi 带 UTF-8 BOM（含中文时的编码�
 });
 
 test('nsisScript：脚本含中文（这正是必须带 BOM 的原因）', () => {
-  const s = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', version: '1.0.0' });
+  const s = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', srcDirName: 'stage', version: '1.0.0' });
   assert.ok(/[\u4e00-\u9fff]/.test(s), '脚本应含中文（否则 BOM 就不必要了）');
 });
 
