@@ -16,8 +16,9 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const { modelsUrl, parseModels } = require('./lib.cjs');
+const { detectZcodePath, missingHint } = require('./zcode-path.cjs');
 
 const HOME = os.homedir();
 const USER_CONFIG = process.env.ZCODE_ADVISOR_USER_CONFIG || path.join(HOME, '.zcode', 'advisor.config.json');
@@ -71,19 +72,31 @@ function readCompanionConfig() {
   }
 }
 
-function detectZcodePath() {
-  const cfg = readCompanionConfig();
-  const candidates = [
-    process.env.ZCODE_ADVISOR_ZCODE_PATH,
-    cfg.zcodePath,
-    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'ZCode', 'ZCode.exe'),
-    'C:\\Program Files\\ZCode\\ZCode.exe',
-    'C:\\Program Files (x86)\\ZCode\\ZCode.exe'
-  ].filter(Boolean);
-  for (const c of candidates) {
-    try { if (fs.existsSync(c) && fs.statSync(c).isFile()) return c; } catch (_) {}
+// Spotlight 兜底：仅在 macOS 且候选链全部落空时调用（5s 超时，失败即放弃）。
+function spotlightFindZcode() {
+  if (process.platform !== 'darwin') return '';
+  try {
+    const out = execSync("mdfind \"kMDItemFSName == 'ZCode.app'\"", {
+      encoding: 'utf8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
+    const first = String(out || '').split('\n').map((s) => s.trim()).filter(Boolean)[0];
+    return first || '';
+  } catch (_) {
+    return '';
   }
-  return '';
+}
+
+// 探测 ZCode 可执行文件（平台分支见 zcode-path.cjs，含 macOS .app 解析）。
+function findZcodePath() {
+  const cfg = readCompanionConfig();
+  return detectZcodePath({
+    platform: process.platform,
+    env: process.env,
+    config: cfg,
+    deps: { fs, path, os, existsSync: fs.existsSync, statSync: fs.statSync, readFileSync: fs.readFileSync, homedir: os.homedir, mdfind: spotlightFindZcode }
+  });
 }
 
 async function fetchJson(url, timeoutMs) {
@@ -107,12 +120,32 @@ async function portReachable(port) {
 }
 
 // —— CDP 附着 ——
+// 依赖全局 WebSocket：Node 22+ 默认提供（v21 需 --experimental-websocket 标志）。
+// 运行时版本守卫放在 main() 内（而非模块顶层），这样 require 冒烟校验/单测
+// 仍能在低版本 Node 上安全加载本模块。
 const attached = new Map(); // targetId -> WebSocket
+const scriptIds = new Map(); // targetId -> [scriptId]（addScriptToEvaluateOnNewDocument 的句柄）
+const pendingPersistent = new Set(); // 等待 Page.enable ack 后才注册持久脚本的 target
 let injectSource = '';
 
+// 补强通道：直接在当前文档执行一次（覆盖"附着时文档已存在"的场景）。
 function injectInto(ws) {
   try {
     ws.send(JSON.stringify({ id: Date.now() % 1e7, method: 'Runtime.evaluate', params: { expression: injectSource, returnByValue: false, userGesture: true } }));
+  } catch (_) {}
+}
+
+// 主通道：addScriptToEvaluateOnNewDocument —— 每次新文档创建时自动执行。
+// 相比只靠 Page.loadEventFired，这条通道能覆盖页面导航与部分新窗口场景
+// （原实现在新开窗口时可能漏注入）。幂等由注入脚本内的
+// window.__zcodeAdvisorInjected 守卫保证，重复执行不会插出多个角标。
+function addPersistentScript(ws) {
+  try {
+    ws.send(JSON.stringify({
+      id: 3,
+      method: 'Page.addScriptToEvaluateOnNewDocument',
+      params: { source: injectSource, runImmediately: false }
+    }));
   } catch (_) {}
 }
 
@@ -125,16 +158,40 @@ function attachTarget(target) {
     try {
       ws.send(JSON.stringify({ id: 1, method: 'Runtime.enable' }));
       ws.send(JSON.stringify({ id: 2, method: 'Page.enable' }));
+      // 当前文档立即注入（不依赖 Page 域，Runtime.evaluate 即可）
       injectInto(ws);
+      // 持久脚本的注册放到 Page.enable 的 ack 之后（见 message 处理），
+      // 不依赖"CDP 按序处理同一连接消息"这一实现细节。
+      pendingPersistent.add(target.id);
     } catch (_) {}
   });
   ws.addEventListener('message', (ev) => {
     try {
       const m = JSON.parse(typeof ev.data === 'string' ? ev.data : ev.data.toString());
-      if (m.method === 'Page.loadEventFired') injectInto(ws); // 刷新后重注入
+      // Page.enable 已生效 → 注册持久脚本（覆盖后续新建文档/新窗口）
+      if (m.id === 2 && pendingPersistent.has(target.id)) {
+        pendingPersistent.delete(target.id);
+        addPersistentScript(ws);
+      }
+      // 记录 scriptId 便于排错（如宿主拒绝该命令）
+      if (m.id === 3) {
+        if (m.result && m.result.identifier) {
+          const list = scriptIds.get(target.id) || [];
+          list.push(m.result.identifier);
+          scriptIds.set(target.id, list);
+          // 成功也要留痕：否则"持久注入静默失效"时日志与正常情况无法区分
+          log(`持久注入已注册（scriptId ${m.result.identifier}）：新窗口/导航后角标自动恢复`);
+        } else {
+          log(`warn: addScriptToEvaluateOnNewDocument 未返回 identifier：${JSON.stringify(m.result)}`);
+        }
+      }
+      if (m.error && m.id === 3) {
+        log(`warn: addScriptToEvaluateOnNewDocument 被拒绝：${m.error.message || JSON.stringify(m.error)}`);
+      }
+      if (m.method === 'Page.loadEventFired') injectInto(ws); // 刷新/导航后补注入
     } catch (_) {}
   });
-  ws.addEventListener('close', () => attached.delete(target.id));
+  ws.addEventListener('close', () => { attached.delete(target.id); scriptIds.delete(target.id); pendingPersistent.delete(target.id); });
   ws.addEventListener('error', () => {});
 }
 
@@ -177,11 +234,16 @@ async function ensureCdp() {
       return p;
     }
   }
-  const zcodePath = detectZcodePath();
+  const found = findZcodePath();
+  const zcodePath = found.path || '';
   if (!zcodePath) {
-    console.error('未找到 ZCode.exe。请在 ' + COMPANION_CONFIG + ' 中填写：\n  { "zcodePath": "C:/Users/<你>/AppData/Local/Programs/ZCode/ZCode.exe" }');
+    if (found.invalid) {
+      console.error(`配置的 zcodePath 无效：${found.invalid.value}（解析为 ${found.invalid.resolved}，文件不存在）`);
+    }
+    console.error(missingHint(process.platform, COMPANION_CONFIG));
     process.exit(1);
   }
+  log(`ZCode 可执行文件：${zcodePath}（来源：${found.source}）`);
   let port = cfg.port && cfg.port >= CDP_PORT_RANGE[0] && cfg.port <= CDP_PORT_RANGE[1] ? cfg.port : CDP_PORT_RANGE[0];
   for (; port <= CDP_PORT_RANGE[1]; port++) {
     try {
@@ -196,7 +258,23 @@ async function ensureCdp() {
     process.exit(1);
   }
   log(`以调试端口 ${port} 启动 ZCode：${zcodePath}`);
-  spawn(zcodePath, [`--remote-debugging-port=${port}`], { detached: true, stdio: 'ignore' }).unref();
+  // 启动 ZCode 的环境变量纪律（实测踩过）：
+  //   父进程若带 ELECTRON_RUN_AS_NODE=1，ZCode 的 Electron 主二进制会被当成 Node
+  //   解释器启动——报 "bad option: --remote-debugging-port" 并随即退出，CDP 永远起不来。
+  //   （我们在 dsh 环境里正是这个变量被置位。）因此显式剥离该变量再启动。
+  const childEnv = Object.assign({}, process.env);
+  delete childEnv.ELECTRON_RUN_AS_NODE;
+  // 同时清掉其它会干扰 Electron 语义的变量，避免同类问题再次出现。
+  delete childEnv.ELECTRON_NO_ATTACH_CONSOLE;
+  delete childEnv.ELECTRON_ENABLE_LOGGING;
+
+  spawn(zcodePath, [`--remote-debugging-port=${port}`], {
+    detached: true,
+    stdio: 'ignore',
+    // macOS 上切到 app 的 MacOS 目录启动，与 zcode+ 的真机做法一致
+    cwd: process.platform === 'darwin' ? path.dirname(zcodePath) : undefined,
+    env: childEnv
+  }).unref();
   const deadline = Date.now() + CDP_LAUNCH_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (await portReachable(port)) {
@@ -369,20 +447,45 @@ async function pickApiPort() {
 }
 
 async function main() {
+  // 版本守卫：依赖全局 WebSocket（Node 22+ 默认提供，v21 需 --experimental-websocket）。
+  // 放在这里而非模块顶层，使 require（冒烟校验/单测）不受影响。
+  if (typeof WebSocket !== 'function') {
+    const major = parseInt(String(process.versions.node).split('.')[0], 10);
+    console.error(
+      `zcode-advisor companion 需要 Node 22 及以上（当前 ${process.versions.node}）。\n` +
+      (major < 22 ? '原因：依赖全局 WebSocket，Node 21 需 --experimental-websocket，22 起默认提供。\n' : '') +
+      '请升级 Node 后重试（审查 hook 本身仍只需 Node ≥ 18）。'
+    );
+    process.exit(1);
+  }
+
   acquireLock();
   injectSource = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
   log('zcode-advisor 输入框角标外挂启动');
   const cdpPort = await ensureCdp();
   const apiPort = await pickApiPort();
   const token = crypto.randomBytes(16).toString('hex');
-  injectSource = injectSource.replace(/__API_PORT__/g, String(apiPort)).replace(/__TOKEN__/g, token);
+  // 角标固定位置：'composer'（输入框工具栏右侧）或 'topbar'（任务窗口上边）。
+  // 通过 companion 配置的 anchorMode 下发（默认 composer），用户二选一改配置即可，无需改代码。
+  const cfg = readCompanionConfig();
+  const anchorMode = cfg.anchorMode === 'topbar' ? 'topbar' : 'composer';
+  injectSource = injectSource
+    .replace(/__API_PORT__/g, String(apiPort))
+    .replace(/__TOKEN__/g, token)
+    .replace(/__ANCHOR_MODE__/g, anchorMode);
+  log(`角标位置：${anchorMode === 'topbar' ? '任务窗口上边' : '输入框工具栏右侧'}（可在 ${COMPANION_CONFIG} 用 "anchorMode" 切换）`);
   startApi(cdpPort, apiPort, token);
   log('每 3 秒全端口段重扫并保持角标注入（Ctrl+C 退出；与其他 CDP 外挂如 zcode-plus 可共存）');
   await rescan();
   setInterval(() => rescan(), POLL_INTERVAL_MS);
 }
 
-main().catch((err) => {
-  console.error(`companion 异常退出：${err && err.stack ? err.stack : err}`);
-  process.exit(1);
-});
+// 仅在被直接执行时启动；被 require（构建期冒烟校验、单测）时只加载模块。
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`companion 异常退出：${err && err.stack ? err.stack : err}`);
+    process.exit(1);
+  });
+}
+
+module.exports = { findZcodePath, main };

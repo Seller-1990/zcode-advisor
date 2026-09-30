@@ -3,41 +3,120 @@
 // 角标与面板均为固定定位悬浮层（输入框区域右下角），DOM 变化不影响。
 // 通信：直接 fetch 本机 controller API（127.0.0.1，CORS 已放行）。
 (() => {
-  if (window.__zcodeAdvisorInjected) return;
-  window.__zcodeAdvisorInjected = true;
-
-  const API = `http://127.0.0.1:${window.__ZCODE_ADVISOR_API_PORT || __API_PORT__}`;
   const TOKEN = '__TOKEN__';
+  const API = `http://127.0.0.1:${window.__ZCODE_ADVISOR_API_PORT || __API_PORT__}`;
+
+  // 幂等守卫带**令牌版本**：
+  // 早期实现只检查 __zcodeAdvisorInjected 布尔量，导致 controller 重启后
+  // （新令牌、可能新端口）新脚本被旧标记挡在门外——页面继续用**过期令牌**调 API，
+  // 一律 403 bad_token，面板显示"无法连接本机 controller（外挂未运行？）"，
+  // 用户必须手动刷新页面才能恢复。
+  // 现在：令牌一致才跳过；不一致则清理旧注入并用新令牌重建。
+  if (window.__zcodeAdvisorInjected && window.__zcodeAdvisorToken === TOKEN) return;
+  if (window.__zcodeAdvisorInjected && window.__zcodeAdvisorToken !== TOKEN) {
+    // 清理上一次注入留下的元素与样式，避免叠加出多个角标
+    for (const id of ['zca-badge', 'zca-panel', 'zca-style']) {
+      const old = document.getElementById(id);
+      if (old) old.remove();
+    }
+  }
+  window.__zcodeAdvisorInjected = true;
+  window.__zcodeAdvisorToken = TOKEN;
 
   const css = `
-.zca-badge{position:fixed;right:18px;bottom:96px;z-index:2147483000;width:44px;height:44px;border-radius:50%;
- background:linear-gradient(135deg,#1e293b,#334155);color:#e2e8f0;border:1px solid #475569;cursor:pointer;
- display:flex;align-items:center;justify-content:center;font-size:20px;box-shadow:0 4px 14px rgba(0,0,0,.35);
- user-select:none;opacity:.88;transition:opacity .15s, transform .15s}
-.zca-badge:hover{opacity:1;transform:scale(1.06)}
-.zca-panel{position:fixed;right:18px;bottom:148px;z-index:2147483001;width:340px;max-height:72vh;overflow:auto;
- background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:12px;padding:14px 16px;
- box-shadow:0 12px 32px rgba(0,0,0,.5);font:13px/1.5 "Segoe UI","Microsoft YaHei",sans-serif}
-.zca-panel h3{margin:0 0 4px;font-size:14px;display:flex;justify-content:space-between;align-items:center}
-.zca-close{cursor:pointer;color:#94a3b8;font-size:16px;padding:0 4px}
-.zca-label{display:block;margin:10px 0 3px;color:#94a3b8;font-size:12px}
-.zca-panel input,.zca-panel select{width:100%;box-sizing:border-box;padding:6px 8px;border-radius:6px;
- border:1px solid #334155;background:#1e293b;color:#e2e8f0;font-size:13px}
-.zca-row{display:flex;gap:8px;margin-top:12px}
-.zca-btn{flex:1;padding:7px 0;border:0;border-radius:6px;cursor:pointer;font-size:13px;
- background:#2563eb;color:#fff}
-.zca-btn.alt{background:#334155}
-.zca-msg{margin-top:10px;padding:8px;border-radius:6px;display:none;white-space:pre-wrap;font-size:12px}
-.zca-ok{background:#052e1b;border:1px solid #14532d;color:#86efac}
-.zca-bad{background:#3f1d1d;border:1px solid #7f1d1d;color:#fca5a5}
-.zca-status{margin:6px 0 2px;padding:6px 8px;background:#1e293b;border-radius:6px;color:#94a3b8;font-size:12px;word-break:break-all}
+/* 角标：锚定在输入框工具栏右侧，与 zcode+ 的 ✨ 并列，而非悬浮遮挡内容。
+   内联到工具栏容器里，尺寸与原生图标按钮一致（28px 高），视觉更精简。 */
+.zca-badge{display:inline-flex;align-items:center;justify-content:center;
+ width:28px;height:28px;padding:0;margin:0;border-radius:8px;cursor:pointer;
+ background:transparent;color:currentColor;border:1px solid transparent;opacity:.72;
+ transition:opacity .15s,background-color .15s,transform .12s;user-select:none;flex:0 0 auto}
+.zca-badge:hover{opacity:1;background:rgba(127,127,127,.16);transform:scale(1.06)}
+.zca-badge:active{transform:scale(.94)}
+/* 兜底：找不到锚点时退回右下角悬浮（不遮挡输入框） */
+.zca-badge.zca-floating{position:fixed;right:18px;bottom:96px;width:36px;height:36px;border-radius:50%;
+ background:rgba(30,41,59,.92);color:#e2e8f0;box-shadow:0 4px 14px rgba(0,0,0,.35);opacity:.9;z-index:2147483000}
+/* topbar 模式：角标做成顶部常驻条，贴在应用主区域上沿 */
+.zca-topbar{display:flex;align-items:center;justify-content:flex-end;gap:8px;
+ padding:2px 10px;flex:0 0 auto;pointer-events:none}
+.zca-topbar > *{pointer-events:auto}
+.zca-badge.zca-topbar-badge{width:auto;height:28px;padding:0 10px;border-radius:8px;gap:6px;
+ border:1px solid rgba(127,127,127,.28);background:rgba(127,127,127,.10);opacity:.9;font-size:12px}
+.zca-badge.zca-topbar-badge .zca-label-text{font-weight:500;letter-spacing:.2px}
+.zca-panel{position:fixed;width:360px;max-height:76vh;overflow:auto;z-index:2147483001;
+ right:16px;bottom:140px;
+ background:#1c1f26;color:#e6e8ec;border:1px solid #333842;border-radius:14px;padding:14px 16px 16px;
+ box-shadow:0 14px 40px rgba(0,0,0,.45);font:13px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.zca-panel h3{margin:0 0 10px;font-size:14px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+.zca-close{cursor:pointer;color:#8b94a3;font-size:15px;line-height:1;padding:4px 6px;border-radius:6px}
+.zca-close:hover{background:rgba(127,127,127,.16);color:#e6e8ec}
+.zca-label{display:block;margin:10px 0 4px;color:#8b94a3;font-size:12px}
+.zca-panel input,.zca-panel select{width:100%;box-sizing:border-box;padding:7px 9px;border-radius:8px;
+ border:1px solid #333842;background:#242833;color:#e6e8ec;font-size:13px;outline:none}
+.zca-panel input:focus,.zca-panel select:focus{border-color:#3b82f6}
+.zca-panel select option{background:#242833;color:#e6e8ec}
+.zca-row{display:flex;gap:8px;margin-top:14px}
+.zca-btn{flex:1;padding:8px 0;border:1px solid transparent;border-radius:8px;cursor:pointer;font-size:13px;
+ background:#2563eb;color:#fff;transition:filter .15s}
+.zca-btn:hover{filter:brightness(1.08)}
+.zca-btn.alt{background:#2c313c;color:#e6e8ec;border-color:#3a4049}
+.zca-msg{margin-top:10px;padding:8px 10px;border-radius:8px;display:none;white-space:pre-wrap;font-size:12px}
+.zca-ok{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.35);color:#6ee7b7}
+.zca-bad{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:#fca5a5}
+.zca-status{margin:0 0 4px;padding:7px 9px;background:#242833;border-radius:8px;color:#8b94a3;font-size:12px;word-break:break-all}
+.zca-hint{color:#6b7280;font-size:11px;margin-top:8px}
+/* 面板在窗口较矮时上移到输入框上方，避免被裁掉 */
+@media (max-height: 620px){.zca-panel{bottom:auto;top:64px;max-height:calc(100vh - 96px)}}
 `;
+
+  // ────────────────────────────────────────────────────────────────
+  // 角标放置位置：**单一配置点**（用户可二选一，切换只改这一处）
+  //
+  // 两种模式：
+  //   'composer' — 固定在「输入框提示词优化图标右侧」：角标内联到输入框工具栏的
+  //                右侧按钮组，与 zcode+ 的 ✨ 并列，随输入框区域布局。
+  //   'topbar'   — 固定在「任务窗口上边」：角标做成顶部常驻的窄条/按钮，
+  //                贴在应用主区域上沿，始终可见、不随输入框滚动。
+  //
+  // 可通过 window.__ZCODE_ADVISOR_ANCHOR 覆盖（便于不改代码试另一种位置），
+  // 或在 controller 注入时替换 __ANCHOR_MODE__ 占位符（按配置文件统一下发）。
+  // ────────────────────────────────────────────────────────────────
+  const ANCHOR_MODE = (window.__ZCODE_ADVISOR_ANCHOR === 'topbar' || window.__ZCODE_ADVISOR_ANCHOR === 'composer')
+    ? window.__ZCODE_ADVISOR_ANCHOR
+    : '__ANCHOR_MODE__';   // 未覆盖时用注入期替换的值（默认 composer）
+
+  // 按模式给出锚点候选（按优先级）。ZCode 用 Tailwind，类名相对稳定。
+  const ANCHOR_SELECTORS = ANCHOR_MODE === 'topbar'
+    ? [
+      // 顶部区：优先主内容区上沿，其次整个应用根容器
+      'main > header', 'header', '[class*="titlebar"]', '[class*="top-bar"]',
+      'main', '#root', 'body'
+    ]
+    : [
+      // 输入框工具栏右侧按钮组 → 工具栏行 → 输入框外框（追加在末尾）
+      '.chat-composer-input-surface .ml-auto.flex.shrink-0.items-center.justify-end',
+      '.chat-composer-input-surface .flex.items-center.justify-between',
+      '.chat-composer-input-surface'
+    ];
+
+  // topbar 模式用于标记容器（角标需要包一层，才能作为常驻条显示）
+  const TOPBAR_WRAPPER_ID = 'zca-topbar';
 
   function el(tag, cls, text) {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
     if (text != null) e.textContent = text;
     return e;
+  }
+
+  // 注入样式表。**必须显式注入**：早期实现只定义了 css 常量却没有插入文档，
+  // 结果角标是无样式的裸 div——position:static 让它铺成视口底部的全宽文字条，
+  // 看上去"角标没出现"。此处的幂等守卫保证重复注入不产生多个 style 元素。
+  function ensureStyles() {
+    if (document.getElementById('zca-style')) return;
+    const style = document.createElement('style');
+    style.id = 'zca-style';
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
   }
 
   async function api(path, body) {
@@ -59,19 +138,43 @@
   async function refreshStatus() {
     try {
       const r = await api('/api/config');
-      if (!r.ok) return;
+      if (!r.ok) {
+        // 403/bad_token 的典型成因：controller 重启过（新令牌），而本页脚本还是旧令牌。
+        // 早期实现对此**静默 return**，面板永久停在"读取中…"，用户看不到任何线索。
+        const st = document.getElementById('zca-status');
+        if (st) st.textContent = `本机 controller 拒绝了本次请求（${r.error || '未知'}）`;
+        msg(
+          r.error === 'bad_token'
+            ? '令牌已失效（controller 重启过）。刷新 ZCode 页面即可恢复，或重新打开「ZCode Advisor」应用。'
+            : `无法连接本机 controller：${r.error || '未知错误'}`,
+          false
+        );
+        return;
+      }
       const c = r.config;
       const st = document.getElementById('zca-status');
       if (st) st.textContent = `模型 ${c.model || '（默认）'} ｜ key ${c.keyMasked} ｜ 模式 ${c.reviewMode || 'async'}`;
       const f = fill();
       if (f) {
-        if (f.model.value !== c.model && c.model) f.model.value = c.model;
+        // 模型值回填到下拉框：若 select 里没有该 id（尚未拉取或列表不含它），
+        // 就补一个条目，保证当前配置可见且保存时不会被静默改掉。
+        if (c.model) {
+          const sel = f.model;
+          if (sel && !Array.from(sel.options || []).some((o) => o.value === c.model)) {
+            const o = document.createElement('option');
+            o.value = c.model;
+            o.textContent = c.model;
+            sel.appendChild(o);
+          }
+          if (sel) sel.value = c.model;
+        }
         if (c.baseUrl) f.baseUrl.value = c.baseUrl;
         if (c.reviewMode) f.reviewMode.value = c.reviewMode;
         if (c.maxTokens) f.maxTokens.value = c.maxTokens;
       }
-    } catch (_) {
-      msg('无法连接本机 controller（外挂未运行？）', false);
+    } catch (err) {
+      // 网络层失败才可能是"外挂未运行"；此时把原因也带上，便于排查
+      msg(`无法连接本机 controller（外挂未运行？）：${err && err.message ? err.message : err}`, false);
     }
   }
 
@@ -82,14 +185,28 @@
       reviewMode: g('zca-reviewMode'), maxTokens: g('zca-maxTokens') };
   }
 
+  // 当前选中的审查模型 id：以下拉框为准，回落到手动输入框。
+  // 两个控件并存是因为 <select> 只能列出已拉取到的模型，而用户也可能想手填
+  // 一个列表里没有的 id（该端点不支持 /models 时只能手填）。
+  function currentModelId() {
+    const sel = document.getElementById('zca-model');
+    const manual = document.getElementById('zca-model-manual');
+    const fromSelect = sel && sel.value ? String(sel.value).trim() : '';
+    const fromManual = manual && manual.value ? String(manual.value).trim() : '';
+    return fromSelect || fromManual;
+  }
+
   function formValues() {
     const f = fill();
     const out = {};
     if (!f) return out;
-    for (const k of ['baseUrl', 'model', 'reviewMode']) {
+    for (const k of ['baseUrl', 'reviewMode']) {
       const v = f[k].value.trim();
       if (v) out[k] = v;
     }
+    // 模型取自 select（或手动输入兜底）
+    const model = currentModelId();
+    if (model) out.model = model;
     const mt = parseInt(f.maxTokens.value, 10);
     if (Number.isFinite(mt)) out.maxTokens = mt;
     const key = f.apiKey.value.trim();
@@ -117,30 +234,61 @@
     try {
       msg('拉取模型列表…', true);
       const f = fill();
-      const r = await api('/api/models', { baseUrl: f.baseUrl.value.trim(), apiKey: f.apiKey.value.trim() });
-      if (!r.ok) {
-        msg(`拉取失败：${r.error} —— 该端点可能不提供 /models，请直接手动输入模型 id`, false);
+      // fill() 在所有面板字段缺失时返回 null；任一字段缺失也会让后续 .value 抛错。
+      // 早期实现直接展开使用，一旦面板被宿主部分重置就报 "Cannot read properties of undefined"。
+      if (!f || !f.baseUrl || !f.apiKey) {
+        msg('拉取失败：面板未正确初始化，请关闭后重新打开设置面板', false);
         return;
       }
+      const r = await api('/api/models', { baseUrl: f.baseUrl.value.trim(), apiKey: f.apiKey.value.trim() });
+      if (!r.ok) {
+        msg(`拉取失败：${r.error} —— 该端点可能不提供 /models，请在下方“或手动输入”里填写模型 id`, false);
+        return;
+      }
+      // 模型控件是原生 <select>。为什么不用 <input list=datalist>：
+      // 实测 Chromium 对 datalist 的下拉只能由**真实用户手势**触发
+      // （程序化 input.showPicker() 报 NotAllowedError: requires a user gesture），
+      // 且下拉提示很弱，用户表现为"点不动/拉不下来"。原生 select 点击必定展开。
       const sel = document.getElementById('zca-model');
-      const current = sel.value;
+      if (!sel) {
+        msg('拉取失败：模型控件缺失（面板未正确初始化）', false);
+        return;
+      }
+      const current = currentModelId();
       sel.innerHTML = '';
       for (const id of r.models) {
         const o = document.createElement('option');
-        o.value = id; o.textContent = id;
+        o.value = id;
+        o.textContent = id;
         sel.appendChild(o);
       }
-      if (current && !r.models.includes(current)) {
+      // 当前模型不在拉取到的列表里（例如手动填过、或端点的 /models 不含它）时：
+      // 把它作为首项保留并**选中它**，不能改用列表首项——否则用户已配置的模型
+      // 会被静默替换掉（保存后审查模型就变了）。此时也不清空手动输入，避免两边不一致。
+      const preserved = current && !r.models.includes(current);
+      if (preserved) {
         const o = document.createElement('option');
-        o.value = current; o.textContent = current + '（当前）';
+        o.value = current;
+        o.textContent = `${current}（当前，不在列表中）`;
         sel.insertBefore(o, sel.firstChild);
       }
-      sel.value = r.models.includes(current) ? current : (r.models[0] || '');
-      msg(`已拉取 ${r.models.length} 个模型，下拉选择即可`, true);
+      sel.value = preserved ? current : (r.models.includes(current) ? current : (r.models[0] || ''));
+      if (!preserved) {
+        const manual = document.getElementById('zca-model-manual');
+        if (manual) manual.value = '';
+      }
+      msg(
+        preserved
+          ? `已拉取 ${r.models.length} 个模型，但当前模型 ${current} 不在列表中，已保留原选择`
+          : `已拉取 ${r.models.length} 个模型，请在上方下拉框中选择`,
+        true
+      );
     } catch (e) { msg('拉取失败：' + e, false); }
   }
 
   function buildPanel() {
+    // 面板可能在样式被外部清除后重建（页面导航、宿主重置 DOM）：这里兜底一次
+    ensureStyles();
     const p = el('div', 'zca-panel');
     p.id = 'zca-panel';
     p.style.display = 'none';
@@ -151,9 +299,11 @@
       <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">
       <label class="zca-label">API key</label>
       <input id="zca-apiKey" type="password" placeholder="留空 = 不修改已保存的 key">
-      <label class="zca-label">审查模型（可拉取列表后选择，或手动输入）</label>
-      <input id="zca-model" list="zca-model-list">
-      <datalist id="zca-model-list"></datalist>
+      <label class="zca-label">审查模型（先点「拉取模型」填充列表，或直接手动输入）</label>
+      <select id="zca-model">
+        <option value="">（尚未拉取，请在下方手动输入）</option>
+      </select>
+      <input id="zca-model-manual" placeholder="或手动输入模型 id（拉取不到时用）" style="margin-top:6px">
       <label class="zca-label">审查模式</label>
       <select id="zca-reviewMode">
         <option value="async">async（默认：零体感延迟，意见随下一条消息送达）</option>
@@ -177,19 +327,103 @@
     return p;
   }
 
+  // 找到当前可用的锚点。ZCode 是 React 应用，容器会在切换任务/会话时重建，
+  // 因此必须每次挂载时重新查找，不能缓存节点。
+  function findAnchor() {
+    for (const sel of ANCHOR_SELECTORS) {
+      try {
+        const el2 = document.querySelector(sel);
+        if (el2) return el2;
+      } catch (_) { /* 选择器不兼容时跳过 */ }
+    }
+    return null;
+  }
+
+  // topbar 模式下，角标需要包一层容器才能作为常驻条布局（并避免污染宿主 flex 结构）
+  function ensureTopbarWrapper() {
+    const existing = document.getElementById(TOPBAR_WRAPPER_ID);
+    if (existing) return existing;
+    const w = el('div', 'zca-topbar');
+    w.id = TOPBAR_WRAPPER_ID;
+    return w;
+  }
+
+  // 把角标挂到锚点上；找不到锚点时退回悬浮模式（仍可用，只是位置不同）。
+  function mountBadge(b) {
+    const anchor = findAnchor();
+    if (!anchor) {
+      if (b.parentNode !== document.body) document.body.appendChild(b);
+      b.classList.add('zca-floating');
+      return;
+    }
+
+    if (ANCHOR_MODE === 'topbar') {
+      // 顶部常驻：插入 wrapper 作为锚点的首个/末个子元素，形成一条窄条
+      const wrapper = ensureTopbarWrapper();
+      if (wrapper.parentNode !== anchor) anchor.insertBefore(wrapper, anchor.firstChild);
+      if (b.parentNode !== wrapper) wrapper.appendChild(b);
+    } else {
+      if (b.parentNode !== anchor) anchor.appendChild(b);
+    }
+    b.classList.remove('zca-floating');
+  }
+
   function buildBadge() {
+    // 已存在则复用（重注入场景），避免出现多个角标
+    const existing = document.getElementById('zca-badge');
+    if (existing) { mountBadge(existing); return existing; }
+
     const b = el('div', 'zca-badge');
     b.id = 'zca-badge';
-    b.title = 'zcode-advisor 顾问设置';
-    b.textContent = '🛡️';
+    b.title = 'ZCode Advisor 顾问设置（审查副模型）';
+    b.setAttribute('role', 'button');
+    b.setAttribute('aria-label', 'ZCode Advisor 设置');
+    b.tabIndex = 0;
+
+    const svg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" '
+      + 'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>';
+    if (ANCHOR_MODE === 'topbar') {
+      // 顶部模式带宽高，可带文字标签，比纯图标更好认
+      b.classList.add('zca-topbar-badge');
+      b.innerHTML = `${svg}<span class="zca-label-text">顾问</span>`;
+    } else {
+      // 输入框工具栏模式：只放图标，与相邻的原生图标按钮尺寸一致
+      b.innerHTML = svg;
+    }
+
     let panel = null;
-    b.addEventListener('click', () => {
+    const toggle = () => {
       if (!panel || !document.getElementById('zca-panel')) panel = buildPanel();
       const show = panel.style.display === 'none';
       panel.style.display = show ? 'block' : 'none';
       if (show) refreshStatus();
+    };
+    b.addEventListener('click', toggle);
+    b.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(); }
     });
-    document.body.appendChild(b);
+
+    mountBadge(b);
+    return b;
+  }
+
+  // 输入框容器会被 React 重建（切换会话/任务），重建后角标会随旧节点一起消失。
+  // 用 MutationObserver 监听并重新挂载——比定时轮询更省资源且响应更快。
+  function watchComposer() {
+    if (typeof MutationObserver !== 'function' || !document.body) return;
+    const observer = new MutationObserver(() => {
+      const b = document.getElementById('zca-badge');
+      if (!b) {
+        // 角标被整体移除（容器重建）：重新创建
+        buildBadge();
+        return;
+      }
+      // 角标还在但已脱离锚点（如父容器被替换）：重挂
+      const anchor = findAnchor();
+      if (anchor && b.parentNode !== anchor) mountBadge(b);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
   }
 
   function boot() {
@@ -197,7 +431,10 @@
       setTimeout(boot, 300);
       return;
     }
+    // 先注入样式再建角标：顺序颠倒会让角标短暂以无样式形态出现
+    ensureStyles();
     buildBadge();
+    watchComposer();
   }
   boot();
 })();

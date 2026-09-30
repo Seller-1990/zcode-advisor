@@ -1,0 +1,171 @@
+name: build-installers
+
+# 触发：
+# - push tag `v*`   → 构建安装包并发布到 Release
+# - 手动触发         → 只构建并上传 Actions artifact（用于验证）
+#
+# 工具链选择依据（2026-09 查证 actions/runner-images）：
+# - windows-2022 预装 NSIS 3.10，可直接产出 setup.exe（windows-2025 未预装 NSIS，只有 InnoSetup）
+# - macos-15-intel 为 Intel(x64) runner；macos-15 为 Apple Silicon(arm64) runner
+#   注意：macos-13 已从 runner-images 移除，macos-14 已标记 deprecated，不要用它们
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      mac_arch:
+        description: 'macOS 目标架构（手动触发时生效；打 tag 时始终构建两者）'
+        required: false
+        default: 'both'
+        type: choice
+        options: ['both', 'x64', 'arm64']
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------- 确定性检查（不依赖网络/模型，作为发布前置门禁） ----------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 单元测试
+        run: npm test
+
+  # ---------- Windows：绿色 zip + NSIS setup.exe ----------
+  windows:
+    needs: test
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 确认 NSIS 可用
+        shell: pwsh
+        run: |
+          $v = (& makensis -VERSION) 2>&1
+          Write-Host "makensis: $v"
+          if ($LASTEXITCODE -ne 0) { throw "makensis 不可用（windows-2022 应预装 NSIS）" }
+
+      - name: 构建（跳过 macOS）
+        run: node tools/companion/build-installer.cjs --skip-mac
+
+      - name: 列出产物
+        shell: pwsh
+        run: Get-ChildItem dist -File | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zcode-advisor-windows
+          path: |
+            dist/*.zip
+            dist/*.exe
+          if-no-files-found: error
+
+  # ---------- macOS：绿色 tar.gz + DMG ----------
+  # 架构列表由一个前置 job 计算：手动触发时尊重 inputs.mac_arch，打 tag 时两者都建。
+  # 这样避免在 matrix 展开前引用 matrix.*（GitHub Actions 不允许）。
+  plan-macos:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      arches: ${{ steps.pick.outputs.arches }}
+    steps:
+      - id: pick
+        run: |
+          set -euo pipefail
+          want='${{ github.event_name == 'workflow_dispatch' && inputs.mac_arch || 'both' }}'
+          case "$want" in
+            x64)   echo 'arches=["x64"]' >> "$GITHUB_OUTPUT" ;;
+            arm64) echo 'arches=["arm64"]' >> "$GITHUB_OUTPUT" ;;
+            *)     echo 'arches=["x64","arm64"]' >> "$GITHUB_OUTPUT" ;;
+          esac
+          echo "选中架构：$want"
+
+  macos:
+    needs: [test, plan-macos]
+    strategy:
+      fail-fast: false
+      matrix:
+        # 由 plan-macos 决定要构建哪些架构；runner 用 include 映射。
+        arch: ${{ fromJSON(needs.plan-macos.outputs.arches) }}
+        include:
+          - arch: x64
+            runner: macos-15-intel   # Intel
+          - arch: arm64
+            runner: macos-15         # Apple Silicon
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 校验 runner 架构与目标架构一致
+        run: |
+          set -euo pipefail
+          echo "runner arch: $(uname -m) / target: ${{ matrix.arch }}"
+          case "${{ matrix.arch }}" in
+            x64)   [ "$(uname -m)" = "x86_64" ] || { echo "目标 x64 但 runner 不是 x86_64"; exit 1; } ;;
+            arm64) [ "$(uname -m)" = "arm64" ]  || { echo "目标 arm64 但 runner 不是 arm64"; exit 1; } ;;
+          esac
+
+      - name: 构建（跳过 Windows）
+        run: node tools/companion/build-installer.cjs --skip-win --mac-arch=${{ matrix.arch }}
+
+      - name: 列出产物
+        run: ls -la dist/
+
+      - name: 冒烟：确认 DMG 可挂载且 .app 结构完整
+        run: |
+          set -euo pipefail
+          DMG=$(ls dist/*.dmg | head -1)
+          echo "检查 $DMG"
+          hdiutil verify "$DMG"
+          MP=$(mktemp -d)
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MP"
+          test -d "$MP/ZCode Advisor.app" || { echo "缺少 .app"; exit 1; }
+          test -x "$MP/ZCode Advisor.app/Contents/MacOS/ZCodeAdvisor" || { echo "缺少启动器"; exit 1; }
+          ls "$MP/ZCode Advisor.app/Contents/Resources/app"
+          hdiutil detach "$MP"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zcode-advisor-macos-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.dmg
+          if-no-files-found: error
+
+  # ---------- 发布：把安装包挂到 Release ----------
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 列出待发布文件
+        run: find artifacts -type f | sort
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.zip
+            artifacts/*.exe
+            artifacts/*.tar.gz
+            artifacts/*.dmg
+          generate_release_notes: true
+          fail_on_unmatched_files: false

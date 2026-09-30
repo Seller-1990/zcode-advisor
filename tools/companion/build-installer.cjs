@@ -1,348 +1,522 @@
 #!/usr/bin/env node
 'use strict';
 
-// 发行包构建脚本（零第三方依赖，在 Windows 上运行）。
+// 发行包构建脚本（零第三方依赖，macOS 与 Windows 均可运行）。
+//
 // 产物（dist/）：
-//   ZCodeAdvisor-<ver>-win-x64-setup.exe   IExpress 自解压安装包（双击安装并创建桌面/开始菜单图标）
-//   ZCodeAdvisor-<ver>-win-x64.zip         绿色包（内含 install.cmd，效果同上）
-//   ZCodeAdvisor-<ver>-macos-x64.tar.gz    macOS Intel (darwin-x64) 包：install.sh 生成 ~/Applications
-//                                          下的 ZCode Advisor.app（启动台可见）
-// 内嵌官方 Node 运行时：Windows 取本机 node.exe（build 即在 Node 上运行）；
-// macOS 取 nodejs.org 的 darwin-x64 官方二进制（下载失败时给出无内嵌包并提示需系统 Node）。
+//   ZCodeAdvisor-<ver>-win-x64.zip           绿色包（内含 install.cmd，创建桌面/开始菜单图标）
+//   ZCodeAdvisor-<ver>-macos-<arch>.tar.gz   install.sh 生成 ~/Applications/ZCode Advisor.app
+//
+// 用法：
+//   node tools/companion/build-installer.cjs [--mac-arch=x64|arm64|both] [--skip-win] [--skip-mac]
+//                                            [--no-embed-node]
+//
+// 与旧版的关键差异：归档不再调用 `powershell Compress-Archive` 或 `SystemRoot\System32\tar.exe`
+// （这两条路径在 macOS 上不存在，实测 powershell ENOENT），改为 tools/companion/archive.cjs
+// 的自研 ZIP/TAR 实现；构建完成后用系统 `unzip` / `tar` 反向校验产物。
+//
+// 内嵌 Node：从 nodejs.org 下载官方发行包并抽出二进制。
+//   注意：受限网络下 nodejs.org 可能直连不通，需设置代理环境变量，例如
+//     export https_proxy=http://127.0.0.1:7897
+//   并在本脚本前加 NODE_USE_ENV_PROXY=1（Node ≥ 22）或改用 NODE_DIST_MIRROR 指向可达镜像。
+//
+// 杀软友好纪律（不得回退）：不做自解压 setup.exe、不改进程名、不做隐藏启动。
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
-const zlib = require('zlib');
 const { execFileSync } = require('child_process');
 
-const ROOT = path.resolve(__dirname, '..', '..');
-const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, '.zcode-plugin', 'plugin.json'), 'utf8')).version;
+const { ROOT, VERSION, COMPANION_FILES } = require('./build-meta.cjs');
+const { buildZip, buildTarGz, readZipEntries, readTarGz, extractFromTarGz, extractFromZip } = require('./archive.cjs');
+const { makeIco, makeIcns } = require('./icon.cjs');
+const P = require('./packagers.cjs');
+const T = require('./install-templates.cjs');
+
 const DIST = path.join(ROOT, 'dist');
-// Windows 自带 bsdtar：GNU tar 会把 "D:\..." 当远程主机
-const TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
-const NODE_DIST_MIRROR = process.env.NODE_DIST_MIRROR || 'https://nodejs.org/dist';
-const NODE_MAJOR = process.version.match(/^v(\d+)/)[1];
-const NODE_VERSION_FOR_MAC = process.env.NODE_EMBED_VERSION || null; // 缺省自动取最新 v22
+const COMPANION_DIR = path.join(ROOT, 'tools', 'companion');
+const NODE_DIST_MIRROR = (process.env.NODE_DIST_MIRROR || 'https://nodejs.org/dist').replace(/\/+$/, '');
+const NODE_EMBED_VERSION = process.env.NODE_EMBED_VERSION || null;
+const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
 
-const COMPANION_FILES = ['controller.cjs', 'inject.js', 'lib.cjs'];
+// ---------------- 参数 ----------------
 
-// ---------------- 图标生成（零依赖）：盾牌图形，输出 RGBA 像素 ----------------
-
-function drawShield(size) {
-  const d = Buffer.alloc(size * size * 4);
-  const px = (x, y, r, g, b, a) => {
-    const i = (y * size + x) * 4;
-    d[i] = r; d[i + 1] = g; d[i + 2] = b; d[i + 3] = a;
+function parseArgs(argv) {
+  const opts = {
+    macArch: process.arch === 'arm64' ? 'arm64' : 'x64',
+    skipWin: false, skipMac: false, embedNode: true,
+    installer: true // 额外产出 NSIS setup.exe 与 DMG（工具不可用时自动跳过并说明）
   };
-  const inRounded = (x, y, m, rad) => {
-    const x0 = m, y0 = m, x1 = size - m, y1 = size - m;
-    if (x < x0 || x > x1 || y < y0 || y > y1) return false;
-    const cx = Math.max(x0 + rad, Math.min(x, x1 - rad));
-    const cy = Math.max(y0 + rad, Math.min(y, y1 - rad));
-    return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= rad * rad || (x >= x0 + rad && x <= x1 - rad) || (y >= y0 + rad && y <= y1 - rad);
-  };
-  const shieldHalf = (t) => size * 0.26 * (1 - 0.42 * t * t); // t∈[0,1] 从顶到底收窄
-  const shieldTop = size * 0.24, shieldBottom = size * 0.82, cx = size / 2;
-  const inShield = (x, y, scale) => {
-    if (y < shieldTop || y > shieldBottom) return false;
-    const t = (y - shieldTop) / (shieldBottom - shieldTop);
-    const half = shieldHalf(t) * scale;
-    if (t > 0.86) { // 底部收尖
-      const k = (t - 0.86) / 0.14;
-      return Math.abs(x - cx) <= half * (1 - k);
-    }
-    return Math.abs(x - cx) <= half;
-  };
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      if (!inRounded(x, y, size * 0.03, size * 0.2)) { px(x, y, 0, 0, 0, 0); continue; }
-      // 底：深蓝渐变
-      const t = y / size;
-      let r = Math.round(15 + 20 * t), g = Math.round(23 + 30 * t), b = Math.round(42 + 45 * t);
-      if (inShield(x, y, 1)) { r = 226; g = 232; b = 240; }        // 外盾：浅色
-      if (inShield(x, y, 0.74)) { r = 37; g = 99; b = 235; }        // 内盾：品牌蓝
-      if (inShield(x, y, 0.74)) {
-        // 中间一道浅色斜杠，增强辨识度
-        const dx = x - cx, dy = y - (shieldTop + shieldBottom) / 2;
-        if (Math.abs(dx - dy * 0.35) < size * 0.045) { r = 226; g = 232; b = 240; }
-      }
-      px(x, y, r, g, b, 255);
-    }
+  for (const a of argv) {
+    if (a.startsWith('--mac-arch=')) {
+      const v = a.split('=')[1];
+      if (!['x64', 'arm64', 'both'].includes(v)) throw new Error(`--mac-arch 只支持 x64|arm64|both，收到：${v}`);
+      opts.macArch = v;
+    } else if (a === '--skip-win') opts.skipWin = true;
+    else if (a === '--skip-mac') opts.skipMac = true;
+    else if (a === '--no-embed-node') opts.embedNode = false;
+    else if (a === '--no-installer') opts.installer = false;
+    else throw new Error(`未知参数：${a}`);
   }
-  return d;
+  return opts;
 }
 
-// PNG 编码（8-bit RGBA，filter 0）
-const CRC_TABLE = (() => {
-  const t = new Int32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c;
-  }
-  return t;
-})();
-function crc32(buf) {
-  let c = 0xffffffff;
-  for (const b of buf) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-function pngChunk(type, data) {
-  const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
-  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
-  const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(body));
-  return Buffer.concat([len, body, crc]);
-}
-function encodePng(size, rgba) {
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4);
-  ihdr[8] = 8; ihdr[9] = 6; // 8bit RGBA
-  const raw = Buffer.alloc(size * (size * 4 + 1));
-  for (let y = 0; y < size; y++) {
-    raw[y * (size * 4 + 1)] = 0;
-    rgba.copy(raw, y * (size * 4 + 1) + 1, y * size * 4, (y + 1) * size * 4);
-  }
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk('IHDR', ihdr),
-    pngChunk('IDAT', zlib.deflateSync(raw, { level: 9 })),
-    pngChunk('IEND', Buffer.alloc(0))
-  ]);
-}
+const log = (...a) => console.log('[build]', ...a);
+const warn = (...a) => console.warn('[build][警告]', ...a);
 
-function makeIco() {
-  const s32 = drawShield(32);
-  // 32bpp BMP（XOR 自下而上 + AND 掩码）
-  const xor = Buffer.alloc(32 * 32 * 4);
-  for (let y = 0; y < 32; y++) s32.copy(xor, (31 - y) * 32 * 4, y * 32 * 4, (y + 1) * 32 * 4);
-  const and = Buffer.alloc(32 * 4); // 全 0 = 不透明位
-  const bmpHeader = Buffer.alloc(40);
-  bmpHeader.writeUInt32LE(40, 0); bmpHeader.writeInt32LE(32, 4); bmpHeader.writeInt32LE(64, 8);
-  bmpHeader.writeUInt16LE(1, 12); bmpHeader.writeUInt16LE(32, 14);
-  bmpHeader.writeUInt32LE(xor.length + and.length, 20);
-  const bmp = Buffer.concat([bmpHeader, xor, and]);
-  const png256 = encodePng(256, drawShield(256));
-  const entries = [];
-  const data32 = Buffer.concat([bmp]);
-  entries.push({ size: 32, data: data32 });
-  entries.push({ size: 256, data: png256, png: true });
-  let offset = 6 + entries.length * 16;
-  const dir = Buffer.alloc(6 + entries.length * 16);
-  dir.writeUInt16LE(0, 0); dir.writeUInt16LE(1, 2); dir.writeUInt16LE(entries.length, 4);
-  let off = offset;
-  entries.forEach((e, i) => {
-    const base = 6 + i * 16;
-    dir[base] = e.size % 256; dir[base + 1] = 0;
-    dir[base + 2] = e.size % 256; dir[base + 3] = 0;
-    dir.writeUInt16LE(1, base + 4);
-    dir.writeUInt16LE(e.png ? 32 : 32, base + 6); // bitcount
-    dir.writeUInt32LE(e.data.length, base + 8);
-    dir.writeUInt32LE(off, base + 12);
-    off += e.data.length;
-  });
-  return Buffer.concat([dir, ...entries.map((e) => e.data)]);
-}
-
-function makeIcns() {
-  const p128 = encodePng(128, drawShield(128));
-  const p256 = encodePng(256, drawShield(256));
-  const chunks = [];
-  for (const [type, png] of [['ic07', p128], ['ic08', p256]]) {
-    const head = Buffer.from(type, 'ascii');
-    const len = Buffer.alloc(4); len.writeUInt32BE(png.length + 8);
-    chunks.push(Buffer.concat([len, head, png]));
-  }
-  const body = Buffer.concat(chunks);
-  const head = Buffer.from('icns', 'ascii');
-  const total = Buffer.alloc(4); total.writeUInt32BE(body.length + 8);
-  return Buffer.concat([head, total, body]);
-}
-
-// ---------------- 通用工具 ----------------
+// ---------------- 工具 ----------------
 
 function stageDir(p) { fs.mkdirSync(p, { recursive: true }); return p; }
-function copyTo(src, dst) { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.copyFileSync(src, dst); }
-function write(dst, content) { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.writeFileSync(dst, content); }
 
-async function downloadTo(url, dst) {
-  fs.mkdirSync(path.dirname(dst), { recursive: true });
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
-  const buf = Buffer.from(await r.arrayBuffer());
-  fs.writeFileSync(dst, buf);
-  return buf.length;
+async function download(url) {
+  // 大文件（Node 发行包 30~60MB）在连续请求时可能因连接复用/代理抖动而失败，
+  // 实测同一 URL 单独请求可成功、连续请求会 `fetch failed`。故做有限重试，
+  // 并显式禁用 keep-alive 以强制每条请求使用独立连接。
+  const MAX_TRIES = 3;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    try {
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+        headers: { Connection: 'close' }
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length === 0) throw new Error(`空响应：${url}`);
+      return buf;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < MAX_TRIES) {
+        const backoff = 1500 * attempt;
+        warn(`下载失败（第 ${attempt}/${MAX_TRIES} 次）：${err.message}；${backoff}ms 后重试`);
+        await new Promise((r) => setTimeout(r, backoff));
+      }
+    }
+  }
+  throw lastErr;
 }
 
-async function latestV22DarwinX64() {
-  const r = await fetch(`${NODE_DIST_MIRROR}/index.json`);
-  const idx = await r.json();
-  const v = idx.find((e) => e.version.startsWith('v22.'));
-  if (!v) throw new Error('index.json 中未找到 v22 版本');
-  return { version: v.version, url: `${NODE_DIST_MIRROR}/${v.version}/node-${v.version}-darwin-x64.tar.gz` };
-}
+// 已解压内容的缓存目录（避免每次构建重复下载 ~30MB）
+const CACHE_DIR = path.join(DIST, '.cache');
 
-// ---------------- 各平台打包 ----------------
-
-const INSTALL_SHORTCUT_VBS = `Option Explicit
-Dim sh, fso, base, desktop, startMenu, lnk, nodeExe
-Set sh = CreateObject("WScript.Shell")
-Set fso = CreateObject("Scripting.FileSystemObject")
-base = fso.GetParentFolderName(WScript.ScriptFullName)
-nodeExe = base & "\\bin\\node.exe"
-desktop = sh.SpecialFolders("Desktop")
-startMenu = sh.SpecialFolders("Programs") & "\\ZCode Advisor"
-If Not fso.FolderExists(startMenu) Then fso.CreateFolder(startMenu)
-' 快捷方式直接指向原始签名的 node.exe（不改名、不隐藏窗口，最小化运行日志）
-Set lnk = sh.CreateShortcut(desktop & "\\ZCode Advisor.lnk")
-lnk.TargetPath = nodeExe
-lnk.Arguments = chr(34) & base & "\\controller.cjs" & chr(34)
-lnk.WorkingDirectory = base
-lnk.IconLocation = base & "\\advisor.ico"
-lnk.Description = "zcode-advisor 输入框角标外挂"
-lnk.WindowStyle = 7
-lnk.Save
-Set lnk = sh.CreateShortcut(startMenu & "\\ZCode Advisor.lnk")
-lnk.TargetPath = nodeExe
-lnk.Arguments = chr(34) & base & "\\controller.cjs" & chr(34)
-lnk.WorkingDirectory = base
-lnk.IconLocation = base & "\\advisor.ico"
-lnk.Description = "zcode-advisor 输入框角标外挂"
-lnk.WindowStyle = 7
-lnk.Save
-`;
-
-const INSTALL_CMD = `@echo off
-setlocal
-set "DST=%LOCALAPPDATA%\\ZCodeAdvisor"
-echo 安装 zcode-advisor 外挂到 %DST% ...
-xcopy /E /I /Y /Q "%~dp0*" "%DST%\\" >nul
-cscript //nologo "%DST%\\install-shortcut.vbs"
-echo 完成：桌面已创建「ZCode Advisor」图标（双击即以角标模式启动 ZCode）。
-endlocal & exit /b 0
-`;
-
-const WIN_README = `ZCode Advisor（输入框角标外挂）— Windows 安装说明
-
-安装：解压后双击 install.cmd（全程明文脚本，可先审阅），完成后桌面出现「ZCode Advisor」图标。
-使用：双击桌面图标 → 以最小化窗口运行外挂（bin\\node.exe，原始官方签名副本）并注入 🛡️ 角标。
-配置：点击输入框旁 🛡️ 角标 → 设置面板：第三方 API 端点 / API key / 拉取模型列表 / Ping 测试 / 保存。
-      保存写入 %USERPROFILE%\\.zcode\\advisor.config.json，下一轮审查即生效，无需重启。
-共存：与 zcode-plus 可同时使用（CDP 多客户端附着，✨ 与 🛡️ 共存；谁先启动都行）。
-日志：%USERPROFILE%\\.zcode\\advisor-companion.log
-卸载：删除桌面/开始菜单快捷方式与 %LOCALAPPDATA%\\ZCodeAdvisor 目录即可。
-关于杀软：本包不含自解压 exe、不含改名进程、无隐藏启动；bin\\node.exe 为官方原版副本。
-        若仍有误报，可将安装目录加入白名单（自行斟酌）。
-免责：依赖 ZCode 桌面版非公开接口（CDP 注入），ZCode 大版本更新可能导致角标失效；hook 审查功能不受影响。
-`;
-
-const MAC_README = `ZCode Advisor（输入框角标外挂）— macOS (Intel) 安装说明
-
-安装：终端执行 ./install.sh —— 生成 ~/Applications/ZCode Advisor.app（启动台可见），
-      并内嵌官方 Node 运行时，无需系统 Node。
-使用：启动台/聚焦打开 ZCode Advisor → 自动以调试模式启动 ZCode 并注入 🛡️ 角标。
-配置：点击输入框旁 🛡️ 角标 → 设置面板：第三方 API 端点 / API key / 拉取模型列表 / Ping / 保存。
-日志：~/.zcode/advisor-companion.log
-卸载：删除 ~/Applications/ZCode Advisor.app 与 ~/Library/Application Support/ZCodeAdvisor。
-`;
-
-const MAC_INSTALL_SH = `#!/bin/bash
-set -e
-SUPPORT="$HOME/Library/Application Support/ZCodeAdvisor"
-APP="$HOME/Applications/ZCode Advisor.app"
-SRC="$(cd "$(dirname "$0")" && pwd)"
-mkdir -p "$SUPPORT/bin" "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp -f "$SRC/controller.cjs" "$SRC/inject.js" "$SRC/lib.cjs" "$SUPPORT/"
-cp -f "$SRC/bin/node" "$SUPPORT/bin/node" 2>/dev/null || cp -f "$(command -v node)" "$SUPPORT/bin/node"
-chmod +x "$SUPPORT/bin/node"
-cp -f "$SRC/advisor.icns" "$APP/Contents/Resources/" 2>/dev/null || true
-cat > "$APP/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>CFBundleName</key><string>ZCode Advisor</string>
-<key>CFBundleDisplayName</key><string>ZCode Advisor</string>
-<key>CFBundleIdentifier</key><string>local.zcode.advisor</string>
-<key>CFBundleVersion</key><string>${VERSION}</string>
-<key>CFBundleShortVersionString</key><string>${VERSION}</string>
-<key>CFBundleExecutable</key><string>ZCodeAdvisor</string>
-<key>CFBundlePackageType</key><string>APPL</string>
-<key>LSUIElement</key><true/>
-<key>CFBundleIconFile</key><string>advisor.icns</string>
-</dict></plist>
-PLIST
-cat > "$APP/Contents/MacOS/ZCodeAdvisor" <<'LAUNCH'
-#!/bin/bash
-SUPPORT="$HOME/Library/Application Support/ZCodeAdvisor"
-LOG="$HOME/.zcode/advisor-companion.log"
-mkdir -p "$(dirname "$LOG")"
-NODE="$SUPPORT/bin/node"
-[ -x "$NODE" ] || NODE="$(command -v node)"
-nohup "$NODE" "$SUPPORT/controller.cjs" >>"$LOG" 2>&1 &
-exit 0
-LAUNCH
-chmod +x "$APP/Contents/MacOS/ZCodeAdvisor"
-echo "已安装：~/Applications/ZCode Advisor.app（启动台可见）+ 桌面图标"
-echo "打开应用即以角标模式启动 ZCode；日志：~/.zcode/advisor-companion.log"
-`;
-
-function buildWin() {
-  // 杀软友好形态（v0.2.1 起放弃 IExpress 自解压与改名 node——两者均为高危启发式特征，
-  // 会被杀软当作 dropper/masquerade 删除）：
-  // - node.exe 保持原名与官方签名，放 bin/ 下；
-  // - 快捷方式直接指向 bin\node.exe（最小化窗口运行日志，进程可见可查）；
-  // - 安装脚本全程明文（install.cmd / install-shortcut.vbs 可审计），无自解压、无隐藏启动。
-  const stage = stageDir(path.join(DIST, 'stage-win'));
-  stageDir(path.join(stage, 'bin'));
-  copyTo(process.execPath, path.join(stage, 'bin', 'node.exe'));
-  for (const f of COMPANION_FILES) copyTo(path.join(ROOT, 'tools', 'companion', f), path.join(stage, f));
-  write(path.join(stage, 'install-shortcut.vbs'), INSTALL_SHORTCUT_VBS);
-  write(path.join(stage, 'install.cmd'), INSTALL_CMD);
-  write(path.join(stage, 'advisor.ico'), makeIco());
-  write(path.join(stage, 'README-install.txt'), WIN_README);
-
-  const zip = path.join(DIST, `ZCodeAdvisor-${VERSION}-win-x64.zip`);
-  execFileSync('powershell', ['-NoProfile', '-Command',
-    `Compress-Archive -Force -Path '${stage}\\*' -DestinationPath '${zip}'`]);
-  log(`产物：${zip}（${(fs.statSync(zip).size / 1048576).toFixed(1)} MB，含 bin\\node.exe 原始签名副本）`);
-}
-
-async function buildMac() {
-  const stage = stageDir(path.join(DIST, 'stage-mac', `ZCodeAdvisor-${VERSION}-macos-x64`));
-  for (const f of COMPANION_FILES) copyTo(path.join(ROOT, 'tools', 'companion', f), path.join(stage, f));
-  write(path.join(stage, 'install.sh'), MAC_INSTALL_SH);
-  write(path.join(stage, 'README-install.txt'), MAC_README);
-  write(path.join(stage, 'advisor.icns'), makeIcns());
-  stageDir(path.join(stage, 'bin'));
-
-  let embedded = false;
-  try {
-    const { url } = await latestV22DarwinX64();
-    log(`下载 macOS 运行时：${url}`);
-    const tgz = path.join(DIST, 'cache', path.basename(url));
-    await downloadTo(url, tgz);
-    execFileSync(TAR, ['-xzf', tgz, '-C', path.join(DIST, 'cache'), `${path.basename(url, '.tar.gz')}/bin/node`]);
-    copyTo(path.join(DIST, 'cache', `${path.basename(url, '.tar.gz')}`, 'bin', 'node'), path.join(stage, 'bin', 'node'));
-    fs.chmodSync(path.join(stage, 'bin', 'node'), 0o755);
-    embedded = true;
-  } catch (err) {
-    log(`警告：内嵌 macOS 运行时下载失败（${String(err).slice(0, 120)}）—— 包内将要求系统 Node ≥ 18`);
+async function fetchEmbeddedNodeBinary(platform, arch) {
+  const key = `${platform}-${arch}`;
+  const cachePath = path.join(CACHE_DIR, `node-${key}`);
+  if (fs.existsSync(cachePath)) {
+    log(`复用缓存的 Node 运行时（${key}）`);
+    return fs.readFileSync(cachePath);
   }
 
-  const tarball = path.join(DIST, `ZCodeAdvisor-${VERSION}-macos-x64.tar.gz`);
-  execFileSync(TAR, ['-czf', tarball, '-C', path.join(DIST, 'stage-mac'), `ZCodeAdvisor-${VERSION}-macos-x64`]);
-  log(`产物：${tarball}（${(fs.statSync(tarball).size / 1048576).toFixed(1)} MB，内嵌 darwin-x64 Node：${embedded ? '是' : '否'}）`);
+  const version = NODE_EMBED_VERSION || await resolveLatestLtsVersion();
+  const fileName = platform === 'win'
+    ? `node-${version}-win-${arch}.zip`
+    : `node-${version}-darwin-${arch}.tar.gz`;
+  const innerPath = platform === 'win' ? 'node.exe' : 'bin/node';
+  const url = `${NODE_DIST_MIRROR}/${version}/${fileName}`;
+
+  log(`下载官方 Node 运行时：${url}`);
+  const buf = await download(url);
+  const binary = platform === 'win' ? extractFromZip(buf, innerPath) : extractFromTarGz(buf, innerPath);
+  if (!binary || binary.length === 0) {
+    throw new Error(`从 ${fileName} 中未取到 ${innerPath}`);
+  }
+  stageDir(CACHE_DIR);
+  fs.writeFileSync(cachePath, binary);
+  log(`已提取 ${innerPath}（${(binary.length / 1048576).toFixed(1)} MB）`);
+  return binary;
 }
 
-function log(...a) { console.log('[build]', ...a); }
+async function resolveLatestLtsVersion() {
+  const index = JSON.parse((await download(`${NODE_DIST_MIRROR}/index.json`)).toString('utf8'));
+  // 取最新 LTS；没有 LTS 标记时退回首条
+  const lts = index.find((v) => v.lts);
+  const picked = lts || index[0];
+  if (!picked) throw new Error('index.json 中未找到任何 Node 版本');
+  return picked.version;
+}
+
+// ---------------- Windows 产物 ----------------
+
+async function buildWin(opts) {
+  const entries = [];
+  const mode = 0o644;
+
+  for (const f of COMPANION_FILES) {
+    entries.push({ path: f, data: fs.readFileSync(path.join(COMPANION_DIR, f)), mode });
+  }
+  entries.push({ path: 'install-shortcut.vbs', data: Buffer.from(T.INSTALL_SHORTCUT_VBS, 'utf8'), mode });
+  entries.push({ path: 'install.cmd', data: Buffer.from(T.INSTALL_CMD, 'utf8'), mode });
+  entries.push({ path: 'advisor.ico', data: makeIco(), mode });
+
+  let embedded = false;
+  if (opts.embedNode) {
+    try {
+      const exe = await fetchEmbeddedNodeBinary('win', 'x64');
+      entries.push({ path: 'bin/node.exe', data: exe, mode: 0o755 });
+      embedded = true;
+    } catch (err) {
+      warn(`Windows 内嵌 Node 获取失败：${String(err.message).slice(0, 160)}`);
+      warn('该包缺少 bin\\node.exe，README-install.txt 中已写明补救步骤。');
+    }
+  }
+  // README 需在确定是否内嵌之后生成（未内嵌时包含补救说明）
+  entries.push({ path: 'README-install.txt', data: Buffer.from(T.winReadme(embedded), 'utf8'), mode });
+
+  const zip = buildZip(entries);
+  const out = path.join(DIST, `ZCodeAdvisor-${VERSION}-win-x64.zip`);
+  fs.writeFileSync(out, zip);
+  log(`产物：${path.basename(out)}（${(zip.length / 1048576).toFixed(1)} MB，内嵌 Node：${embedded ? '是' : '否'}）`);
+
+  const results = [{ path: out, kind: 'zip' }];
+
+  // 额外产出 NSIS 安装器（标准安装体验）。工具缺失/崩溃时明确跳过，不算失败。
+  // **在独立子进程中执行**：实测 makensis 崩溃（SIGABRT）会干扰同进程内随后的
+  // hdiutil 调用，导致 DMG 无辜失败——隔离后两者互不影响。
+  if (opts.installer) {
+    try {
+      const stage = stageDir(path.join(DIST, '.stage-win-nsis'));
+      for (const e of entries) {
+        const dest = path.join(stage, e.path);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.writeFileSync(dest, e.data);
+        if (e.mode === 0o755 || e.path === 'bin/node.exe') {
+          try { fs.chmodSync(dest, 0o755); } catch (_) {}
+        }
+      }
+      const setupPath = path.join(DIST, `ZCodeAdvisor-${VERSION}-win-x64-setup.exe`);
+      const workDir = path.join(DIST, '.stage-win-nsis-build');
+      const r = runNsisInChildProcess({ workDir, stage, iconPath: path.join(stage, 'advisor.ico'), setupPath });
+      if (r.ok) {
+        log(`产物：${path.basename(setupPath)}（${(r.bytes / 1048576).toFixed(1)} MB，NSIS 安装器）`);
+        results.push({ path: setupPath, kind: 'exe' });
+      } else {
+        warn(`跳过 NSIS 安装器：${r.reason}`);
+      }
+    } catch (err) {
+      warn(`NSIS 安装器构建失败（不影响绿色包）：${String(err.message).slice(0, 200)}`);
+    }
+  }
+
+  return results;
+}
+
+// 在独立子进程中生成 NSIS 安装器，stdout 回传 JSON 结果。
+// 隔离原因见调用处注释（makensis 崩溃会污染父进程）。
+function runNsisInChildProcess(o) {
+  const runner = `
+    const P = require(${JSON.stringify(path.join(COMPANION_DIR, 'packagers.cjs'))});
+    const r = P.buildNsisInstaller({
+      workDir: ${JSON.stringify(o.workDir)},
+      srcDir: ${JSON.stringify(o.stage)},
+      iconPath: ${JSON.stringify(o.iconPath)},
+      version: ${JSON.stringify(VERSION)},
+      outFile: ${JSON.stringify(o.setupPath)}
+    });
+    process.stdout.write(JSON.stringify(r));
+  `;
+  try {
+    const out = execFileSync(process.execPath, ['-e', runner], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return JSON.parse(out.trim() || '{}');
+  } catch (err) {
+    const stderr = String((err && err.stderr) || '').trim().slice(0, 200);
+    return { ok: false, reason: `NSIS 子进程失败${stderr ? `：${stderr}` : `：${err.message}`}` };
+  }
+}
+
+// ---------------- macOS 产物 ----------------
+
+async function buildMac(arch, opts) {
+  const entries = [];
+  const mode = 0o644;
+
+  for (const f of COMPANION_FILES) {
+    entries.push({ path: f, data: fs.readFileSync(path.join(COMPANION_DIR, f)), mode });
+  }
+  // install.sh 的 cp 清单由依赖闭包注入，并做版本号占位替换
+  const installSh = T.MAC_INSTALL_SH(COMPANION_FILES).replace(/__VERSION__/g, VERSION);
+  entries.push({ path: 'install.sh', data: Buffer.from(installSh, 'utf8'), mode: 0o755 });
+  entries.push({ path: 'advisor.icns', data: makeIcns(), mode });
+
+  let embedded = false;
+  if (opts.embedNode) {
+    try {
+      const bin = await fetchEmbeddedNodeBinary('mac', arch);
+      entries.push({ path: 'bin/node', data: bin, mode: 0o755 });
+      embedded = true;
+    } catch (err) {
+      warn(`macOS(${arch}) 内嵌 Node 获取失败：${String(err.message).slice(0, 200)}`);
+      warn('该包将回退到系统 Node（install.sh 会提示），或可换用 NODE_DIST_MIRROR / 设置代理后重试。');
+    }
+  }
+
+  entries.push({ path: 'README-install.txt', data: Buffer.from(T.macReadme(embedded), 'utf8'), mode });
+  entries.push({ path: 'BUILD-INFO.txt', data: Buffer.from(T.MAC_BUILD_INFO(arch, embedded), 'utf8'), mode });
+
+  const tgz = buildTarGz(entries);
+  const out = path.join(DIST, `ZCodeAdvisor-${VERSION}-macos-${arch}.tar.gz`);
+  fs.writeFileSync(out, tgz);
+  log(`产物：${path.basename(out)}（${(tgz.length / 1048576).toFixed(1)} MB，内嵌 Node：${embedded ? '是' : '否'}）`);
+
+  const results = [{ path: out, kind: 'targz' }];
+
+  // 额外产出 DMG（macOS 标准分发形态：内含自包含 .app，拖入 Applications 即装）。
+  if (opts.installer) {
+    if (process.platform !== 'darwin') {
+      warn(`跳过 DMG（arch=${arch}）：DMG 只能在 macOS 上构建`);
+    } else {
+      try {
+        const stage = stageDir(path.join(DIST, `.stage-mac-dmg-${arch}`));
+        const runtimeFiles = COMPANION_FILES;
+        const nodeEntry = entries.find((e) => e.path === 'bin/node');
+        // .app 自包含：运行时与控制器都在包内（不依赖 Application Support）。
+        // 临时文件放在 stage 之外的构建目录，避免被一起打进 DMG 根目录。
+        let nodeBinPath = '';
+        if (nodeEntry) {
+          const tmpDir = stageDir(path.join(DIST, '.stage-mac-runtime'));
+          nodeBinPath = path.join(tmpDir, `node-${arch}`);
+          fs.writeFileSync(nodeBinPath, nodeEntry.data);
+          fs.chmodSync(nodeBinPath, 0o755);
+        }
+        P.stageMacApp({
+          destDir: stage,
+          version: VERSION,
+          runtimeFiles,
+          companionDir: COMPANION_DIR,
+          nodeBinPath,
+          icnsBuf: makeIcns()
+        });
+        const dmgPath = path.join(DIST, `ZCodeAdvisor-${VERSION}-macos-${arch}.dmg`);
+        const r = P.buildDmg({
+          stageDir: stage,
+          outFile: dmgPath,
+          volumeName: `ZCode Advisor ${VERSION}`
+        });
+        if (r.ok) {
+          log(`产物：${path.basename(dmgPath)}（${(r.bytes / 1048576).toFixed(1)} MB，DMG 安装包）`);
+          results.push({ path: dmgPath, kind: 'dmg' });
+        } else {
+          warn(`跳过 DMG：${r.reason}`);
+        }
+      } catch (err) {
+        warn(`DMG 构建失败（不影响 tar.gz）：${String(err.message).slice(0, 200)}`);
+      }
+    }
+  }
+
+  return results;
+}
+
+// ---------------- 产物反向校验 ----------------
+
+// 归档格式一旦写错，典型表现是"能生成、解压报错"。这里做三层校验：
+// 1) 结构校验：必需文件都在（含**依赖闭包**，防止再次漏包——曾漏 zcode-path.cjs）；
+// 2) 系统工具交叉验证：unzip / tar 能否列出条目；
+// 3) 冒烟校验：产物内 controller.cjs 的 require 能否全部解析（真正确认"装完能跑"）。
+function verifyArtifact(artifact) {
+  const name = path.basename(artifact.path);
+
+  // 安装器形态（exe/dmg）走各自的校验分支
+  if (artifact.kind === 'exe') return verifyNsis(name, artifact.path);
+  if (artifact.kind === 'dmg') return verifyDmg(name, artifact.path);
+
+  const buf = fs.readFileSync(artifact.path);
+  const entries = artifact.kind === 'zip' ? readZipEntries(buf) : readTarGz(buf);
+  const names = entries.map((e) => e.path);
+
+  // 1) 依赖闭包校验：compiler 推导出的每个运行时文件都必须进包
+  const missing = COMPANION_FILES.filter((f) => !names.includes(f));
+  if (missing.length > 0) {
+    throw new Error(`${name}: 缺少运行时文件 ${missing.join(', ')}（发行包内 controller 会 require 失败）`);
+  }
+  if (artifact.kind === 'zip' && !names.includes('install.cmd')) throw new Error(`${name}: 缺少 install.cmd`);
+  if (artifact.kind === 'targz' && !names.includes('install.sh')) throw new Error(`${name}: 缺少 install.sh`);
+
+  // 2) 系统工具交叉验证（尽力而为）。
+  // 工具**不可用**时跳过并提示：`unzip` 不是 Windows 自带（需 Git for Windows 的 CmdTools，
+  // MinGit 版不含），把它当致命条件会让没装该工具的 Windows 机器直接构建失败。
+  // 但工具**存在却失败**时仍必须报错——那说明产物可能真的损坏。
+  const crossCheck = artifact.kind === 'zip'
+    ? { tool: 'unzip', args: ['-l', artifact.path] }
+    : { tool: 'tar', args: ['-tzf', artifact.path] };
+  if (hasSystemTool(crossCheck.tool)) {
+    execFileSync(crossCheck.tool, crossCheck.args, { stdio: 'pipe' });
+    log(`系统工具交叉验证通过（${crossCheck.tool}）：${name}`);
+  } else {
+    log(`提示：未找到 ${crossCheck.tool}，跳过系统工具交叉验证（自研读取器校验已通过）`);
+  }
+
+  // 3) require 冒烟：把包内 JS 释放到临时目录，实际 require 一次 controller
+  verifyRequireClosure(name, entries);
+
+  log(`校验通过（依赖闭包 + 系统工具 + require 冒烟）：${name}，${names.length} 个条目`);
+}
+
+// 系统上是否存在可执行工具（用于决定是否做交叉验证）。
+function hasSystemTool(tool) {
+  try {
+    execFileSync(process.platform === 'win32' ? 'where' : 'which', [tool], { stdio: 'ignore' });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// NSIS 安装器校验：PE 头（致命）+ 体积合理性（致命）+ 内嵌文件名扫描（仅告警）。
+//
+// verifyNsis：PE 头（致命）+ 体积合理性（致命）+ 内嵌文件名扫描（仅告警）。
+//
+// 体积下限不能一刀切：不带内嵌 Node 的安装器**合法地**很小——实测真实
+// COMPANION_FILES + 真图标、无 bin/node.exe 时 makensis 产出 80592 字节（约 79KB）。
+// 早期用固定 1MiB 会把这种好包判成"疑似空包"，并让整个构建 exit 1。
+// 因此阈值按"是否内嵌 node"区分：
+//   - 内嵌：安装器必须显著大于 node 二进制本身（用 8MiB 作宽松下限，node.exe 约 90MB）
+//   - 未内嵌：只要不是几百字节的残骸即可（1KiB）
+function verifyNsis(name, filePath) {
+  const buf = fs.readFileSync(filePath);
+  if (buf.subarray(0, 2).toString('ascii') !== 'MZ') {
+    throw new Error(`${name}: 不是合法的 PE 可执行文件（缺 MZ 头）`);
+  }
+
+  const hasEmbeddedNode = COMPANION_FILES.length > 0 && fs.existsSync(path.join(DIST, '.stage-win-nsis', 'bin', 'node.exe'));
+  const MIN_BYTES = hasEmbeddedNode ? 8 * 1024 * 1024 : 1024;
+  if (buf.length < MIN_BYTES) {
+    const kind = hasEmbeddedNode ? '已内嵌 node.exe' : '未内嵌 node.exe';
+    throw new Error(`${name}: 体积异常（${buf.length} 字节，${kind}，下限 ${MIN_BYTES}），疑似空包`);
+  }
+
+  // 文件名扫描仅作告警，且**同时查 UTF-8/ASCII 与 UTF-16LE**：
+  // Unicode NSIS 的字符串表是 UTF-16LE，只用 latin1 查会恒为 false，
+  // 每次都打印"未检出"——那样的诊断信息没有价值。
+  const hasLatin = (f) => buf.includes(Buffer.from(f, 'latin1'));
+  const hasUtf16 = (f) => buf.includes(Buffer.from(f, 'utf16le'));
+  const notFound = COMPANION_FILES.filter((f) => !hasLatin(f) && !hasUtf16(f));
+  if (notFound.length > 0) {
+    // 非致命：LZMA 压缩后文件名可能整体位于压缩流中，不可见属正常。
+    log(`提示：${name} 未检出 ${notFound.join(', ')}（LZMA 压缩下属正常，不作为失败条件）`);
+  }
+  log(`校验通过（PE 头 + 体积合理性）：${name}，${(buf.length / 1048576).toFixed(1)} MB`);
+}
+
+// DMG 校验：hdiutil verify 后挂载，确认 .app 结构与依赖闭包完整。
+function verifyDmg(name, filePath) {
+  execFileSync('hdiutil', ['verify', filePath], { stdio: 'pipe' });
+
+  const mountPoint = fs.mkdtempSync(path.join(require('os').tmpdir(), 'zca-dmg-'));
+  try {
+    execFileSync('hdiutil', ['attach', filePath, '-nobrowse', '-readonly', '-mountpoint', mountPoint], { stdio: 'pipe' });
+    try {
+      const appDir = path.join(mountPoint, 'ZCode Advisor.app');
+      if (!fs.existsSync(appDir)) throw new Error(`${name}: DMG 内缺少 ZCode Advisor.app`);
+
+      const resources = path.join(appDir, 'Contents', 'Resources');
+      const launcher = path.join(appDir, 'Contents', 'MacOS', 'ZCodeAdvisor');
+      if (!fs.existsSync(launcher)) throw new Error(`${name}: .app 缺少可执行启动器`);
+
+      const missing = COMPANION_FILES.filter((f) => !fs.existsSync(path.join(resources, 'app', f)));
+      if (missing.length > 0) {
+        throw new Error(`${name}: .app 内缺少运行时文件 ${missing.join(', ')}`);
+      }
+      log(`校验通过（hdiutil verify + .app 结构与依赖闭包）：${name}，${(fs.statSync(filePath).size / 1048576).toFixed(1)} MB`);
+    } finally {
+      execFileSync('hdiutil', ['detach', mountPoint, '-quiet'], { stdio: 'pipe' });
+    }
+  } catch (err) {
+    // 挂载失败时尝试清理，但把原始错误抛给调用方
+    try { execFileSync('hdiutil', ['detach', mountPoint, '-force', '-quiet'], { stdio: 'pipe' }); } catch (_) {}
+    throw err;
+  } finally {
+    try { fs.rmdirSync(mountPoint); } catch (_) { /* 挂载点非空/已卸载：保留即可 */ }
+  }
+}
+
+// 把产物中的 JS 文件释放到临时目录并 require 入口，确认依赖确实可解析。
+// 这是拦住"清单漏项"类问题的最终防线：结构对了、但 require 挂掉同样不可交付。
+function verifyRequireClosure(name, entries) {
+  const { execFileSync: run } = require('child_process');
+  const tmp = fs.mkdtempSync(path.join(require('os').tmpdir(), 'zca-smoke-'));
+
+  try {
+    for (const e of entries) {
+      if (!/\.(cjs|js)$/.test(e.path)) continue;
+      const dest = path.join(tmp, e.path);
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, e.data);
+    }
+
+    // controller.cjs 顶层只做定义与 require，不会自动启动（main() 在文件末尾调用，
+    // 故这里改为只解析依赖图：require 每个模块并检查是否抛 MODULE_NOT_FOUND）。
+    for (const f of COMPANION_FILES) {
+      if (!f.endsWith('.cjs')) continue; // inject.js 是页面脚本，不参与 require
+      try {
+        run(process.execPath, ['-e', `require(${JSON.stringify(path.join(tmp, f))})`], {
+          stdio: 'pipe',
+          timeout: 20000,
+          env: Object.assign({}, process.env, { ZCODE_ADVISOR_REQUIRE_SMOKE: '1' })
+        });
+      } catch (err) {
+        const out = `${err.stdout || ''}${err.stderr || ''}`.trim().slice(0, 400);
+        throw new Error(`${name}: require 冒烟失败（${f}）—— ${out || err.message}`);
+      }
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// ---------------- 入口 ----------------
 
 (async () => {
-  log(`构建 ZCode Advisor 发行包 v${VERSION}`);
-  fs.rmSync(DIST, { recursive: true, force: true });
+  const opts = parseArgs(process.argv.slice(2));
+  log(`构建 ZCode Advisor 发行包 v${VERSION}（平台参数 mac-arch=${opts.macArch}）`);
+
+  // 清理上次产物：**不删除**，移入 dist/.previous/（保留可回溯性，也避免误删手工放置的文件）。
+  // .cache 与 .previous 自身不动。
+  if (fs.existsSync(DIST)) {
+    const prev = path.join(DIST, '.previous');
+    let moved = 0;
+    for (const f of fs.readdirSync(DIST)) {
+      if (f === '.cache' || f === '.previous') continue;
+      fs.mkdirSync(prev, { recursive: true });
+      const from = path.join(DIST, f);
+      const to = path.join(prev, f);
+      try {
+        if (fs.existsSync(to)) fs.rmSync(to, { recursive: true, force: true }); // 覆盖上上次同名产物
+        fs.renameSync(from, to);
+        moved++;
+      } catch (_) { /* 跨设备或占用：跳过，不阻断构建 */ }
+    }
+    if (moved > 0) log(`上次产物 ${moved} 项已移入 dist/.previous/`);
+  }
   stageDir(DIST);
-  buildWin();
-  await buildMac();
-  log('构建完成。产物位于 dist/');
+
+  const artifacts = [];
+
+  if (!opts.skipWin) {
+    artifacts.push(...await buildWin(opts));
+  }
+
+  if (!opts.skipMac) {
+    // mac 产物可在任意平台交叉构建（只做二进制搬运，不执行），故不限制构建机平台。
+    const arches = opts.macArch === 'both' ? ['x64', 'arm64'] : [opts.macArch];
+    for (const arch of arches) {
+      artifacts.push(...await buildMac(arch, opts));
+    }
+  }
+
+  // 校验阶段：单个产物失败不应掩盖其它产物的结论，先全跑完再汇总
+  const failures = [];
+  for (const a of artifacts) {
+    try {
+      verifyArtifact(a);
+    } catch (err) {
+      failures.push(`${path.basename(a.path)}: ${err.message}`);
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(`产物校验失败：\n  - ${failures.join('\n  - ')}`);
+  }
+
+  log(`构建完成：${artifacts.length} 个产物位于 dist/`);
 })().catch((err) => {
   console.error('[build] 失败：', err && err.stack ? err.stack : err);
   process.exit(1);
