@@ -35,6 +35,7 @@ const {
 const {
   decideAction, decideActionAsync, prefixFor, applyDeliveryToState, enqueueNote
 } = require('./lib/route');
+const { appendHistory } = require('./lib/history');
 
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const SCRIPT_PATH = path.join(__dirname, 'advisor-hook.js');
@@ -204,6 +205,13 @@ function onUserPromptSubmit(ctx) {
       hookEventName: 'UserPromptSubmit',
       additionalContext: deliver
     }
+  });
+  // 历史记录：意见真实送达主会话（与入队记录通过 ts 顺序可对应）
+  appendHistory({
+    event: 'delivered',
+    count: deliveredNoteCount,
+    sessionId,
+    mode: 'async'
   });
   // 只清除自己已投递的前 deliveredNoteCount 条——临界区间隙里 worker 新入队的意见不受影响。
   mutateStateExclusive(file, (s) => {
@@ -412,6 +420,14 @@ async function onStopSync(ctx) {
       // 队列满被丢弃时不计入 steer/deferred（不设"幻影冷却"）。
       applyDeliveryToState(s, false, cfg);
       s.lastAction = queued ? `queued:${frame.severity}` : `dropped:${frame.severity}`;
+      // 历史记录（issue #102 可见性）：入队即记，事件标注 queued/dropped
+      appendHistory({
+        event: queued ? 'queued' : 'dropped:queue_overflow',
+        severity: frame.severity,
+        note: frame.note,
+        sessionId: s.sessionId,
+        mode: 'sync'
+      });
     });
     return;
   }
@@ -553,6 +569,14 @@ async function handleReviewWorker(args) {
       } else {
         s.lastAction = `dropped:${frame.severity}`;
       }
+      // 历史记录（issue #102 可见性）：async 模式入队即记
+      appendHistory({
+        event: queued ? 'queued' : 'dropped:queue_overflow',
+        severity: frame.severity,
+        note: frame.note,
+        sessionId: s.sessionId,
+        mode: 'async'
+      });
     });
   } catch (err) {
     // worker 内任何异常：留下计数痕迹（此前版本此处静默消失），尽力落盘。

@@ -20,6 +20,28 @@ const { spawn, execSync } = require('child_process');
 const { modelsUrl, parseModels } = require('./lib.cjs');
 const { detectZcodePath, missingHint } = require('./zcode-path.cjs');
 
+// —— 顾问意见历史读取 ——
+// 为什么不复用 hooks/lib/history：发行包只随带 companion 四个文件（hooks/ 不存在），
+// 跨目录 require 会静默失效。读取逻辑只有十几行，这里内联一份；
+// 写入侧仍统一在 hooks/lib/history（单写多读，格式漂移风险由测试锁住）。
+const HISTORY_FILE = process.env.ZCODE_ADVISOR_HISTORY
+  || path.join(os.homedir(), '.zcode', 'advisor-history.jsonl');
+
+function readHistory(limit) {
+  const max = Number.isFinite(limit) && limit > 0 ? limit : 50;
+  try {
+    if (!fs.existsSync(HISTORY_FILE)) return [];
+    const lines = fs.readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(Boolean);
+    const out = [];
+    for (let i = lines.length - 1; i >= 0 && out.length < max; i--) {
+      try { out.push(JSON.parse(lines[i])); } catch (_) { /* 跳过坏行 */ }
+    }
+    return out;
+  } catch (_) {
+    return [];
+  }
+}
+
 const HOME = os.homedir();
 const USER_CONFIG = process.env.ZCODE_ADVISOR_USER_CONFIG || path.join(HOME, '.zcode', 'advisor.config.json');
 const COMPANION_CONFIG = process.env.ZCODE_ADVISOR_COMPANION_CONFIG || path.join(HOME, '.zcode', 'advisor-companion.json');
@@ -430,6 +452,10 @@ function startApi(cdpPort, apiPort, token) {
       }
       if (req.method === 'GET' && req.url === '/api/status') {
         return done(200, { ok: true, attachedPages: attached.size, cdpPort });
+      }
+      // 顾问意见历史（issue #102 可见性）：读 JSONL 追加日志，新的在前
+      if (req.method === 'GET' && req.url === '/api/history') {
+        return done(200, { ok: true, history: readHistory(50), file: HISTORY_FILE });
       }
       return done(404, { ok: false, error: 'not_found' });
     } catch (err) {

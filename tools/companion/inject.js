@@ -63,6 +63,19 @@
 .zca-ok{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.35);color:#6ee7b7}
 .zca-bad{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:#fca5a5}
 .zca-status{margin:0 0 4px;padding:7px 9px;background:#242833;border-radius:8px;color:#8b94a3;font-size:12px;word-break:break-all}
+/* 历史记录区：折叠展示，展开后只读最近若干条 */
+.zca-history{margin-top:12px;border-top:1px solid #333842;padding-top:8px}
+.zca-history-head{display:flex;justify-content:space-between;align-items:center;cursor:pointer;color:#8b94a3;font-size:12px;user-select:none}
+.zca-history-head:hover{color:#e6e8ec}
+.zca-history-body{margin-top:6px;display:none;max-height:200px;overflow:auto}
+.zca-history-item{padding:6px 8px;border-radius:6px;background:#242833;margin-bottom:6px}
+.zca-history-item .h-ts{color:#6b7280;font-size:11px}
+.zca-history-item .h-sev{font-weight:600;font-size:11px;margin-right:6px}
+.zca-history-item .h-note{color:#c8cdd6;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.zca-history-item.ev-delivered .h-sev{color:#6ee7b7}
+.zca-history-item.ev-queued .h-sev{color:#93c5fd}
+.zca-history-item[class*="ev-dropped"] .h-sev{color:#fca5a5}
+.zca-history-empty{color:#6b7280;font-size:12px;padding:4px 0}
 .zca-hint{color:#6b7280;font-size:11px;margin-top:8px}
 /* 面板在窗口较矮时上移到输入框上方，避免被裁掉 */
 @media (max-height: 620px){.zca-panel{bottom:auto;top:64px;max-height:calc(100vh - 96px)}}
@@ -133,6 +146,38 @@
     m.textContent = text;
     m.style.display = 'block';
     m.className = 'zca-msg ' + (ok ? 'zca-ok' : 'zca-bad');
+  }
+
+  // 顾问意见历史：读 controller 的 /api/history（JSONL 追加日志，新的在前）。
+  // 数据侧写入点在 hooks/lib/history（入队/丢弃/送达三个事件），此处只读。
+  async function fetchHistory() {
+    const box = document.getElementById('zca-history-body');
+    if (!box) return;
+    try {
+      const r = await api('/api/history');
+      const items = (r && r.ok && Array.isArray(r.history)) ? r.history : [];
+      if (items.length === 0) {
+        box.innerHTML = '<div class="zca-history-empty">暂无记录——顾问意见产生后会出现在这里</div>';
+        return;
+      }
+      box.innerHTML = items.map((it) => {
+        const ts = String(it.ts || '').replace('T', ' ').slice(5, 16);   // MM-DD HH:MM
+        const sev = it.severity || it.event || '-';
+        const note = String(it.note || (it.event === 'delivered' ? `已送达 ${it.count || ''} 条意见` : it.event || '')).slice(0, 200);
+        const cls = it.event === 'delivered' ? 'ev-delivered' : (String(it.event).startsWith('dropped') ? 'ev-dropped' : 'ev-queued');
+        return `<div class="zca-history-item ${cls}">`
+          + `<span class="h-ts">${ts}</span> <span class="h-sev">${sev}</span>`
+          + `<div class="h-note"></div></div>`;
+      }).join('');
+      // 用 textContent 填正文，避免把模型产出当作 HTML 注入（注入链防线的一部分）
+      const nodes = box.querySelectorAll('.h-note');
+      items.forEach((it, i) => {
+        const note = String(it.note || (it.event === 'delivered' ? `已送达 ${it.count || ''} 条意见` : it.event || '')).slice(0, 200);
+        if (nodes[i]) nodes[i].textContent = note;
+      });
+    } catch (e) {
+      box.innerHTML = `<div class="zca-history-empty">读取失败：${String(e).slice(0, 80)}</div>`;
+    }
   }
 
   async function refreshStatus() {
@@ -317,6 +362,12 @@
         <button class="zca-btn alt" id="zca-ping">Ping</button>
       </div>
       <div class="zca-msg" id="zca-msg"></div>
+      <div class="zca-history" id="zca-history">
+        <div class="zca-history-head" id="zca-history-head">
+          <span>📜 顾问意见记录</span><span id="zca-history-arrow">▸</span>
+        </div>
+        <div class="zca-history-body" id="zca-history-body"></div>
+      </div>
       <div class="zca-status" style="margin-top:10px">保存后下一轮审查即生效；意见以 [advisor:*] 前缀随下一条消息送达。</div>
     `;
     document.body.appendChild(p);
@@ -324,6 +375,18 @@
     p.querySelector('#zca-save').addEventListener('click', save);
     p.querySelector('#zca-ping').addEventListener('click', ping);
     p.querySelector('#zca-models').addEventListener('click', fetchModels);
+
+    // 历史区：默认折叠；首次展开才拉取（后续展开用缓存，点头部可强制刷新）
+    const head = p.querySelector('#zca-history-head');
+    const body = p.querySelector('#zca-history-body');
+    const arrow = p.querySelector('#zca-history-arrow');
+    let historyLoaded = false;
+    head.addEventListener('click', () => {
+      const open = body.style.display === 'block';
+      body.style.display = open ? 'none' : 'block';
+      arrow.textContent = open ? '▸' : '▾';
+      if (!open && !historyLoaded) { historyLoaded = true; fetchHistory(); }
+    });
     return p;
   }
 

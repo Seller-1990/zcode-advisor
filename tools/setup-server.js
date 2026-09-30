@@ -13,6 +13,7 @@ const { spawn } = require('child_process');
 const { writeUserConfig, USER_CONFIG } = require('./config-bridge');
 const { loadConfig, resolveApiKey, gate, configWarnings, maskKey, isPlaceholderKey } = require('../hooks/lib/config');
 const { callReviewer } = require('../hooks/lib/reviewer');
+const { readHistory } = require('../hooks/lib/history');
 
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 // 端口解析顺序：--port= 参数 > ZCODE_ADVISOR_PANEL_PORT 环境变量 > 默认 8789
@@ -78,6 +79,26 @@ function page() {
 <button onclick="save()">保存配置</button>
 <button class="alt" onclick="ping()">Ping 测试（验证 key 与模型）</button>
 <div id="msg"></div>
+</fieldset>
+<fieldset><legend>📜 顾问意见记录（最近 50 条）</legend>
+<div id="hist" style="font-size:13px;color:#444">载入中…</div>
+<script>
+(async()=>{
+  try{
+    const r=await post('/api/history',{});
+    const items=(r&&r.ok&&Array.isArray(r.history))?r.history:[];
+    if(items.length===0){document.getElementById('hist').textContent='暂无记录——顾问意见产生后会出现在这里';return;}
+    document.getElementById('hist').innerHTML=items.map(it=>{
+      const ts=String(it.ts||'').replace('T',' ').slice(5,16);
+      const sev=it.severity||it.event||'-';
+      const note=String(it.note||(it.event==='delivered'?('已送达 '+(it.count||'')+' 条意见'):it.event||'')).slice(0,200);
+      return '<div style="margin:6px 0"><b>'+ts+'</b> ['+sev+'] <span></span></div>';
+    }).join('');
+    const spans=document.querySelectorAll('#hist span');
+    items.forEach((it,i)=>{ if(spans[i]) spans[i].textContent=String(it.note||(it.event==='delivered'?('已送达 '+(it.count||'')+' 条意见'):it.event||'')).slice(0,200); });
+  }catch(e){document.getElementById('hist').textContent='读取失败：'+e;}
+})();
+</script>
 </fieldset>
 <fieldset><legend>说明</legend>
 <small>保存写入用户级配置文件（跨插件升级保留，不在任何 git 仓库内）。审查在每轮结束时由后台进程进行；
@@ -166,6 +187,10 @@ const server = http.createServer((req, res) => {
         send(500, { ok: false, error: String(err).slice(0, 200) });
       }
     });
+    return;
+  }
+  if (req.method === 'GET' && req.url === '/api/history') {
+    send(200, { ok: true, history: readHistory(50), file: require('../hooks/lib/history').HISTORY_FILE });
     return;
   }
   if (req.method === 'POST' && req.url === '/api/ping') {
