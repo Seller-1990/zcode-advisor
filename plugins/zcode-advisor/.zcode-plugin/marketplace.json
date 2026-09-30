@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "zcode-advisor",
-      "source": "./plugins/zcode-advisor",
+      "source": "./",
       "displayName": "ZCode Advisor",
       "displayName_i18n": {
         "en": "ZCode Advisor",

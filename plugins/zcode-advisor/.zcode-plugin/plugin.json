@@ -1,0 +1,44 @@
+{
+  "name": "zcode-advisor",
+  "version": "0.2.1",
+  "description": "dsh-advisor 的 zcode 移植：独立审查副模型在每轮结束后被动审查对话增量，以 nit/concern/blocker 三级建议注回会话（advisory-only，绝不阻塞主流程）。",
+  "author": {
+    "name": "local"
+  },
+  "license": "MIT",
+  "commands": "commands",
+  "mcpServers": {
+    "config-bridge": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/tools/config-bridge.js"],
+      "env": {
+        "ZCODE_ADVISOR_CFG_API_KEY": "${user_config.api_key}",
+        "ZCODE_ADVISOR_CFG_MODEL": "${user_config.model}",
+        "ZCODE_ADVISOR_CFG_BASE_URL": "${user_config.base_url}",
+        "ZCODE_ADVISOR_CFG_REVIEW_MODE": "${user_config.review_mode}"
+      }
+    }
+  },
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "default": "",
+      "description": "审查模型 API key（智谱 BigModel/Z.ai）。保存后由桥接进程写入用户级配置 ~/.zcode/advisor.config.json，下一轮审查即生效，无需重启"
+    },
+    "model": {
+      "type": "string",
+      "default": "glm-5.3-flash",
+      "description": "审查模型 id。建议与主对话模型形成能力差；思考型模型建议把 max_tokens 提到 4096"
+    },
+    "base_url": {
+      "type": "string",
+      "default": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "description": "OpenAI 兼容端点。非官方端点会在 /advisor-status 中给出明文/key 配对警告"
+    },
+    "review_mode": {
+      "type": "string",
+      "default": "async",
+      "description": "审查模式：async（默认，零体感延迟，意见随下一条消息送达）或 sync（当轮打断，每轮收尾等待审查）"
+    }
+  }
+}

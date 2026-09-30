@@ -81,3 +81,40 @@ test('HISTORY_FILE 指向 ~/.zcode（与配置/面板读取路径一致）', () 
     path.join(os.homedir(), '.zcode', 'advisor-history.jsonl')
   );
 });
+
+// ---------------- STATE_DIR 隔离（防回归） ----------------
+// 背景：e2e 曾在无隔离时把假记录写进用户真实 ~/.zcode（靠手动 ls 才发现）。
+// 锁住：设置了 ZCODE_ADVISOR_STATE_DIR 时，历史必须落在 stateDir 下。
+
+test('STATE_DIR 隔离：历史落在 stateDir/advisor-history.jsonl，而非用户目录', () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zca-state-'));
+  const userHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zca-fakehome-'));
+  // 子进程：STATE_DIR 指向隔离目录，HOME 指向假主目录（确保真实 ~/.zcode 绝不参与）
+  const runner = `
+    process.env.ZCODE_ADVISOR_STATE_DIR = ${JSON.stringify(stateDir)};
+    process.env.HOME = ${JSON.stringify(userHome)};
+    delete process.env.ZCODE_ADVISOR_HISTORY;
+    const H = require(${JSON.stringify(path.join(__dirname, '../hooks/lib/history'))});
+    H.appendHistory({ event: 'queued', severity: 'nit', note: '隔离测试' });
+    process.stdout.write(JSON.stringify({
+      stateFile: H.HISTORY_FILE,
+      existsInState: require('fs').existsSync(${JSON.stringify(path.join(stateDir, 'advisor-history.jsonl'))}),
+      existsInFakeHome: require('fs').existsSync(${JSON.stringify(path.join(userHome, '.zcode/advisor-history.jsonl'))})
+    }));
+  `;
+  const out = execFileSync(process.execPath, ['-e', runner], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const got = JSON.parse(out.trim().split('\n').pop());
+
+  assert.strictEqual(got.stateFile, path.join(stateDir, 'advisor-history.jsonl'), 'HISTORY_FILE 应解析到 stateDir');
+  assert.strictEqual(got.existsInState, true, '记录应写入 stateDir');
+  assert.strictEqual(got.existsInFakeHome, false, '绝不应写进（假）用户主目录');
+});
+
+test('STATE_DIR 隔离：读取也从 stateDir 读（读写同源）', () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zca-state-'));
+  const got = runInChild(path.join(stateDir, 'h.jsonl'), `
+    H.appendHistory({ event: 'queued', severity: 'nit', note: 'x' });
+    process.stdout.write(JSON.stringify(H.readHistory(10)));
+  `);
+  assert.strictEqual(got.length, 1);
+});
