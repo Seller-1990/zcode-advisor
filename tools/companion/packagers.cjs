@@ -24,11 +24,20 @@ function version4(v) {
 }
 
 // NSIS 脚本。路径统一用正斜杠（NSIS 接受），避免反斜杠转义问题。
+//
+// File 指令为什么用**相对路径**（`SRCFILES` 定义 + 相对 srcDir）：
+// 实测 CI（windows-2022，makensis v3.10）上 `File /r "D:/abs/path/*.*"` 报
+// "no files found" —— makensis 对「绝对路径 + 通配符」的组合在 Windows 上解析不可靠。
+// 改为把 .nsi 放在 srcDir 的**父目录**、引用相对路径 `SRCFILES\*.*`，
+// 并让 makensis 以脚本所在目录为工作目录（cd 到该目录再调用），两侧一致后解析稳定。
 function nsisScript(opts) {
-  const { outFile, iconPath, srcDir, version } = opts;
+  const { outFile, iconPath, version } = opts;
   return `Unicode true
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+
+; 待打包目录（相对本脚本）：由构建脚本保证 .nsi 与 srcDir 同级
+!define SRCFILES "stage"
 
 Name "ZCode Advisor"
 OutFile "${outFile}"
@@ -63,7 +72,7 @@ VIAddVersionKey "ProductVersion" "${version}"
 
 Section "Install"
   SetOutPath "$INSTDIR"
-  File /r "${srcDir}/*.*"
+  File /r "\${SRCFILES}\\*.*"
 
   WriteRegStr HKCU "Software\\ZCodeAdvisor" "InstallDir" "$INSTDIR"
 
@@ -114,17 +123,18 @@ function buildNsisInstaller(opts) {
   const { workDir, srcDir, iconPath, version, outFile } = opts;
   fs.mkdirSync(workDir, { recursive: true });
 
-  // 先写脚本再检查工具：脚本本身可用于审阅与诊断（例如排查编码问题），
-  // 不应该因为本机没装 makensis 就不产出。
-  const nsiPath = path.join(workDir, `zcode-advisor-${version}.nsi`);
+  // 脚本写到 srcDir 的**父目录**，使 File /r 的相对路径（stage\*.*）可解析。
+  // 背景见 nsisScript 的注释：绝对路径 + 通配符在 Windows 的 makensis 上解析不可靠。
+  const nsiPath = path.join(path.dirname(srcDir), `zcode-advisor-${version}.nsi`);
+  const iconRel = path.relative(path.dirname(nsiPath), iconPath).replace(/\\/g, '/');
+
   // **必须带 UTF-8 BOM**：脚本含中文，而 makensis 在 Windows 上默认按系统 ACP 解析
   // 非 BOM 输入（NSIS 源码 utf.cpp 的 DetectUTFBOM 只识别 BOM，识别失败即回落到 ACP）。
   // 无 BOM 的 UTF-8 + 中文 → "Bad text encoding"，编译失败，而失败会被上层当成
   // "跳过安装器" 吞掉，导致 CI 绿灯却不产出 setup.exe。加 BOM 后任何平台都按 UTF-8 解析。
   const nsiSource = Buffer.from(nsisScript({
     outFile: outFile.replace(/\\/g, '/'),
-    iconPath: iconPath.replace(/\\/g, '/'),
-    srcDir: srcDir.replace(/\\/g, '/'),
+    iconPath: iconRel,
     version
   }), 'utf8');
   fs.writeFileSync(nsiPath, Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), nsiSource]));
@@ -134,7 +144,8 @@ function buildNsisInstaller(opts) {
   }
 
   try {
-    execFileSync('makensis', ['-V2', nsiPath], { stdio: 'pipe' });
+    // 以 .nsi 所在目录为工作目录运行（与脚本内相对路径的定义一致）
+    execFileSync('makensis', ['-V2', nsiPath], { stdio: 'pipe', cwd: path.dirname(nsiPath) });
   } catch (err) {
     // 已知现象一：部分平台/版本的 makensis 二进制自身崩溃（如 macOS Homebrew 3.12 的
     // std::bad_alloc → SIGABRT）。此时 stderr 只有 libc++abi 提示，需要转成可读原因。

@@ -36,16 +36,16 @@ test('version4：补成 4 段数字（满足 VIProductVersion 要求）', () => 
 test('nsisScript：构建期路径用正斜杠、含关键段落与卸载项', () => {
   const script = P.nsisScript({
     outFile: 'C:/out/setup.exe',
-    iconPath: 'C:/stage/advisor.ico',
-    srcDir: 'C:/stage',
+    iconPath: 'stage/advisor.ico',
     version: '0.2.0'
   });
-  // 说明：脚本中会有 `$LOCALAPPDATA\ZCodeAdvisor` 这类 **Windows 目标路径**（反斜杠是语义要求），
-  // 这里只约束"构建期传入的路径"必须已被规范成正斜杠。
+  // 说明：脚本中会有 `$LOCALAPPDATA\ZCodeAdvisor` 这类 **Windows 目标路径**（反斜杠是语义要求）。
+  // File 指令改用相对路径（stage\*.*）——绝对路径+通配符在 Windows 的 makensis 上解析不可靠
+  // （CI 实测 "no files found"，导致 setup.exe 静默缺失）。
   assert.match(script, /OutFile "C:\/out\/setup\.exe"/);
-  assert.match(script, /!define MUI_ICON "C:\/stage\/advisor\.ico"/);
-  assert.match(script, /File \/r "C:\/stage\/\*\.\*"/);
-  assert.ok(!/C:\\out/.test(script), '构建期路径不应残留反斜杠');
+  assert.match(script, /!define MUI_ICON "stage\/advisor\.ico"/);
+  assert.match(script, /!define SRCFILES "stage"/);
+  assert.match(script, /File \/r "\$\{SRCFILES\}\\\*\.\*"/);
   assert.match(script, /Unicode true/);
   assert.match(script, /InstallDir "\$LOCALAPPDATA\\ZCodeAdvisor"/);
   assert.match(script, /VIProductVersion "0\.2\.0\.0"/);
@@ -54,7 +54,7 @@ test('nsisScript：构建期路径用正斜杠、含关键段落与卸载项', (
 });
 
 test('nsisScript：快捷方式指向原始 node.exe 且最小化显示（非隐藏）', () => {
-  const script = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', srcDir: 's', version: '1.0.0' });
+  const script = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', version: '1.0.0' });
   // 不改名：直接指向 bin\node.exe
   assert.match(script, /CreateShortCut "\$DESKTOP\\ZCode Advisor\.lnk" "\$INSTDIR\\bin\\node\.exe"/);
   // SW_SHOWMINIMIZED (=7)，不隐藏控制台
@@ -63,7 +63,7 @@ test('nsisScript：快捷方式指向原始 node.exe 且最小化显示（非隐
 });
 
 test('nsisScript：卸载保留用户级配置（含 API key，不静默删除）', () => {
-  const script = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', srcDir: 's', version: '1.0.0' });
+  const script = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', version: '1.0.0' });
   assert.match(script, /Section "Uninstall"/);
   assert.match(script, /卸载保留用户级配置/);
   // 只看实际删除指令（注释里提到 .zcode 是说明，不是行为）：
@@ -81,7 +81,7 @@ test('buildNsisInstaller：makensis 不可用/崩溃时返回可读原因（不�
   const workDir = tmpDir();
   const r = P.buildNsisInstaller({
     workDir,
-    srcDir: tmpDir(),
+    srcDir: tmpDir(),          // .nsi 会写到它的父目录
     iconPath: '/nonexistent.ico',
     version: '0.0.1',
     outFile: path.join(tmpDir(), 'never.exe')
@@ -107,17 +107,17 @@ test('buildNsisInstaller：写出的 .nsi 带 UTF-8 BOM（含中文时的编码�
   // 回归：makensis 在 Windows 上按 ACP 解析非 BOM 输入（NSIS 源码 DetectUTFBOM 只认 BOM），
   // 无 BOM 的 UTF-8 + 中文会 "Bad text encoding" 编译失败，而失败被上层当成"跳过安装器"，
   // 造成 CI 绿灯却无 setup.exe。这里直接检查生成物首字节。
-  const workDir = tmpDir();
+  const srcDir = tmpDir();          // .nsi 写到它的父目录
   const outFile = path.join(tmpDir(), 'x.exe');
   P.buildNsisInstaller({
-    workDir,
-    srcDir: tmpDir(),
+    workDir: tmpDir(),
+    srcDir,
     iconPath: '/nonexistent.ico',
     version: '1.2.3',
     outFile
   });
 
-  const nsiPath = path.join(workDir, 'zcode-advisor-1.2.3.nsi');
+  const nsiPath = path.join(path.dirname(srcDir), 'zcode-advisor-1.2.3.nsi');
   assert.ok(fs.existsSync(nsiPath), '应生成 .nsi 脚本（无论 makensis 是否可用）');
   const head = fs.readFileSync(nsiPath).subarray(0, 3);
   assert.deepStrictEqual([...head], [0xEF, 0xBB, 0xBF], '.nsi 必须以 UTF-8 BOM 开头');
@@ -128,7 +128,7 @@ test('buildNsisInstaller：写出的 .nsi 带 UTF-8 BOM（含中文时的编码�
 });
 
 test('nsisScript：脚本含中文（这正是必须带 BOM 的原因）', () => {
-  const s = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', srcDir: 's', version: '1.0.0' });
+  const s = P.nsisScript({ outFile: 'o.exe', iconPath: 'i.ico', version: '1.0.0' });
   assert.ok(/[\u4e00-\u9fff]/.test(s), '脚本应含中文（否则 BOM 就不必要了）');
 });
 

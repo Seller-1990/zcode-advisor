@@ -184,6 +184,8 @@ async function buildWin(opts) {
         }
       }
       const setupPath = path.join(DIST, `ZCodeAdvisor-${VERSION}-win-x64-setup.exe`);
+      // .nsi 会写到 srcDir 的父目录（packagers.cjs 的相对路径设计），
+      // workDir 仅承载临时产物，不再决定脚本位置。
       const workDir = path.join(DIST, '.stage-win-nsis-build');
       const r = runNsisInChildProcess({ workDir, stage, iconPath: path.join(stage, 'advisor.ico'), setupPath });
       if (r.ok) {
