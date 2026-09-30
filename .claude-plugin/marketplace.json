@@ -1,0 +1,13 @@
+{
+  "name": "zcode-advisor-local",
+  "owner": {
+    "name": "local"
+  },
+  "plugins": [
+    {
+      "name": "zcode-advisor",
+      "source": "./",
+      "description": "每轮被动审查对话增量的独立审查副模型（dsh-advisor 的 zcode 移植）。"
+    }
+  ]
+}

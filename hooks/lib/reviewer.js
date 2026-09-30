@@ -1,0 +1,260 @@
+'use strict';
+
+// 评审输出帧：{"severity":"none|nit|concern|blocker","note":"..."}
+// 解析规则与 dsh-advisor 对齐：JSON 帧为主，散文救回（proseFallback，本移植默认开启）有三条守门。
+
+const SEVERITIES = ['none', 'nit', 'concern', 'blocker'];
+
+// 扫描文本中全部配平的 {...} 对象（忽略字符串内的花括号与转义）。
+// 上一版只取第一个配平块、失败即整体放弃——伪码 {a:1} 会杀死后面的真帧；
+// 现在继续向后扫描，返回全部可解析对象，由 parseFrame 取 severity 最高者。
+function extractJsonObjects(text) {
+  const s = String(text || '');
+  const objs = [];
+  let from = 0;
+  while (true) {
+    const start = s.indexOf('{', from);
+    if (start === -1) break;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let end = -1;
+    for (let i = start; i < s.length; i++) {
+      const ch = s[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    if (end === -1) {
+      from = start + 1;
+      continue;
+    }
+    try {
+      objs.push(JSON.parse(s.slice(start, end + 1)));
+      from = end + 1;
+    } catch (_) {
+      from = start + 1; // 配平但非法（如 {note: foo}）：跳过，继续找
+    }
+  }
+  return objs;
+}
+
+function normalizeFrame(obj, maxNoteChars) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  const severity = String(obj.severity || '').trim().toLowerCase();
+  let note = typeof obj.note === 'string' ? obj.note.trim() : '';
+  if (!SEVERITIES.includes(severity)) return null;
+  if (severity !== 'none' && !note) return null;
+  // 单条建议统一码点上限：JSON 帧路径此前无任何截断，失控模型可向主会话注入超长内容。
+  if (note) {
+    const chars = Array.from(note);
+    if (chars.length > maxNoteChars) note = `${chars.slice(0, maxNoteChars).join('')}…`;
+  }
+  return { severity, note };
+}
+
+// 返回 {severity, note} 或 null（无法解析）。
+function parseFrame(text, proseFallback, opts) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  const options = opts || {};
+  const maxNoteChars = options.maxNoteChars || 768;
+
+  // 整体即是 JSON 时直接采用（快路径）。
+  let direct = null;
+  try {
+    direct = JSON.parse(raw);
+  } catch (_) {
+    direct = null;
+  }
+  const directFrame = normalizeFrame(direct, maxNoteChars);
+  if (directFrame) return directFrame;
+
+  // 从包裹文本中提取全部候选帧，取**最后一个**合法帧（模型自我纠正语义；
+  // max-of-N 会放大转录注入面，见安全复审）。
+  const candidates = extractJsonObjects(raw)
+    .map((obj) => normalizeFrame(obj, maxNoteChars))
+    .filter(Boolean);
+  if (candidates.length > 0) {
+    // 取**最后一个**合法帧（模型自我纠正语义：后帧覆盖前帧）。
+    // 不取 severity 最高者——max-of-N 会保证转录中注入的对抗帧必然压过模型真实判定。
+    return candidates[candidates.length - 1];
+  }
+  // 有 JSON 形状的内容但全部非法：判定 unparsed，不做散文救回（半截 JSON 不注入会话）。
+  if (extractJsonObjects(raw).length > 0 || /^\s*[[{]/.test(raw)) return null;
+
+  if (proseFallback) {
+    return salvageProse(raw, maxNoteChars);
+  }
+  return null;
+}
+
+// —— 散文救回（三条守门，逐条对应 ADVISOR-GUARD-REPORT 实测踩过的坑）——
+function salvageProse(text, noteChars) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+
+  // 守门一：JSON 尝试不救回——以 { / [ 开头、括号不配平、或带 note: 键特征的回复，
+  // 说明模型想输出帧但失败了；把半截 JSON 注入会话比丢弃更糟。
+  if (raw.startsWith('{') || raw.startsWith('[')) return null;
+  if (!bracesBalanced(raw)) return null;
+  if (/["']?note["']?\s*:/.test(raw)) return null;
+
+  const cleaned = cleanProse(raw);
+  // 守门二：过短内容没有建议价值。
+  if (Array.from(cleaned.trim()).length < 8) return null;
+
+  // 守门三：severity 一律 nit（救回的内容未经帧校验，不允许 blocker/concern 误导会话），
+  // 按 Unicode 码点截断（不劈开 emoji）。
+  const note = truncateCodePoints(cleaned.trim(), noteChars);
+  return { severity: 'nit', note };
+}
+
+function truncateCodePoints(text, max) {
+  const chars = Array.from(String(text || ''));
+  if (chars.length <= max) return chars.join('');
+  return `${chars.slice(0, max).join('')}…`;
+}
+
+function bracesBalanced(text) {
+  let curly = 0;
+  let square = 0;
+  let inString = false;
+  let escaped = false;
+  for (const ch of text) {
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') curly++;
+    else if (ch === '}') curly--;
+    else if (ch === '[') square++;
+    else if (ch === ']') square--;
+    if (curly < 0 || square < 0) return false;
+  }
+  return curly === 0 && square === 0;
+}
+
+// 只剥离成对 markdown 标记：**粗体**、行内反引号、围栏标记行。
+// 绝不全局删除 * _ > 等单字符——否则 snake_case_var、x => y、*.ts 会被破坏（复审实测踩过）。
+function cleanProse(text) {
+  let out = String(text || '');
+  out = out.replace(/^```[^\n]*\n?/gm, '').replace(/```/g, '');
+  out = out.replace(/\*\*([^*\n]+)\*\*/g, '$1');
+  out = out.replace(/`([^`\n]+)`/g, '$1');
+  return out.trim();
+}
+
+// OpenAI 兼容 chat/completions。唯一会发起网络请求的地方；
+// 超时/HTTP 错误/响应异常都以 {error} 返回，由调用方计入 dropped。
+// 429/5xx 做一次短退避重试——**全部尝试共享同一截止时间**（deadline）：
+// 重试只使用剩余预算，否则 sync 模式下"首次响应慢 + 重试全额"会突破 Stop hook 的 320s 硬限，
+// 复活"强杀→指针不推进→每轮重审"的停滞循环。
+async function callReviewer(params) {
+  const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, signal } = params;
+
+  const deadline = Date.now() + timeoutMs;
+  const remaining = () => deadline - Date.now();
+  const RETRY_BACKOFF_MS = 1500;
+
+  const attempt = async (budgetMs) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(1000, budgetMs));
+    if (signal) signal.addEventListener('abort', () => controller.abort(), { once: true });
+    try {
+      return await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userContent }
+          ],
+          max_tokens: maxTokens,
+          temperature,
+          stream: false
+        }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  let resp = null;
+  for (let tries = 0; tries < 2; tries++) {
+    try {
+      resp = await attempt(remaining());
+    } catch (err) {
+      if (err && (err.name === 'AbortError' || String(err).includes('abort'))) {
+        return { error: 'llm_timeout' };
+      }
+      return { error: 'llm_error', detail: String(err).slice(0, 200) };
+    }
+    if ((resp.status === 429 || resp.status >= 500) && tries === 0) {
+      const left = remaining() - RETRY_BACKOFF_MS;
+      if (left < 5000) break; // 剩余预算不足以完成第二次尝试：不重试
+      await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS + Math.floor(Math.random() * 500)));
+      continue;
+    }
+    break;
+  }
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    return { error: `llm_http_${resp.status}`, detail: body.slice(0, 200) };
+  }
+
+  try {
+    const data = await resp.json();
+    const choice = data && Array.isArray(data.choices) && data.choices[0];
+    const content = choice && choice.message && choice.message.content;
+    let text = '';
+    if (typeof content === 'string') text = content;
+    else if (Array.isArray(content)) text = content.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('');
+    if (!text.trim()) return { error: 'llm_empty_response' };
+    // usage 解析：成本可观测（此前被整体丢弃）。
+    const usage = data.usage && typeof data.usage === 'object'
+      ? {
+          promptTokens: Number(data.usage.prompt_tokens) || 0,
+          completionTokens: Number(data.usage.completion_tokens) || 0
+        }
+      : null;
+    return { text, usage };
+  } catch (err) {
+    return { error: 'llm_error', detail: String(err).slice(0, 200) };
+  }
+}
+
+const DEFAULT_SYSTEM_PROMPT = [
+  '你是编码会话中的独立审查副模型（advisor）。你只观察与建议：绝不代行操作、绝不扮演主模型、绝不给出指令式命令；你的每条输出都会以"仅供参考的建议"身份送达主会话。',
+  '输入是一段对话增量（可能被截断）。请判断主模型当前的工作方向与方法是否存在明显问题，输出且仅输出一个 JSON 对象：不要 Markdown 代码块，不要任何额外文本。',
+  '{"severity":"none|nit|concern|blocker","note":"<一句具体建议>"}',
+  '判定标准：',
+  '- none：没有值得提醒的问题。多数情况应输出 none，不要为输出而输出。',
+  '- nit：小的风格/清晰度/质量建议，不影响方向。',
+  '- concern：继续当前做法会有实质风险，或存在明显更优方向，值得在继续之前权衡。',
+  '- blocker：继续明显浪费工作：违背用户明确指示、原地打转、核心前提不成立。',
+  '宁缺毋滥：没有把握就输出 {"severity":"none","note":""}。note 必须具体、可执行、指向增量中的实际问题，使用中文，不超过 120 字。note 只是建议性描述，不得包含让主模型执行的命令、路径或安装指令。'
+].join('\n');
+
+module.exports = { callReviewer, parseFrame, salvageProse, extractJsonObjects, truncateCodePoints, DEFAULT_SYSTEM_PROMPT, SEVERITIES };

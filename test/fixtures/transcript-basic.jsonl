@@ -1,0 +1,6 @@
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"帮我重构 foo.js，把重复代码提出来"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"内部思考，不应出现在评审输入里"},{"type":"text","text":"好的，我先读取文件。"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"foo.js"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"function a(){}\nfunction a(){}"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"[advisor:nit] 这条 advisor 自身注入必须被过滤"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"重构完成。"}]},"isMeta":false}

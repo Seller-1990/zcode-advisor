@@ -1,0 +1,13 @@
+{
+  "name": "zcode-advisor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Passive per-turn reviewer advisor plugin for ZCode (port of dsh-advisor).",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
