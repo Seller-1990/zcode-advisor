@@ -1,13 +1,23 @@
 {
   "name": "zcode-advisor-local",
   "owner": {
-    "name": "local"
+    "name": "Seller-1990"
   },
   "plugins": [
     {
       "name": "zcode-advisor",
       "source": "./",
-      "description": "每轮被动审查对话增量的独立审查副模型（dsh-advisor 的 zcode 移植）。"
+      "displayName": "ZCode Advisor",
+      "displayName_i18n": {
+        "en": "ZCode Advisor",
+        "zh-CN": "ZCode 顾问"
+      },
+      "description": "每轮被动审查对话增量的独立审查副模型（dsh-advisor 的 zcode 移植）。",
+      "description_i18n": {
+        "en": "An independent reviewer sub-model that passively reviews conversation deltas each turn and returns nit/concern/blocker suggestions.",
+        "zh-CN": "每轮被动审查对话增量的独立审查副模型：观察主会话转录，在每轮结束时评审是否存在明显问题，并以 nit/concern/blocker 三级建议注回会话（advisory-only，绝不阻塞主流程）。"
+      },
+      "category": "developer-tools"
     }
   ]
 }

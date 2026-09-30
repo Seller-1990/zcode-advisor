@@ -1,17 +1,69 @@
-# 安装后真机自检清单（第 3 条行动：宿主契约验证）
+# 安装后真机自检清单（宿主契约验证）
 
-> 以下三项实验验证的是 mock 测试无法覆盖的宿主契约。**任何一项失败都请把现象与
+> 以下实验验证的是 mock 测试无法覆盖的宿主契约。**任何一项失败都请把现象与
 > `/advisor-status` 的完整输出反馈回来**，对应机制将按真机行为重构。
-> 全部通过后，本插件即达可交付状态。
+>
+> 部分项已在开发机（macOS x86_64）实测通过并标注结论；未标注的仍需在你的机器上确认。
+
+## 实验 0：发行包与角标（原生部署链路）
+
+**构建**（macOS 与 Windows 均可；受限网络需令 nodejs.org 走代理）：
+
+```bash
+export https_proxy=http://127.0.0.1:7897   # 视网络环境
+NODE_USE_ENV_PROXY=1 npm run build -- --mac-arch=x64
+```
+
+✅ 通过标准：`dist/` 出现 zip / tar.gz（macOS 上还会出现 .dmg；Windows 上还会出现 setup.exe，前提是 makensis 可用）；
+构建日志显示「内嵌 Node：是」，且每个产物都出现对应的一行「校验通过」，三种形态的串为：
+
+- 绿色包：`校验通过（依赖闭包 + 系统工具 + require 冒烟）：…`
+- 安装器：`校验通过（PE 头 + 体积合理性）：…`
+- DMG：`校验通过（hdiutil verify + .app 结构与依赖闭包）：…`
+
+若显示「内嵌 Node：否」，需按提示配代理或换 `NODE_DIST_MIRROR`。
+
+**macOS 安装**（归档是**平铺**的，没有顶层目录，解压后直接执行 `install.sh`）：
+
+```bash
+mkdir -p zca && tar -xzf dist/ZCodeAdvisor-<v>-macos-x64.tar.gz -C zca
+cd zca && ./install.sh
+```
+
+或直接使用 DMG：打开 `ZCodeAdvisor-<v>-macos-x64.dmg`，把 `ZCode Advisor.app` 拖入 Applications。
+
+✅ 通过标准：`~/Applications/ZCode Advisor.app` 存在；启动台可见；`Contents/MacOS/ZCodeAdvisor` 可执行。
+
+**角标注入**（本项已在开发机实测通过）：
+
+```bash
+node tools/companion/controller.cjs     # 控制台保持开启
+```
+
+- ✅ 通过标准（已在开发机验证）：日志出现「ZCode 可执行文件：…（来源：自动探测…）」→
+  「发现已运行的调试实例（端口 9333），直接附着」或「CDP 通道就绪」→「已附着页面」；
+  ZCode 输入框右下角出现 🛡️ 角标。
+- 点击角标 → 设置面板可打开（已实测页面内 `__zcodeAdvisorInjected=true`、`zca-badge` 元素存在）。
+- 面板内完成「填端点 + key → 拉取模型 → Ping → 保存」，`~/.zcode/advisor.config.json` 被写入。
+- 刷新页面或新开窗口后角标应自动恢复（`addScriptToEvaluateOnNewDocument` 通道）。
+- ⚠️ **破坏性验证需用户自行执行**：若要验证「由本脚本冷启动 ZCode」，须先完全退出 ZCode
+  并停掉 zcode-plus 的 controller（避免调试端口争抢）；执行前请确认 ZCode 内无未保存工作。
+
+---
 
 ## 实验 1：注册行可达（覆盖：插件市场识别、`${CLAUDE_PLUGIN_ROOT}` 展开、UserPromptSubmit additionalContext 契约）
 
 1. ZCode → 设置 → 插件管理 → 添加插件市场 → 选择本项目目录 → 安装 `zcode-advisor` → 保持启用。
+   列表应显示「ZCode 顾问 / ZCode Advisor」（展示元数据来自 marketplace.json）。
 2. **新开会话**，发送任意一条消息（如"你好"）。
    ⚠️ 注意：斜杠命令与注册行都在**会话创建时**注册——安装前就打开的旧会话里没有它们，新建会话即可，不是故障。
 3. ✅ 通过标准：该消息前出现以 `[advisor]` 开头的注册行（含"脚本"与"状态文件"两个绝对路径；未配 key 时还会有一行"门禁未满足：missing:apiKey"——这本身也是被验证的行为）。
 4. 顺带验证命令链：运行 `/advisor-status`，应能执行并输出状态块（而不是"未挂载"）。
-5. 顺带验证插件设置表单：设置 → 插件管理 → zcode-advisor 详情页应出现配置字段（API key/模型/端点/模式）。若你的 ZCode 版本没有渲染该表单，改用双击 `配置面板.cmd` 的本地网页面板，并在反馈中注明。
+5. 顺带验证插件设置表单（⚠️ 预期**不渲染**）：
+   ZCode 官方插件规范（plugin-creator 的 `plugin-json-spec.md`）未定义 `userConfig`；
+   ZCode 3.14.4 的 `app.asar` 中亦未检索到插件系统处理该字段的逻辑。
+   **若详情页未出现配置表单，这属预期行为**——请改用 🛡️ 角标或双击 `配置面板.cmd`。
+   若你的版本确实渲染了表单，请在反馈中注明版本号（这会更新上述结论）。
 
 ## 实验 2：后台审查链路存活（覆盖：detached worker 在 hook 退出后存活、转录文件持续性）
 
@@ -29,7 +81,6 @@
 
 ## 附加验证（可选）
 
-- **输入框角标外挂**：双击 `启动-Advisor-ZCode.cmd`（若 ZCode 已在运行请先完全退出）→ 等控制台显示"CDP 通道就绪"与"已附着页面" → ZCode 输入框区域右下角出现 🛡️ 角标 → 点开设置面板 → 填端点与 key →「拉取模型」看是否列出模型 → 选模型 →「Ping 测试」→「保存」→ 回会话发一轮消息后 `/advisor-status` 看 Token 累计是否使用新配置。注意：`/models` 拉取取决于端点是否支持，BigModel 官方端点若不支持属预期（面板会提示手动输入）。
 - **resume/compact 重发注册行**：长会话触发压缩后，下一条消息应重新出现注册行（依赖宿主 SessionStart stdin 是否带 `source` 字段——未验证项）。
 - **sync 模式**：`advisor.config.json` 配 `reviewMode: "sync"`，观察 blocker 是否当轮打断、每轮收尾延迟是否可接受。
 - **mock 快速自检**（不消耗 key，Git Bash）：
@@ -47,6 +98,7 @@
 
 | 实验 | 结果（通过/失败+现象） | 日期 |
 | --- | --- | --- |
+| 0 发行包与角标 | 构建 + 路径探测 + 角标注入已在开发机通过（macOS x64） | 2026-09-30 |
 | 1 注册行 | | |
 | 2 后台审查 | | |
 | 3 解析产率 | | |

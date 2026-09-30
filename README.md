@@ -11,7 +11,14 @@ ZCode（z.ai CLI）插件：**每轮被动审查对话增量的独立审查副�
 
 ## 快速开始
 
-前置条件：**PATH 上有 Node ≥ 18**（hook 以 `node` 派生；`node -v` 自查）。
+前置条件：**PATH 上有 Node**（hook 以 `node` 派生；`node -v` 自查）。版本要求分两档：
+
+| 组件 | 最低 Node | 原因 |
+| --- | --- | --- |
+| hook 审查链路（SessionStart / UserPromptSubmit / Stop） | **≥ 18** | 只用 `fetch`、`fs` 等 18 起稳定的能力 |
+| 🛡️ 角标外挂（`tools/companion/controller.cjs`） | **≥ 22** | 依赖全局 `WebSocket`（v21 需 `--experimental-websocket`，22 起默认提供） |
+
+发行包内嵌官方 Node，目标机无需自行安装；仅在包**未内嵌**时才需要系统 Node 满足上表。
 
 1. **安装**：ZCode → 设置 → 插件管理 → 添加插件市场 → 选择本目录（`.claude-plugin/marketplace.json`，插件源指向自身；`.zcode-plugin/marketplace.json` 为等价副本）→ 安装 **zcode-advisor** 并保持启用。
 2. **新开会话**。
@@ -39,17 +46,96 @@ ZCode（z.ai CLI）插件：**每轮被动审查对话增量的独立审查副�
 
 **模型怎么选**：审查模型建议与主对话模型形成能力差（主模型是 flash 级时，审查优先试 `glm-5.3` 等更强模型，以套餐实际可用为准）。配置面板与 `/advisor-setup` 都能一键 Ping 验证候选模型；会话级临时切换用 `/advisor-model set <model-id>`（自下一轮审查生效）。注意 `maxTokens: 2048` 默认值**未在本插件目标端点验证过**——思考型模型建议 4096（768 会把预算耗在思考上导致空转，有实测）。
 
-## 输入框角标外挂（Companion，可选）
+## 发行包
 
-嫌命令和单独网页麻烦？参考 [zcode-plus](https://github.com/Llliao1113/zcode-plus) 的同类原理（CDP 注入），把设置入口直接做进 ZCode 界面：
+构建零第三方依赖，**macOS 与 Windows 均可运行**：
 
-- **双击 `启动-Advisor-ZCode.cmd`**：以调试模式拉起 ZCode，并保持一个控制台窗口（使用期间别关）；
+```bash
+npm run build                                   # 默认：win 全套 + 当前架构 mac 全套
+node tools/companion/build-installer.cjs --mac-arch=both   # 同时产出 mac x64 与 arm64
+node tools/companion/build-installer.cjs --skip-win        # 只出 mac
+node tools/companion/build-installer.cjs --no-installer    # 只出绿色包（跳过 exe/dmg）
+```
+
+| 产物 | 平台 | 形态 | 安装方式 |
+| --- | --- | --- | --- |
+| `ZCodeAdvisor-<v>-win-x64-setup.exe` | Windows x64 | **NSIS 安装器** | 双击 → 向导安装 → 桌面/开始菜单快捷方式 + 控制面板卸载项 |
+| `ZCodeAdvisor-<v>-win-x64.zip` | Windows x64 | 绿色包 | 解压 → 双击 `install.cmd`（明文脚本） |
+| `ZCodeAdvisor-<v>-macos-<arch>.dmg` | macOS | **DMG 安装包** | 打开 → 把 `ZCode Advisor.app` 拖入 Applications |
+| `ZCodeAdvisor-<v>-macos-<arch>.tar.gz` | macOS | 绿色包 | 解压 → `./install.sh` |
+
+两种形态的差异：安装器（exe/dmg）提供标准安装体验；绿色包全程明文脚本、可先审阅。
+**两者都内嵌官方 Node 运行时**（Windows `bin\node.exe` 保留原始签名；macOS 内嵌官方二进制），
+目标机无需安装 Node。DMG 内的 `.app` 是**自包含**的（运行时与控制器都在包内，不依赖 `~/Library`）。
+
+> **受限网络注意**：nodejs.org 在部分网络下直连不通，需走代理，例如
+> `export https_proxy=http://127.0.0.1:7897` 后以 `NODE_USE_ENV_PROXY=1` 运行构建（Node ≥ 22）；
+> 或设 `NODE_DIST_MIRROR` 指向可达镜像。内嵌运行时获取失败时，构建**不静默**：会给出警告并产出
+> 「回退到系统 Node」的包，包内 README 与 `install.sh` 都会明确提示需要系统 Node（**角标外挂需 ≥ 22**，见上方版本表）。
+
+构建完成后脚本做**三层校验**，任一层失败即非零退出：
+1. **依赖闭包**：从源码 `require` 链自动推导运行时文件清单，逐个确认已进包
+   （这道防线是必需的——早期硬编码清单曾漏掉 `zcode-path.cjs`，产物装完即崩）；
+2. **系统工具交叉验证**：`unzip` / `tar` / `hdiutil verify` 实际校验产物（工具不存在时跳过并提示；
+   注意 `unzip` 不是 Windows 自带，需 Git for Windows 的 CmdTools 才有）；
+3. **require 冒烟**：把包内 JS 释放到临时目录并真实 `require` 一次入口，确认依赖可解析。
+
+**工具可用性**（缺失时明确跳过并提示，不算构建失败）：
+
+| 产物 | 依赖工具 | 说明 |
+| --- | --- | --- |
+| setup.exe | `makensis` | Windows 上 `choco install nsis`；CI 用 `windows-2022`（预装 NSIS 3.10） |
+| dmg | `hdiutil` | 仅 macOS 可构建 |
+
+> 实测记录：本机（Hackintosh x86_64）的 Homebrew `makensis 3.12` 连最简 NSIS 脚本都
+> `std::bad_alloc` 崩溃（与该二进制自身有关，非脚本问题），且其 SIGABRT 会干扰同进程内随后的
+> `hdiutil` 调用——因此 NSIS 构建在**独立子进程**中执行，二者互不影响。macOS 上产出 setup.exe
+> 因此不可靠，**建议在 Windows/CI 上构建**。
+
+**杀软友好形态**（刻意保持，不得回退）：不做自解压 dropper、不改进程名、不做隐藏启动——
+NSIS 是业界标准安装器（非 IExpress 自解压），快捷方式直接指向原始 `node.exe` 且以最小化窗口运行。
+若你的环境仍有误报，自行斟酌是否加白。
+
+**与 zcode-plus 共存**：本外挂的 controller 先扫描调试端口段（9333-9350），
+**发现已有调试实例就直接附着**（不抢占、不重复拉起 ZCode）；因此与 zcode+ 谁先启动都行，
+✨ 与 🛡️ 可在同一页面共存。
+
+## 自动构建（GitHub Actions）
+
+`.github/workflows/build-installers.yml`：
+
+- **打 tag 即自动发布**：`git tag v0.2.1 && git push origin v0.2.1` → 三平台并行构建 →
+  安装包自动挂到 Release；
+- **手动触发**：Actions 页面 `Run workflow`，只上传 artifact 供验证，不发 Release。
+
+流程包含一道确定性门禁：Linux 上先跑全量测试（`npm test`），通过后才进入打包；
+macOS 侧在打包后额外做 **DMG 挂载冒烟**（确认 `.app` 与启动器存在），Windows 侧确认 `makensis` 可用。
+
+> 为何固定 `windows-2022`：查证 `actions/runner-images` 得知 NSIS 3.10 预装在该镜像，
+> 而 `windows-2025` 未预装 NSIS（只有 InnoSetup）——换镜像会导致 setup.exe 静默跳过。
+
+## 在 ZCode 界面中访问设置（🛡️ 角标）
+
+ZCode 桌面版没有官方 UI 扩展机制，因此在界面内提供设置入口依赖 CDP 注入：
+
+- **双击 `启动-Advisor-ZCode.cmd`**（Windows）或运行 `node tools/companion/controller.cjs`：
+  以调试模式拉起 ZCode（或在已有调试实例时直接附着），保持一个控制台窗口（使用期间别关）；
 - ZCode 输入框区域右下角出现 **🛡️ 顾问角标**，点开即设置面板：
   - **第三方 API**：端点随便填（任何 OpenAI 兼容服务）；
-  - **拉取模型**：填好端点与 key 后点「拉取模型」，自动请求 `{端点}/models` 列出可选模型，下拉即选（端点不支持 /models 时提示手动输入）；
+  - **拉取模型**：填好端点与 key 后点「拉取模型」，自动请求 `{端点}/models` 列出可选模型；
   - **Ping 测试** / **保存**：保存写入用户级配置，下一轮审查即生效，无需重启；
-- 面板刷新/新窗口自动重注入；原版方式启动的 ZCode 不会有角标（无调试通道），想回原版直接点原版快捷方式。
-- **与 zcode-plus 可共存**：CDP 允许多客户端附着同一实例，✨ 与 🛡️ 会在同一页面共存；本外挂每 3 秒全端口段（9333-9350）重扫，谁先启动都行，对方把 ZCode 重启到别的调试端口后角标自动跟随恢复。
+- 注入采用 `Page.addScriptToEvaluateOnNewDocument` + 当前文档补注入双通道，
+  页面刷新/导航后角标自动恢复；原版方式启动的 ZCode 不会有角标（无调试通道）。
+
+**macOS 用户**：若自动探测不到 ZCode，在 `~/.zcode/advisor-companion.json` 填
+`{ "zcodePath": "/Applications/ZCode.app" }`（支持直接填 `.app` 包路径，会自动解析到内部可执行文件）。
+
+> **关于插件设置表单（`userConfig`）的如实说明**：本项目在 `.zcode-plugin/plugin.json` 中声明了
+> `userConfig` 设置表单（沿用 Claude Code 契约）。但 ZCode 官方插件规范
+> （`plugin-creator` 的 `plugin-json-spec.md`）只声明 `skills`/`commands`/`hooks`/`mcpServers`，
+> **未定义 `userConfig`**；在 ZCode 3.14.4 的 `app.asar` 中也未检索到插件系统处理该字段的逻辑。
+> 因此**不要依赖**该表单单作为配置入口——请优先使用 **🛡️ 角标** 或本地配置面板。
+> 若你的 ZCode 版本确实渲染了该表单，它会正常写入用户级配置（桥接进程逻辑已就绪）。
 
 原理与限制（如实声明）：ZCode 桌面版是 Electron 应用且无官方 UI 扩展机制，本外挂经 Chrome DevTools Protocol 注入页面脚本——依赖 ZCode 的非公开接口，**ZCode 大版本更新可能导致角标失效**（重新适配即可，hook 审查功能不受影响）；调试端口仅监听 127.0.0.1；面板 API 使用随注入下发的共享令牌，本机其他网页无法调用；不承诺官方兼容性，介意者只用前文的命令/面板方式。
 
@@ -129,7 +215,13 @@ dsh 端教训（`ADVISOR-GUARD-REPORT.md`，[issue #102](https://github.com/omds
 ## 验证
 
 ```sh
-npm test          # 66 例：配置分层/状态临界区/转录增量与指纹/帧解析与散文救回/路由/端到端（含 P0 并发回归）
+npm test          # 全量测试（用例数随开发增长，不在此写死；实际数量见命令输出）
+                  # 覆盖：配置分层/状态临界区/转录增量与指纹/帧解析与散文救回/路由/端到端（含 P0 并发回归）
+                  #      + 归档读写（ZIP/TAR 字节结构与系统工具交叉校验）
+                  #      + ZCode 路径探测（macOS .app 解析 / Windows 候选链 / 降级链）
+                  #      + 安装模板、图标生成（ICO/ICNS 经系统工具校验）、运行时依赖闭包
+                  #      + 页面注入脚本行为（样式注入、令牌版本、模型下拉、403 提示）
+npm run build     # 构建发行包（构建后自动做三层产物校验）
 ```
 
 mock 链路验证（以下命令需 **Git Bash**；PowerShell 用户请用等价写法，注意 JSON 内路径需用正斜杠或双反斜杠）：
@@ -187,29 +279,29 @@ ZCODE_ADVISOR_REVIEW_MODE=sync \
 
 ```
 zcode-advisor/
-├─ .zcode-plugin/         plugin.json（含 userConfig 设置表单 + MCP 桥）+ marketplace.json
+├─ .zcode-plugin/         plugin.json + marketplace.json（含展示元数据）
 ├─ .claude-plugin/        marketplace.json（Claude Code 兼容副本）
 ├─ hooks/hooks.json       SessionStart / UserPromptSubmit / Stop 三个 process 型 hook
 ├─ hooks/advisor-hook.js  入口：事件分发 + review-worker + ctl（含 doctor）
 ├─ hooks/lib/             config（分层加载）/ state（临界区写）/ transcript（字节级增量）/ reviewer / route
 ├─ commands/              /advisor-setup /advisor-status /advisor-on /advisor-off /advisor-model
 ├─ tools/                 config-bridge.js（设置表单桥）+ setup-server.js（本地网页面板）
-├─ tools/companion/       输入框角标外挂：controller.cjs（CDP 注入 + 本机 API）+ inject.js + lib.cjs
+├─ tools/companion/       输入框角标外挂与打包：
+│                         ├─ controller.cjs       CDP 注入 + 本机 API（macOS/Windows 双平台探测）
+│                         ├─ inject.js            页面角标 + 设置面板
+│                         ├─ lib.cjs              模型端点推导（纯函数）
+│                         ├─ zcode-path.cjs       ZCode 可执行文件探测（含 .app 解析）
+│                         ├─ archive.cjs          零依赖 ZIP/TAR 读写
+│                         ├─ icon.cjs             零依赖 ICO/ICNS/PNG 生成
+│                         ├─ install-templates.cjs 明文安装脚本模板
+│                         ├─ build-meta.cjs       版本号单一来源
+│                         └─ build-installer.cjs  发行包构建（跨平台）
 ├─ 配置面板.cmd            双击打开本地网页配置面板
 ├─ 启动-Advisor-ZCode.cmd  双击以角标模式启动 ZCode（CDP 注入）
 ├─ advisor.config.json    插件目录兜底配置（gitignore；模板见 advisor.config.example.json）
-├─ test/                  node:test 单测 + mock 端到端 + P0 并发回归 + 面板/桥接/companion 测试
+├─ test/                  node:test 单测 + mock 端到端 + P0 并发回归 + 面板/桥接/companion/归档/路径测试
 └─ state/                 兜底状态目录（默认优先宿主插件数据目录）
 ```
-
-## 发行包（dist/，`node tools/companion/build-installer.cjs` 一键构建）
-
-| 产物 | 平台 | 安装方式 |
-| --- | --- | --- |
-| `ZCodeAdvisor-<v>-win-x64.zip` | Windows | 解压 → 双击 `install.cmd`（明文脚本）→ 桌面出现「ZCode Advisor」图标 |
-| `ZCodeAdvisor-<v>-macos-x64.tar.gz` | macOS **Intel (x64)** | 解压 → `./install.sh` → 启动台出现「ZCode Advisor」（内嵌 darwin-x64 Node，无需系统 Node） |
-
-两个包都内嵌官方 Node 运行时（Windows 的 `bin\node.exe` 保留原始数字签名；macOS 为官方 darwin-x64 二进制）。**刻意不做自解压 setup.exe、不改进程名、不做隐藏启动**——这三者是杀软启发式（dropper/masquerade）的高危特征，实测会被直接查杀；透明安装脚本 + 原始签名运行时是可用性与可检出性的平衡点。若你的环境仍有误报，自行斟酌是否加白。
 
 ## 许可证
 
