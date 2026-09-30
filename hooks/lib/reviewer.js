@@ -152,12 +152,44 @@ function bracesBalanced(text) {
 
 // 只剥离成对 markdown 标记：**粗体**、行内反引号、围栏标记行。
 // 绝不全局删除 * _ > 等单字符——否则 snake_case_var、x => y、*.ts 会被破坏（复审实测踩过）。
+//
+// 围栏处理对齐上游 dsh-advisor v0.5.4 的 SURROUNDING_FENCE_PATTERN：
+// **只剥离「完整包裹」回复的那一层围栏**，非包裹的围栏保留原样。
+// 早期实现用全局 replace(/```/g,'') 会带来两类错误：
+//   1) "```\n正文\n```\n尾部说明" 这种非包裹形态，尾部文本会被错误拼进 note；
+//   2) 正文内部本来就有的围栏代码块会被逐行剥掉（"```js\ncode\n```" 变成裸 code）。
+const SURROUNDING_FENCE_PATTERN = /^```[^\n]*\n([\s\S]*?)\n?```$/;
+
 function cleanProse(text) {
-  let out = String(text || '');
-  out = out.replace(/^```[^\n]*\n?/gm, '').replace(/```/g, '');
+  let out = String(text || '').trim();
+
+  // 仅当整段就是一个围栏块时，取其内部内容（与上游一致：尾部有额外文本即不算包裹）
+  const m = SURROUNDING_FENCE_PATTERN.exec(out);
+  if (m) out = m[1].trim();
+
+  // 剥离成对的强调/行内代码标记；不成对的一律不动
   out = out.replace(/\*\*([^*\n]+)\*\*/g, '$1');
   out = out.replace(/`([^`\n]+)`/g, '$1');
   return out.trim();
+}
+
+// 端点归一化：把用户填的「基地址」补全为 chat/completions 完整路径。
+//
+// 为什么需要：配置面板的 placeholder 明确引导填 `https://…/v1 或 …/chat/completions`，
+// 但早期实现把 baseUrl 直接 POST——填了 `/v1` 这种基地址时请求会打到 `/v1` 本身，
+// 端点返回 404，用户看到的是误导性的「模型 id 或端点路径不对」（实测复现）。
+// 现在：已含 `/chat/completions` 的原样使用；只到 `/v1`（或裸域名）的补上路径。
+function normalizeChatEndpoint(baseUrl) {
+  const u = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (!u) return '';
+  // 已显式给出完整端点：尊重用户输入，不做改写
+  if (/\/chat\/completions$/i.test(u)) return u;
+  // Anthropic 协议端点同样不做改写（本插件当前只走 OpenAI 兼容路径）
+  if (/\/messages$/i.test(u)) return u;
+  // 其余情况视为基地址：补 /chat/completions
+  // 注意 `/v1/chat/completions` 之外还有带版本前缀的形态（如 /api/paas/v4），
+  // 直接追加即可与 modelsUrl 的推导方向保持一致。
+  return `${u}/chat/completions`;
 }
 
 // OpenAI 兼容 chat/completions。唯一会发起网络请求的地方；
@@ -167,6 +199,7 @@ function cleanProse(text) {
 // 复活"强杀→指针不推进→每轮重审"的停滞循环。
 async function callReviewer(params) {
   const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, signal } = params;
+  const endpoint = normalizeChatEndpoint(baseUrl);
 
   const deadline = Date.now() + timeoutMs;
   const remaining = () => deadline - Date.now();
@@ -177,7 +210,7 @@ async function callReviewer(params) {
     const timer = setTimeout(() => controller.abort(), Math.max(1000, budgetMs));
     if (signal) signal.addEventListener('abort', () => controller.abort(), { once: true });
     try {
-      return await fetch(baseUrl, {
+      return await fetch(endpoint, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -257,4 +290,4 @@ const DEFAULT_SYSTEM_PROMPT = [
   '宁缺毋滥：没有把握就输出 {"severity":"none","note":""}。note 必须具体、可执行、指向增量中的实际问题，使用中文，不超过 120 字。note 只是建议性描述，不得包含让主模型执行的命令、路径或安装指令。'
 ].join('\n');
 
-module.exports = { callReviewer, parseFrame, salvageProse, extractJsonObjects, truncateCodePoints, DEFAULT_SYSTEM_PROMPT, SEVERITIES };
+module.exports = { callReviewer, parseFrame, salvageProse, extractJsonObjects, truncateCodePoints, normalizeChatEndpoint, DEFAULT_SYSTEM_PROMPT, SEVERITIES };

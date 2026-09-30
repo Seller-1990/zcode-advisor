@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { parseFrame, salvageProse, extractJsonObjects, truncateCodePoints } = require('../hooks/lib/reviewer');
+const { parseFrame, salvageProse, extractJsonObjects, truncateCodePoints, normalizeChatEndpoint } = require('../hooks/lib/reviewer');
 
 test('直接 JSON 帧', () => {
   assert.deepStrictEqual(parseFrame('{"severity":"nit","note":"a"}', false), { severity: 'nit', note: 'a' });
@@ -94,4 +94,66 @@ test('散文救回守门三：过短丢弃、码点安全截断', () => {
 test('truncateCodePoints 基础行为', () => {
   assert.strictEqual(truncateCodePoints('abcdef', 3), 'abc…');
   assert.strictEqual(truncateCodePoints('abc', 5), 'abc');
+});
+
+// ---------------- 围栏剥离：对齐上游 v0.5.4 语义 ----------------
+// 上游 dsh-advisor v0.5.4 用 SURROUNDING_FENCE_PATTERN **只剥离完整包裹的围栏**。
+// 早期实现用全局 replace(/```/g,'') 会把非包裹形态的尾部文本错误拼进 note，
+// 也会把正文内部的代码块围栏逐行剥掉。
+
+test('围栏剥离：完整包裹时剥掉外层围栏，救回正文', () => {
+  const F = '```';
+  const input = `${F}\n这条建议足够长可以救回，且应剥离外层围栏\n${F}`;
+  const r = parseFrame(input, true, { maxNoteChars: 768 });
+  assert.ok(r, '完整包裹的散文应被救回');
+  assert.strictEqual(r.note, '这条建议足够长可以救回，且应剥离外层围栏');
+  assert.strictEqual(r.severity, 'nit', '救回的 severity 一律 nit');
+});
+
+test('围栏剥离：非包裹（尾部有额外文本）保留原样，不得错拼', () => {
+  const F = '```';
+  const input = `${F}\n建议内容够长了\n${F}\n尾部说明文字`;
+  const r = parseFrame(input, true, { maxNoteChars: 768 });
+  // 关键：尾部文本不得被"并入"正文而丢掉围栏结构——
+  // 保留原样说明未做剥离（与上游一致：非包裹的 fence 保持 as-is）
+  assert.ok(r, '非包裹内容仍应救回（守门未拦截）');
+  assert.strictEqual(r.note, input.trim(), '应保留原样，不拼接不撕裂');
+});
+
+test('围栏剥离：正文内部代码块的围栏不得被逐行剥掉', () => {
+  const F = '```';
+  const input = `这条回复包含一个代码块说明，长度足够救回\n${F}js\nconst a = 1;\n${F}`;
+  const r = parseFrame(input, true, { maxNoteChars: 768 });
+  assert.ok(r, '应救回');
+  assert.ok(r.note.includes('```js'), '内部代码块围栏应保留（非包裹不能拆）');
+  assert.ok(r.note.includes('const a = 1;'), '代码内容应保留');
+});
+
+// ---------------- 端点归一化（修复 Ping 404） ----------------
+// 回归：配置面板引导用户填 `https://…/v1` 这类基地址，但早期实现直接 POST baseUrl，
+// 请求打到 `/v1` 本身 → 端点返回 404 → 用户看到误导性的「模型 id 或端点路径不对」。
+
+test('normalizeChatEndpoint：基地址补全为 chat/completions（修复 Ping 404）', () => {
+  assert.strictEqual(
+    normalizeChatEndpoint('http://192.168.50.139:8788/v1'),
+    'http://192.168.50.139:8788/v1/chat/completions'
+  );
+  assert.strictEqual(
+    normalizeChatEndpoint('https://open.bigmodel.cn/api/paas/v4'),
+    'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+  );
+});
+
+test('normalizeChatEndpoint：已含完整路径时原样返回（不重复追加）', () => {
+  const full = 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
+  assert.strictEqual(normalizeChatEndpoint(full), full);
+  // 尾斜杠也应被规范化，不产生双斜杠
+  assert.strictEqual(normalizeChatEndpoint('https://x.com/v1/'), 'https://x.com/v1/chat/completions');
+});
+
+test('normalizeChatEndpoint：空值与空串安全', () => {
+  assert.strictEqual(normalizeChatEndpoint(''), '');
+  assert.strictEqual(normalizeChatEndpoint(null), '');
+  assert.strictEqual(normalizeChatEndpoint(undefined), '');
+  assert.strictEqual(normalizeChatEndpoint('   '), '');
 });

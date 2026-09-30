@@ -108,10 +108,21 @@ ATTEMPT_LOG=""
 cleanup() { rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}; }
 trap cleanup EXIT INT TERM
 
-# 判定一次尝试是否真正成功：退出码为 0 **且** 产出结构合格的 JSON。
-# 只校验"可解析"不够——ocr 会写出 {"status":"failed","message":"..."} 这类对象，
-# 若据此锁定 CHOSEN 就会跳过降级链，最后渲染成"未发现问题"（假清白，实测踩过）。
-# 额外要求：status 不是 failed/error/cancelled，且 comments 是数组。
+# 判定一次尝试是否真正成功：退出码为 0 **且** 评审确实完整完成。
+#
+# 判定依据来自 ocr 自身的状态枚举（从其二进制字符串表提取，2026-09 实测）：
+#   TerminalState = complete | partial | failed | skipped | aborted | legacy
+# 其中只有 `complete` 表示「全部选中项都评审完成」；`partial` 会打印
+# "Review partially complete: N finding(s); M of K selected item(s) failed."。
+#
+# 为什么用**白名单**而不是黑名单：黑名单已被咬过两次——
+#   ① {"status":"failed",...}（无 comments）曾被当成干净通过；
+#   ② 补上 failed/error/cancelled 后，{"status":"partial","comments":[]} 仍被当成通过。
+# 只认 `complete` 才不会再有第三个未知状态漏过。
+#
+# 注意：**不能**用 retry_report.failed_requests 当判据——plan 阶段的失败
+# （日志里的 "continuing without plan"）不影响评审覆盖，按它判定会在上游限流时
+# 误拒完整结果、触发无谓重跑。覆盖完整性以 status 为准。
 valid_output() {
   [ -s "$OUT_JSON" ] || return 1
   python3 - "$OUT_JSON" <<'PYCHECK' >/dev/null 2>&1
@@ -123,9 +134,12 @@ except Exception:
     sys.exit(1)
 if not isinstance(data, dict):
     sys.exit(1)
-status = str(data.get("status") or "").lower()
-if status in ("failed", "error", "cancelled"):
+
+# 白名单：只有 complete 才算完整评审
+if str(data.get("status") or "").lower() != "complete":
     sys.exit(1)
+
+# comments 必须存在且为数组（0 条也是合法的"未发现问题"）
 if not isinstance(data.get("comments"), list):
     sys.exit(1)
 PYCHECK

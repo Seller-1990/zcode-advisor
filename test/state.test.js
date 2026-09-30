@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  ensureState, mutateStateExclusive, loadState, saveState, createLock, countLocks, lockPathFor, freshState
+  ensureState, mutateStateExclusive, loadState, saveState, createLock, countLocks, lockPathFor, freshState, bumpDrop
 } = require('../hooks/lib/state');
 
 function tmpDir(t) {
@@ -80,4 +80,36 @@ test('陈旧锁可被抢占', (t) => {
   const old = new Date(Date.now() - 5000);
   fs.utimesSync(lockPathFor(f), old, old);
   assert.strictEqual(createLock(f, 1000), true); // 陈旧 → 抢占成功
+});
+
+// ---------------- KD-I3：丢弃分类的最近时间戳（对齐上游 v0.5.4） ----------------
+// 上游 dsh-advisor v0.5.4 为 EMPTY/UNPARSED 两类各维护 lastXxxTimestamp，
+// 用于回答"最后一次空回复/解析失败是多久前"，使"在跑但不产出"可被发现。
+
+test('bumpDrop：记录计数与最近一次时间戳（droppedAt）', () => {
+  const s = {};
+  bumpDrop(s, 'llm_empty_response');
+  assert.strictEqual(s.dropped.llm_empty_response, 1);
+  assert.ok(s.droppedAt.llm_empty_response, '应记录时间戳');
+  // 是合法 ISO 时间
+  assert.ok(!Number.isNaN(Date.parse(s.droppedAt.llm_empty_response)));
+
+  // 再次发生：计数累加、时间戳更新
+  const first = s.droppedAt.llm_empty_response;
+  bumpDrop(s, 'llm_empty_response');
+  assert.strictEqual(s.dropped.llm_empty_response, 2);
+  assert.ok(s.droppedAt.llm_empty_response >= first, '时间戳应更新为最新');
+
+  // 不同类别互不影响
+  bumpDrop(s, 'unparsed');
+  assert.strictEqual(s.dropped.unparsed, 1);
+  assert.ok(s.droppedAt.unparsed);
+  assert.strictEqual(s.dropped.llm_empty_response, 2, '其他类别不应被改动');
+});
+
+test('bumpDrop：空 reason 归为 unknown（保持既有行为）', () => {
+  const s = {};
+  bumpDrop(s, '');
+  assert.strictEqual(s.dropped.unknown, 1);
+  assert.ok(s.droppedAt.unknown);
 });

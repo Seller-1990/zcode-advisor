@@ -623,6 +623,29 @@ async function handleCtl(args) {
     const drops = state.dropped || {};
     const dropLine = Object.entries(drops).filter(([, n]) => n > 0).map(([k, n]) => `${k}=${n}`).join(' ');
     if (dropLine) lines.push(`  Dropped: ${dropLine}`);
+
+    // KD-I3 可见性（对齐上游 v0.5.4）：展示"最后一次"发生时间，并给出可操作提示。
+    // 目的：让"审查在跑但从不产出"可被发现——只看计数无法判断是陈旧积压还是正在发生。
+    const droppedAt = state.droppedAt || {};
+    const stampLine = Object.entries(droppedAt)
+      .filter(([k]) => (drops[k] || 0) > 0)
+      .map(([k, t]) => `${k}@${String(t).replace(/\.\d+Z$/, 'Z')}`)
+      .join(' ');
+    if (stampLine) lines.push(`  最近丢弃: ${stampLine}`);
+
+    // 针对最常见两类给出修复提示（与上游 KD-I3 的 warn 口径一致）
+    const hints = [];
+    if ((drops.llm_empty_response || 0) > 0) {
+      hints.push('llm_empty_response：模型把输出预算耗在思考上 → 提高 maxTokens（思考型模型建议 4096）');
+    }
+    if ((drops.unparsed || 0) > 0) {
+      hints.push('unparsed：回复无合法 JSON 帧 → 确认 proseFallback: true，或换格式更稳定的模型');
+    }
+    if ((drops.parse_empty || 0) > 0) {
+      hints.push('parse_empty：转录有完整行但全部无法解析 → 转录格式与预期不符，请带样例反馈');
+    }
+    for (const h of hints) lines.push(`  提示: ${h}`);
+
     for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
     for (const w of configWarnings(cfg, apiKeyInfo)) lines.push(`  配置警告: ${w}`);
     if (state.lastAction) lines.push(`  最近动作: ${state.lastAction}`);

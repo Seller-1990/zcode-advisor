@@ -235,10 +235,20 @@ function pruneStates(stateDir, maxAgeDays, keep) {
   }
 }
 
+// 丢弃分类计数 + **最近一次发生时间**。
+//
+// 对齐上游 dsh-advisor v0.5.4 的 KD-I3 可见性语义（issue #102）：
+// 上游为 EMPTY / UNPARSED 两类各自维护计数与 lastXxxTimestamp，让
+// "advisor 在跑但从不说话" 可被发现，而不是只能开 debug 才看见。
+// 这里用最小侵入的方式实现同等能力：保留原有 dropped[reason] 计数形状不变
+// （既有 status 输出与测试依赖它），时间戳记入同级的 droppedAt[reason]。
 function bumpDrop(state, reason) {
   if (!reason) reason = 'unknown';
   state.dropped = state.dropped || {};
   state.dropped[reason] = (state.dropped[reason] || 0) + 1;
+  // 最近一次该类别丢弃的时间（用于回答"最后一次空回复/解析失败是多久前"）
+  state.droppedAt = state.droppedAt || {};
+  state.droppedAt[reason] = new Date().toISOString();
 }
 
 // —— 审查互斥锁（防同一会话并行审查堆积）——
