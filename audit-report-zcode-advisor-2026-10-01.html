@@ -378,11 +378,11 @@
   </div>
 
   <div class="stats-row">
-    <div class="stat-card"><div class="num">10</div><div class="desc">总发现</div></div>
-    <div class="stat-card"><div class="num" style="color:var(--badge-critical)">2</div><div class="desc">Blocker</div></div>
+    <div class="stat-card"><div class="num">18</div><div class="desc">总发现</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--badge-critical)">6</div><div class="desc">Blocker</div></div>
     <div class="stat-card"><div class="num" style="color:var(--badge-high)">1</div><div class="desc">High</div></div>
-    <div class="stat-card"><div class="num" style="color:var(--badge-medium)">4</div><div class="desc">Medium</div></div>
-    <div class="stat-card"><div class="num" style="color:var(--badge-low)">3</div><div class="desc">Low</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--badge-medium)">8</div><div class="desc">Medium</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--badge-low)">4</div><div class="desc">Low</div></div>
   </div>
 
   <h3 class="section-title" id="top-risks">⚠️ 风险清单</h3>
@@ -649,6 +649,156 @@ tools/companion/controller.cjs → 24</div>
       <strong>⏱ 工作量：</strong> ~40 分钟 &nbsp;·&nbsp; <strong>回归测试：</strong> DEBUG=1 跑一轮，断言日志含 error 分类与 requestId
     </div>
   </div>
+
+  <div class="finding severity-blocker">
+    <div class="finding-header">
+      <h4>11. controller.cjs 未导入 spawnSync —— 自动启用 100% 静默失效</h4>
+      <span class="badge badge-critical">blocker</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 tools/companion/controller.cjs:19 + :524</span><span>🎯 插件自动启用</span></div>
+    <div class="problem"><strong>问题：</strong>解构 require('child_process') 时未导入 spawnSync，却在控制插件自动启用的代码里调用它 → 抛 ReferenceError 并被 catch 静默吞掉。日志里不留任何痕迹，用户装完打开应用、插件从未被注册。</div>
+    <div class="evidence">const { spawn, execSync } = require('child_process');  // ← 缺 spawnSync
+...
+const r = spawnSync(process.execPath, [autoEnable], {...});  // ReferenceError
+} catch (_) { /* 自动启用失败不阻断外挂 */ }                  // ← 静默吞掉</div>
+    <div class="fix-box"><div class="fix-label">最小修复</div><code>const { spawn, spawnSync, execSync } = require('child_process');</code></div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> 1 行 + 测试 20 行 &nbsp;·&nbsp; <strong>回归测试：</strong> 静态守卫——断言被解构的 API 集合 ⊇ 实际调用的 child_process API（已实现）
+    </div>
+  </div>
+
+  <div class="finding severity-blocker">
+    <div class="finding-header">
+      <h4>12. saveUserConfig 的 TDZ —— 面板保存功能整体死亡</h4>
+      <span class="badge badge-critical">blocker</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 tools/companion/controller.cjs:322</span><span>🎯 saveUserConfig</span></div>
+    <div class="problem"><strong>问题：</strong>startEnabled 分支写在 const v = patch[k] 之前，因 const 的 TDZ，只要 k === 'startEnabled' 就必然抛 ReferenceError。而面板每次保存都带 startEnabled → /api/config 返回 500 → <b>端点上任何配置都存不进去</b>（不只是总开关）。</div>
+    <div class="evidence">if (k === 'startEnabled') {
+  if (v === true || v === false) allowed[k] = v;   // ← v 在此处尚未初始化
+  continue;
+}
+const v = patch[k];                                 // ← const 声明在之后 → TDZ</div>
+    <div class="fix-box"><div class="fix-label">最小修复</div><code>把 const v = patch[k]; 提到 for 循环体第一行（所有分支之前）</code></div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> 1 行移动 + 测试 25 行 &nbsp;·&nbsp; <strong>回归测试：</strong> 直接调用 saveUserConfig({startEnabled:false}) 断言不抛且返回正确（已实测通过）
+    </div>
+  </div>
+
+  <div class="finding severity-blocker">
+    <div class="finding-header">
+      <h4>13. Windows 包不打包 auto-enable.cjs 与插件 payload</h4>
+      <span class="badge badge-critical">blocker</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 packagers.cjs:93 vs build-installer.cjs buildWin</span><span>🎯 Windows 发行包</span></div>
+    <div class="problem"><strong>问题：</strong>NSIS 脚本 ExecWait 调 $INSTDIR\auto-enable.cjs，但 buildWin 只打包 COMPANION_FILES（4 个文件），既无 auto-enable 也无插件 payload。ExecWait 失败且不检查 → 安装器照样报成功。<b>Windows 全形态（setup.exe 与 zip）都无法启用插件</b>。</div>
+    <div class="evidence">; packagers.cjs  安装脚本
+ExecWait '"$INSTDIR\bin\node.exe" "$INSTDIR\auto-enable.cjs"'   ; 文件不存在
+; buildWin 的 entries 仅含：controller.cjs / inject.js / lib.cjs / zcode-path.cjs
+;   + install-shortcut.vbs / install.cmd / advisor.ico / bin\node.exe / README</div>
+    <div class="fix-box"><div class="fix-label">最小修复</div><code>buildWin 复用 stagePluginPayload()，把 plugin/ 与 auto-enable.cjs 一并加入 entries</code></div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> 8 行 + 测试 25 行 &nbsp;·&nbsp; <strong>回归测试：</strong> 从 NSIS 脚本提取 $INSTDIR 引用，断言每个都被 buildWin entries 覆盖（已实现）
+    </div>
+  </div>
+
+  <div class="finding severity-blocker">
+    <div class="finding-header">
+      <h4>14. arm64 DMG 缺插件 + hdiutil 磁盘不足（CI 曾绿灯放行）</h4>
+      <span class="badge badge-critical">blocker</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 build-installer.cjs:pluginDir + verifyDmg</span><span>🎯 macOS 发行包</span></div>
+    <div class="problem"><strong>问题（两个）：</strong>① pluginDir 传参语义错位——stageMacApp 执行 cpSync(pluginDir, Resources/app/plugin) 是"整体拷为"，传父目录会得到 plugin/plugin/… 嵌套，期望路径不存在，arm64 DMG 缺插件本体。<br>② arm64 runner 磁盘不足：<code>hdiutil: create failed - No space left on device</code>（内嵌 Node 116MB 撑爆）。<br>③ verifyDmg 原本<b>不校验 plugin/</b>，所以上述问题 CI 绿灯放行。</div>
+    <div class="evidence">cpSync(pluginDir, path.join(appRes, 'plugin'))   // 整体拷为
+pluginDir: path.join(DIST, `.stage-mac-payload-${arch}`)  // 传父目录 → plugin/plugin/
+CI: hdiutil: create failed - No space left on device</div>
+    <div class="fix-box"><div class="fix-label">最小修复</div><code>pluginDir 传 pluginRoot（= &lt;stage&gt;/plugin）；
+verifyDmg 增加 plugin/.claude-plugin/marketplace.json 与 tools/config-bridge.js 断言；
+workflow 构建前清理 runner 磁盘并在前后打印 df -h</code></div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~15 行 &nbsp;·&nbsp; <strong>回归测试：</strong> verifyDmg 断言 payload 存在（已在 CI 中抓到本次问题）；本地 hdiutil 挂载核对结构已通过
+    </div>
+  </div>
+
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>15. 面板「顾问总开关」状态不回填 —— 保存即静默关闭顾问</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 tools/companion/inject.js:199-219</span><span>🎯 refreshStatus</span></div>
+    <div class="problem"><strong>问题：</strong>refreshStatus 回填了 model/baseUrl/reviewMode/maxTokens，<b>唯独没有回填 zca-enabled</b>。checkbox 默认未勾选，用户打开面板看到"未启用"，一点保存就把 startEnabled:false 写进配置 → 顾问被静默关闭。</div>
+    <div class="evidence">if (c.baseUrl) f.baseUrl.value = c.baseUrl;
+if (c.reviewMode) f.reviewMode.value = c.reviewMode;
+if (c.maxTokens) f.maxTokens.value = c.maxTokens;
+// ← 缺 zca-enabled 的回填</div>
+    <div class="fix-box"><div class="fix-label">最小修复</div><code>const enEl = document.getElementById('zca-enabled');
+if (enEl) enEl.checked = c.enabled !== false;</code></div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> 2 行 &nbsp;·&nbsp; <strong>回归测试：</strong> stub /api/config 返回 enabled:false 时断言开关未勾选（已实现静态守卫）
+    </div>
+  </div>
+
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>16. 含 API key 的配置落盘 0644（同机其他用户可读）</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 controller.cjs saveUserConfig / config-bridge.js / auto-enable.cjs</span><span>🎯 配置写入</span></div>
+    <div class="problem"><strong>问题：</strong>配置含明文 apiKey，但三条写入路径均未设权限（目录 0755、文件 0644）。转录快照与意见历史已收紧到 0600/0700，配置这一处遗漏。多用户机器上同机其他账户可读 key。</div>
+    <div class="evidence">fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true });      // 0755
+fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');  // 0644</div>
+    <div class="fix-box"><div class="fix-label">最小修复</div><code>目录 mode 0o700、文件 mode 0o600，写后 chmodSync 兜底（照抄 history.js 的既有写法）</code></div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> 9 行 &nbsp;·&nbsp; <strong>回归测试：</strong> 断言 statSync(cfg).mode &amp; 0o077 === 0（已实测 600 通过）
+    </div>
+  </div>
+
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>17. readHistory 两份实现路径分歧 —— 面板永远空白</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 hooks/lib/history.js:28 vs controller.cjs:27</span><span>🎯 意见历史读写</span></div>
+    <div class="problem"><strong>问题：</strong>写入侧（hook）支持 ZCODE_ADVISOR_STATE_DIR 隔离，读取侧（controller，内联实现）不看该变量。设了隔离的部署里写读指向不同文件，面板「顾问意见记录」永远空白。注释声称"格式漂移风险由测试锁住"，但测试只覆盖了 hooks 那份。</div>
+    <div class="evidence">// hooks（写）：STATE_DIR 优先 → &lt;stateDir&gt;/advisor-history.jsonl
+// controller（读）：只认 ZCODE_ADVISOR_HISTORY 或 ~/.zcode/advisor-history.jsonl
+// → 不一致</div>
+    <div class="fix-box"><div class="fix-label">最小修复</div><code>controller 的 resolveHistoryFile() 补上 STATE_DIR 分支</code></div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> 2 行 &nbsp;·&nbsp; <strong>回归测试：</strong> 断言两份实现都处理三个来源（已实现静态守卫）
+    </div>
+  </div>
+
+  <div class="finding severity-low">
+    <div class="finding-header">
+      <h4>18. 测试文件残留调试输出</h4>
+      <span class="badge badge-low">low</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 test/inject.test.js:588,590,593</span><span>🎯 测试卫生</span></div>
+    <div class="problem"><strong>问题：</strong>3 处 console.error('[dbg] ...') 探针留在最终提交里，污染测试输出。</div>
+    <div class="evidence">console.error('[dbg] en.tagName=', en.tagName, ...);</div>
+    <div class="fix-box"><div class="fix-label">最小修复</div><code>删除三条调试语句</code></div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> 2 分钟 &nbsp;·&nbsp; <strong>回归测试：</strong> 遍历 test/ 断言无 [dbg]（已实现）
+    </div>
+  </div>
+
 
   <h3 class="section-title" id="arch">🏗 架构与模块边界</h3>
   <div class="card"><div class="card-body">
