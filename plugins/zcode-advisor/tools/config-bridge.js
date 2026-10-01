@@ -5,7 +5,10 @@
 // 作用：把插件设置页（plugin.json userConfig 表单）里保存的值落盘到用户级配置
 // ~/.zcode/advisor.config.json——这样 hook（读不到 user_config 环境变量）也能用上 GUI 配置。
 // 纪律：
-// - 只合并非空值，绝不覆盖用户在配置面板/其他途径写入的其他字段；
+// - **只填补缺失键**：宿主会把 userConfig 声明的 default 展开进环境变量（用户没填也有值），
+//   因此这里绝不能覆盖用户级配置里已有的非空值——否则每次会话启动都会把用户在
+//   配置面板/advisor-setup 里调好的端点、模型静默改回表单默认（真机实测踩过：401）。
+//   表单是"兜底填充"，不是"权威覆盖"；显式写路径（面板保存按钮）才用覆盖语义。
 // - 落盘失败只写 stderr，不影响 MCP 协议；
 // - 启动即落盘，然后再服务最小 MCP 协议（stdio JSON-RPC），宿主异常时也不阻塞会话。
 
@@ -33,28 +36,133 @@ function guiValuesFromEnv(env) {
   return out;
 }
 
-// 合并策略：GUI 非空值覆盖同名键，其余既有字段原样保留；原子写。
-function mergeUserConfig(existingRaw, guiValues) {
+function isBlank(v) {
+  return v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+}
+
+// 合并策略：
+// - 默认（覆盖）：GUI 非空值覆盖同名键，其余既有字段原样保留。
+//   用于**显式写路径**——配置面板「保存配置」按钮、controller 的保存动作。
+// - fillMissingOnly（只填补）：GUI 值仅在既有配置对应键缺失/空值时才写入，
+//   已有非空值一律保留。用于**随会话启动的桥接进程**（见文件头纪律）。
+function mergeUserConfig(existingRaw, guiValues, opts) {
+  const fillMissingOnly = !!(opts && opts.fillMissingOnly);
   let base = {};
   if (existingRaw && typeof existingRaw === 'object' && !Array.isArray(existingRaw)) {
     base = existingRaw;
   }
-  return Object.assign({}, base, guiValues);
+  const merged = {};
+  // 逐键拷贝并跳过 __proto__：Object.assign 对自有 __proto__ 键走 [[Set]] 触发原型 setter，
+  // 键丢失且与 existing 的 stringify 比较恒不等 → 等值跳过保证被击穿（每次启动必写盘）。
+  for (const k of Object.keys(base)) {
+    if (k === '__proto__') continue;
+    merged[k] = base[k];
+  }
+  for (const [k, v] of Object.entries(guiValues || {})) {
+    if (k === '__proto__') continue;
+    if (isBlank(v)) continue;
+    if (fillMissingOnly && !isBlank(merged[k])) continue; // 已有非空值：用户配置优先
+    merged[k] = v;
+  }
+  return merged;
 }
 
-function writeUserConfig(guiValues, file) {
-  const target = file || USER_CONFIG;
-  if (Object.keys(guiValues).length === 0) return { changed: false, file: target };
-  let existing = {};
+function sleepSync(ms) {
   try {
-    existing = JSON.parse(fs.readFileSync(target, 'utf8'));
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   } catch (_) {}
-  const merged = mergeUserConfig(existing, guiValues);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
+}
+
+// 配置文件跨进程 RMW 临界区。
+// **锁协议的 vendored 双副本必须逐字一致**：本文件与 tools/companion/controller.cjs
+// （发行包不含 hooks/ 无法 require 共享，只能复制；test/static-guards.test.js 锁两副本
+// 的协议标记防漂移）。写方全景：本文件 writeUserConfig（桥接启动 + setup-server 面板保存
+// 经它共享）、controller saveUserConfig；auto-enable 仅「不存在则创建」，不入锁。
+//   协议：锁文件 <target>.lock，内容=持有者 pid，wx 抢建；持有者 pid 已死或锁 mtime>10s
+//   → 接管；进入与写入前双查属主，仅属主清除；EEXIST 重试 40×25ms≈1s，EACCES/EROFS
+//   等永久性失败立即放弃（只读 HOME 下不再白烧 1s）。
+function withConfigLock(target, fn) {
+  const lock = `${target}.lock`;
+  const myPid = String(process.pid);
+  let got = false;
+  for (let i = 0; i < 40 && !got; i++) {
+    try {
+      fs.writeFileSync(lock, myPid, { flag: 'wx' });
+      got = true;
+    } catch (err) {
+      if (!err || err.code !== 'EEXIST') return false;
+      let holder = '';
+      try { holder = fs.readFileSync(lock, 'utf8').trim(); } catch (_) {}
+      let stale = true;
+      try { stale = Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch (_) {}
+      const pid = parseInt(holder, 10);
+      let alive = false;
+      if (pid > 0) {
+        try { process.kill(pid, 0); alive = true; } catch (e) { alive = !!(e && e.code === 'EPERM'); }
+      }
+      if (!alive || stale) { try { fs.unlinkSync(lock); } catch (_) {} }
+      sleepSync(25);
+    }
+  }
+  if (!got) return false;
+  const ownLock = () => {
+    try { return fs.readFileSync(lock, 'utf8').trim() === myPid; } catch (_) { return false; }
+  };
+  try {
+    if (!ownLock()) return false;
+    return fn();
+  } finally {
+    try { if (fs.readFileSync(lock, 'utf8').trim() === myPid) fs.unlinkSync(lock); } catch (_) {}
+  }
+}
+
+function writeJsonAtomic(target, text) {
+  // 该文件含 API key：新建目录/文件收紧到 0700/0600，不依赖 umask（默认会落成 0644）。
+  // rename 整体替换目标文件，历史遗留的宽权限文件也一并收紧；Windows 忽略 mode（ACL 继承）。
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   const tmp = `${target}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');
-  fs.renameSync(tmp, target);
-  return { changed: true, file: target, keys: Object.keys(guiValues) };
+  fs.writeFileSync(tmp, text, { encoding: 'utf8', mode: 0o600 });
+  try {
+    // Windows 上杀毒/索引器持有目标句柄时 rename 报 EPERM（hooks/lib/state.js saveState
+    // 同款实证），3 次退避重试。
+    for (let i = 0; ; i++) {
+      try { fs.renameSync(tmp, target); return; } catch (err) {
+        if (i >= 2 || !err || (err.code !== 'EPERM' && err.code !== 'EACCES')) throw err;
+        sleepSync(30 * (i + 1));
+      }
+    }
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {} // 成功时 tmp 已不存在；失败时清尸
+  }
+}
+
+function writeUserConfig(guiValues, file, opts) {
+  const target = file || USER_CONFIG;
+  const values = guiValues || {};
+  if (Object.keys(values).length === 0) return { changed: false, file: target };
+  // 抢锁前先建目录：wx 建锁需要父目录存在（否则 ENOENT 被误判为永久性失败立即放弃）。
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  // 读-合-比-写全程在跨进程临界区内：面板保存与桥接启动写并发时不再互相覆盖（丢更新）。
+  const outcome = withConfigLock(target, () => {
+    let existing = {};
+    try {
+      existing = JSON.parse(fs.readFileSync(target, 'utf8'));
+    } catch (_) {}
+    const merged = mergeUserConfig(existing, values, opts);
+    // 无实际变化就不落盘：桥接进程每次会话启动都跑一遍，无谓改写会污染 mtime
+    // 并让用户误以为配置被改动（排查 401 时正是靠 mtime 定位到本缺陷）。
+    if (JSON.stringify(merged) === JSON.stringify(existing)) {
+      return { changed: false, file: target };
+    }
+    writeJsonAtomic(target, JSON.stringify(merged, null, 2));
+    return { changed: true, file: target, keys: Object.keys(values) };
+  });
+  if (outcome === false) {
+    // 拿不到锁（约 1s）：如实上报，调用方决定失败语义。fillMissingOnly 不会在下次会话
+    // 「兜底」补回本次写入（只填缺失键），显式保存必须当场成功或当场报错。
+    return { changed: false, file: target, lockTimeout: true };
+  }
+  return outcome;
 }
 
 // —— 最小 MCP stdio 服务（initialize / tools/list / tools/call / ping）——
@@ -123,12 +231,15 @@ function serveMcp() {
 function main() {
   let result = { changed: false, file: USER_CONFIG };
   try {
-    result = writeUserConfig(guiValuesFromEnv(process.env));
+    // fillMissingOnly：宿主展开的 userConfig 默认值只用于兜底，绝不覆盖用户已配置的非空值。
+    result = writeUserConfig(guiValuesFromEnv(process.env), undefined, { fillMissingOnly: true });
   } catch (err) {
     try { process.stderr.write(`[advisor-bridge] 落盘失败: ${err && err.message}\n`); } catch (_) {}
   }
   if (process.env.ZCODE_ADVISOR_BRIDGE_VERBOSE === '1') {
     try { process.stderr.write(`[advisor-bridge] ${JSON.stringify(result)}\n`); } catch (_) {}
+  } else if (result.lockTimeout) {
+    try { process.stderr.write('[advisor-bridge] 配置文件被其他进程占用，本次跳过兜底写入\n'); } catch (_) {}
   }
   serveMcp();
 }

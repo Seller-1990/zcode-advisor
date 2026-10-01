@@ -36,6 +36,13 @@ function saveUserConfig(patch) {
     const v = String(patch[k] || '').trim();
     if (v && !isPlaceholderKey(v)) allowed[k] = v;
   }
+  // maxTokens 必须与其余字段走**同一次** read-modify-write：早期实现把它当作补丁，
+  // 在 writeUserConfig 之后再读一次文件、再写一次（两次独立 RMW + 两处重复校验），
+  // 既与 config-bridge 的合并语义分叉，也留下「后写覆盖先写」的窗口（审计报告 A1）。
+  if (patch.maxTokens != null) {
+    const mt = parseInt(patch.maxTokens, 10);
+    if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) allowed.maxTokens = mt;
+  }
   return writeUserConfig(allowed);
 }
 
@@ -74,8 +81,8 @@ function page() {
  <option value="async"${(cfg.reviewMode || 'async') === 'async' ? ' selected' : ''}>async（默认：零体感延迟，意见随下一条消息送达）</option>
  <option value="sync"${cfg.reviewMode === 'sync' ? ' selected' : ''}>sync（当轮打断：concern/blocker 立即送达，每轮收尾等待审查）</option>
 </select>
-<label style="margin-top:14px">max_tokens（高级，默认 2048；思考型模型建议 4096）</label>
-<input id="maxTokens" type="number" min="64" max="16384" value="${cfg.maxTokens || 2048}">
+<label style="margin-top:14px">max_tokens（高级，引擎默认 4096；越界会被钳到 64–16384）</label>
+<input id="maxTokens" type="number" min="64" max="16384" value="${cfg.maxTokens || 4096}">
 <button onclick="save()">保存配置</button>
 <button class="alt" onclick="ping()">Ping 测试（验证 key 与模型）</button>
 <div id="msg"></div>
@@ -152,6 +159,24 @@ async function ping(body) {
   return { ok: false, error: res.error, detail: res.detail, hint: hint(res.error) };
 }
 
+// CSRF/DNS-rebinding 防护：写接口只接受本机来源。
+// - Host 必须是回环地址：DNS rebinding 会把 Host 换成攻击者域名 → 拒绝；
+// - 浏览器跨源请求必带 Origin（text/plain 简单请求免预检也会带上），非回环来源一律拒绝——
+//   否则恶意网页可静默 POST /api/save 改写 baseUrl/apiKey，下轮审查会把对话增量外传；
+// - curl 等本机工具不带 Origin，不受影响；端口可变（EADDRINUSE 重试），只比对主机名。
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+function isLocalRequest(req) {
+  const host = String(req.headers.host || '').replace(/:\d+$/, '').toLowerCase();
+  if (!LOOPBACK_HOSTS.has(host)) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return LOOPBACK_HOSTS.has(new URL(String(origin)).hostname.toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
 const server = http.createServer((req, res) => {
   const send = (code, obj) => {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -163,24 +188,18 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === 'POST' && req.url === '/api/save') {
+    if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
       try {
         const patch = JSON.parse(body || '{}');
-        if (patch.maxTokens != null) {
-          const mt = parseInt(patch.maxTokens, 10);
-          if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) patch.maxTokens = mt;
-          else delete patch.maxTokens;
-        }
         const r = saveUserConfig(patch);
-        // maxTokens 保存到 maxTokens 键（用户级配置与 hook 配置同名同义）
-        if (patch.maxTokens != null) {
-          const cur = readUserConfig();
-          cur.maxTokens = patch.maxTokens;
-          const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
-          fs.writeFileSync(tmp, JSON.stringify(cur, null, 2), 'utf8');
-          fs.renameSync(tmp, USER_CONFIG);
+        // 锁超时必须以失败态呈现：fillMissingOnly/覆盖语义都不会「下次再补」，
+        // 静默 ok:true 会让用户以为存上了（配置 panel 前端按 ok 分红绿条）。
+        if (r.lockTimeout) {
+          send(503, { ok: false, error: '配置文件正被其他进程写入，请等几秒重试；若持续出现，删除 ~/.zcode/advisor.config.json.lock 后再试' });
+          return;
         }
         send(200, { ok: true, file: r.file });
       } catch (err) {
@@ -194,6 +213,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === 'POST' && req.url === '/api/ping') {
+    if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {

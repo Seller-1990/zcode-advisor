@@ -198,17 +198,43 @@ function normalizeChatEndpoint(baseUrl) {
 // 重试只使用剩余预算，否则 sync 模式下"首次响应慢 + 重试全额"会突破 Stop hook 的 320s 硬限，
 // 复活"强杀→指针不推进→每轮重审"的停滞循环。
 async function callReviewer(params) {
-  const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, signal } = params;
+  const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, signal, deadline: deadlineParam } = params;
   const endpoint = normalizeChatEndpoint(baseUrl);
 
-  const deadline = Date.now() + timeoutMs;
+  // 截止时间可由调用方传入：一轮审查内的多次调用（尤其"空响应重试"）必须共享同一预算。
+  // 不传时各自起算——那样"首次慢 + 重试全额"可达 2×timeoutMs，突破 Stop hook 的 320s 硬限，
+  // 复活"强杀→指针不推进→每轮重审"的停滞循环（审计报告 A2）。与本函数内 429/5xx 重试
+  // 共享 deadline 的纪律保持一致。
+  const deadline = Number.isFinite(deadlineParam) ? deadlineParam : Date.now() + timeoutMs;
   const remaining = () => deadline - Date.now();
   const RETRY_BACKOFF_MS = 1500;
 
-  const attempt = async (budgetMs) => {
+  // abort 计时器必须活到 body 消费完成：fetch 在响应头到达即 resolve，若此刻就 clearTimeout，
+  // 慢滴流的 body 读取不受 deadline 约束 → 单轮突破预算 → worker 锁被判陈旧 → 同会话双开
+  // （A2 同族停滞）。body 消费统一经 consumeBody：超时中止归类 llm_timeout，用完即拆定时器。
+  let bodyGuard = null;
+  const armGuard = (budgetMs) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(1000, budgetMs));
     if (signal) signal.addEventListener('abort', () => controller.abort(), { once: true });
+    bodyGuard = { timer, controller };
+  };
+  const disarmGuard = () => {
+    if (bodyGuard) { clearTimeout(bodyGuard.timer); bodyGuard = null; }
+  };
+  const consumeBody = async (promise) => {
+    try {
+      return { ok: true, value: await promise };
+    } catch (err) {
+      if (err && (err.name === 'AbortError' || String(err).includes('abort'))) return { ok: false };
+      throw err;
+    } finally {
+      disarmGuard();
+    }
+  };
+
+  const attempt = async (budgetMs) => {
+    armGuard(budgetMs);
     try {
       return await fetch(endpoint, {
         method: 'POST',
@@ -226,15 +252,18 @@ async function callReviewer(params) {
           temperature,
           stream: false
         }),
-        signal: controller.signal
+        signal: bodyGuard.controller.signal
       });
-    } finally {
-      clearTimeout(timer);
+    } catch (err) {
+      disarmGuard(); // 请求层失败立即清理；成功路径的定时器延后到 body 消费完
+      throw err;
     }
   };
 
   let resp = null;
   for (let tries = 0; tries < 2; tries++) {
+    // 预算已被上一轮（或调用方传进来的 deadline）耗尽：不再发起注定超时的请求。
+    if (remaining() < 1000) return { error: 'llm_timeout' };
     try {
       resp = await attempt(remaining());
     } catch (err) {
@@ -244,6 +273,7 @@ async function callReviewer(params) {
       return { error: 'llm_error', detail: String(err).slice(0, 200) };
     }
     if ((resp.status === 429 || resp.status >= 500) && tries === 0) {
+      disarmGuard(); // 该响应被丢弃：不消费 body，拆掉守卫定时器
       const left = remaining() - RETRY_BACKOFF_MS;
       if (left < 5000) break; // 剩余预算不足以完成第二次尝试：不重试
       await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS + Math.floor(Math.random() * 500)));
@@ -253,12 +283,15 @@ async function callReviewer(params) {
   }
 
   if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    return { error: `llm_http_${resp.status}`, detail: body.slice(0, 200) };
+    const r = await consumeBody(resp.text().catch(() => ''));
+    if (!r.ok) return { error: 'llm_timeout' }; // body 读取撞上 deadline
+    return { error: `llm_http_${resp.status}`, detail: String(r.value).slice(0, 200) };
   }
 
   try {
-    const data = await resp.json();
+    const parsed = await consumeBody(resp.json());
+    if (!parsed.ok) return { error: 'llm_timeout' };
+    const data = parsed.value;
     const choice = data && Array.isArray(data.choices) && data.choices[0];
     const message = (choice && choice.message) || {};
     const content = message.content;
@@ -291,7 +324,8 @@ async function callReviewer(params) {
       // 区分空响应的成因（真机实测：思考型模型会把 max_tokens 全部耗在
       // reasoning 上，finish_reason=length 且 content 为空）。
       // 只报 llm_empty_response 会让用户无从下手；带上成因与建议。
-      const fin = (data.choices && data.choices[0] && data.choices[0].finish_reason) || '';
+      // 上游端点完全控制 finish_reason 内容：截断到 40 字符，防被劫持端点借 hint 向日志无界注入。
+      const fin = String((data.choices && data.choices[0] && data.choices[0].finish_reason) || '').slice(0, 40);
       const details = (data.usage && data.usage.completion_tokens_details) || {};
       const reasoning = Number(details.reasoning_tokens) || 0;
       if (fin === 'length' && reasoning > 0) {

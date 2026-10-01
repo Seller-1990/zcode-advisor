@@ -1,6 +1,6 @@
 {
   "name": "zcode-advisor",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "dsh-advisor 的 zcode 移植：独立审查副模型在每轮结束后被动审查对话增量，以 nit/concern/blocker 三级建议注回会话（advisory-only，绝不阻塞主流程）。",
   "author": {
     "name": "local"
@@ -23,7 +23,7 @@
     "api_key": {
       "type": "string",
       "default": "",
-      "description": "审查模型 API key（智谱 BigModel/Z.ai）。保存后由桥接进程写入用户级配置 ~/.zcode/advisor.config.json，下一轮审查即生效，无需重启"
+      "description": "审查模型 API key（智谱 BigModel/Z.ai）。桥接进程以「只兜底填补缺失项」语义写入 ~/.zcode/advisor.config.json：仅在该键缺失/为空时落盘，已有非空配置不被表单覆盖（修改已有配置请用本地配置面板），下一轮审查即生效，无需重启"
     },
     "model": {
       "type": "string",

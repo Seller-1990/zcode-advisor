@@ -64,6 +64,8 @@ function emit(obj) {
   process.stdout.write(JSON.stringify(obj));
 }
 
+// 非匿名化标识：32 位 djb2 变体、无盐、确定性——可被字典穷举确认、同前缀跨会话可关联，
+// 仅用于状态文件名与日志 requestId 的弱区分，不得当作脱敏手段。
 function hashId(s) {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
@@ -122,6 +124,31 @@ function mockFrame(cfg) {
   return parseFrame(JSON.stringify(frame), cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
 }
 
+// 结构化审查日志（默认关闭）：ZCODE_ADVISOR_DEBUG=1 时按行追加到 <stateDir>/review.log。
+// 目的：把"审查失败只能通过 /advisor-status 的计数间接观察"变成可回溯单次失败原因
+// （error 分类 + requestId + 耗时 + 模型）。默认零常驻 IO（审计报告 B10）。
+function logReview(cfg, entry) {
+  if (process.env.ZCODE_ADVISOR_DEBUG !== '1') return;
+  try {
+    const dir = resolveStateDir(cfg);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.appendFileSync(
+      path.join(dir, 'review.log'),
+      JSON.stringify(Object.assign({ ts: new Date().toISOString() }, entry)) + '\n',
+      { encoding: 'utf8', mode: 0o600 }
+    );
+  } catch (_) { /* 日志是辅助功能，失败不影响审查 */ }
+}
+
+// 单轮审查总预算。sync 复用被钳制的 reviewTimeoutMs（≤300s，单轮 < Stop hook 硬超时 320s）；
+// async 由后台 worker 执行、无宿主硬限，放宽到 2×reviewTimeoutMs——首次尝试烧满 T 后
+// 重试仍有 ≥T 预算（v0.2.7 曾把 async 一并压到 1×，重试预算被首尝试挤占）。
+// 不变量：worker 锁 staleMs（=2×timeout+60s）> worker 最坏生命周期（预算 + 有界 ε），
+// 2×预算仍满足，双开窗口保持关闭。
+function reviewBudgetMs(cfg) {
+  return cfg.reviewMode === 'sync' ? cfg.reviewTimeoutMs : cfg.reviewTimeoutMs * 2;
+}
+
 async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock) {
   if (process.env.ZCODE_ADVISOR_MOCK === '1' && allowMock) {
     const frame = mockFrame(cfg);
@@ -129,6 +156,9 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
     return { frame };
   }
   const systemPrompt = cfg.systemPrompt && cfg.systemPrompt.trim() ? cfg.systemPrompt : DEFAULT_SYSTEM_PROMPT;
+  // **整轮共享同一截止时间**（审计报告 A2）：空响应重试复用同一 deadline，预算按模式区分（见 reviewBudgetMs）。
+  const deadline = Date.now() + reviewBudgetMs(cfg);
+  const t0 = Date.now();
   const reviewParams = {
     baseUrl: cfg.baseUrl,
     model: modelOverride || cfg.model,
@@ -137,7 +167,8 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
     userContent,
     maxTokens: cfg.maxTokens,
     temperature: cfg.temperature,
-    timeoutMs: cfg.reviewTimeoutMs
+    timeoutMs: cfg.reviewTimeoutMs,
+    deadline
   };
   let res = await callReviewer(reviewParams);
 
@@ -150,18 +181,29 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
   // content 为 null 且推理文本里也没有 JSON 帧。单纯重复请求成功率低；
   // 回灌上一步推理并明确要求"只输出 JSON"后显著改善（实测 2/3 → 3/4）。
   for (let attempt = 0; attempt < 2 && res.error === 'llm_empty_response'; attempt++) {
+    // 剩余预算不足以完成一次重试：直接放弃（避免发起注定超时的请求）。
+    if (deadline - Date.now() < 10000) break;
     const carry = res.reasoningText
       ? `\n\n【你上一步的分析（供参考，不要重复）】\n${res.reasoningText.slice(0, 3000)}\n\n请基于以上分析，只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}。不要输出任何其他文字。`
       : '\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）';
+    // 复用同一 deadline（见上）：重试只花剩余预算，不重新起算
     res = await callReviewer(Object.assign({}, reviewParams, {
       userContent: `${userContent}${carry}`,
       // 重试时温度归零，减少发散
       temperature: 0
     }));
   }
-  if (res.error) return { error: res.error, usage: res.usage, hint: res.hint };
+  const meta = { model: reviewParams.model, ms: Date.now() - t0, requestId: hashId(userContent) };
+  if (res.error) {
+    logReview(cfg, Object.assign({ kind: 'error', error: res.error, hint: res.hint || '' }, meta));
+    return { error: res.error, usage: res.usage, hint: res.hint };
+  }
   const frame = parseFrame(res.text, cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
-  if (!frame) return { error: 'unparsed', usage: res.usage };
+  if (!frame) {
+    logReview(cfg, Object.assign({ kind: 'unparsed' }, meta));
+    return { error: 'unparsed', usage: res.usage };
+  }
+  logReview(cfg, Object.assign({ kind: 'frame', severity: frame.severity }, meta));
   return { frame, usage: res.usage };
 }
 
@@ -747,6 +789,9 @@ async function handleCtl(args) {
     if ((drops.parse_empty || 0) > 0) {
       hints.push('parse_empty：转录有完整行但全部无法解析 → 转录格式与预期不符，请带样例反馈');
     }
+    if ((drops.llm_timeout || 0) > 0) {
+      hints.push('llm_timeout：审查超时 → 提高 reviewTimeoutMs（配置面板或 /advisor-setup；sync 模式上限 300s）');
+    }
     for (const h of hints) lines.push(`  提示: ${h}`);
 
     for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
@@ -882,13 +927,20 @@ async function main() {
   // 未知事件：安静退出。
 }
 
-main().catch((err) => {
-  // 绝不因 advisor 的错误影响主会话：吞掉一切异常，空输出、exit 0。
-  // ZCODE_ADVISOR_DEBUG=1 时把栈写到 stderr（hook 运行记录会捕获错误流），便于排查。
-  try {
-    if (process.env.ZCODE_ADVISOR_DEBUG === '1') {
-      process.stderr.write(`[advisor] hook error: ${err && err.stack ? err.stack : String(err)}\n`);
-    }
-  } catch (_) {}
-  process.exitCode = 0;
-});
+// 宿主以 `node advisor-hook.js <event>` 直接执行本文件（require.main === module 成立）；
+// 守卫只是让测试可以 require 本模块（否则会挂死在读 stdin）。CLI 行为不变。
+if (require.main === module) {
+  main().catch((err) => {
+    // 绝不因 advisor 的错误影响主会话：吞掉一切异常，空输出、exit 0。
+    // ZCODE_ADVISOR_DEBUG=1 时把栈写到 stderr（hook 运行记录会捕获错误流），便于排查。
+    try {
+      if (process.env.ZCODE_ADVISOR_DEBUG === '1') {
+        process.stderr.write(`[advisor] hook error: ${err && err.stack ? err.stack : String(err)}\n`);
+      }
+    } catch (_) {}
+    process.exitCode = 0;
+  });
+}
+
+// 仅供测试导出（test/log-review.test.js）；生产调用方全部走 CLI 入口。
+module.exports = { reviewTurn, logReview, reviewBudgetMs };
