@@ -351,3 +351,57 @@ test('parse_empty：转录有完整行但零解析产率时留信号', (t) => {
   assert.strictEqual(state.dropped.parse_empty, 1);
   assert.ok(state.byteOffset > 0);
 });
+
+// ---------------- ZCode 快照契约（no_transcript 修复） ----------------
+// 用户实测：ZCode 给 hook 的 transcript_path 是每轮临时快照（/var/folders/.../T/...），
+// Stop 返回即删。async worker 延后读取 → no_transcript，reviews 恒 0。
+// 修复：Stop 侧 spawn 前先把转录快照到持久目录，worker 加 --transcript 读快照。
+
+test('ZCode 快照契约：Stop 后临时转录被删，worker 仍能用快照完成审查', (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zca-snap-'));
+  t.after(() => { try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) {} });
+  // mock 双要素之二：state 目录下的 .mock-allowed（安全闸，防真实调用）
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, '.mock-allowed'), '');
+  const env = makeEnv(stateDir);
+
+  // 模拟 ZCode 行为：临时目录里的转录（每轮快照）
+  const tmpDirZ = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-claude-hook-'));
+  const tmpTranscript = path.join(tmpDirZ, 'transcript.jsonl');
+  fs.writeFileSync(tmpTranscript, [
+    JSON.stringify({ type: 'user', message: { role: 'user', content: '帮我实现一个功能' } }),
+    JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: '好的，我来实现' } })
+  ].join('\n') + '\n');
+
+  // session-start 记录的是**临时路径**
+  runHook(['session-start'], { session_id: 'snap1', transcript_path: tmpTranscript }, env);
+
+  // Stop：spawn 前应把临时转录快照到持久目录
+  const r = runHook(['stop'], { session_id: 'snap1', transcript_path: tmpTranscript, stop_hook_active: false }, env);
+  assert.strictEqual(r.status, 0);
+
+  // 快照应已生成在 state/snapshots/
+  const snapDir = path.join(stateDir, 'snapshots');
+  assert.ok(fs.existsSync(snapDir), '应有快照目录');
+  const snaps = fs.readdirSync(snapDir).filter((n) => n.endsWith('.jsonl'));
+  assert.ok(snaps.length > 0, '应有快照文件');
+  const snapContent = fs.readFileSync(path.join(snapDir, snaps[0]), 'utf8');
+  assert.ok(snapContent.includes('帮我实现一个功能'), '快照应包含转录内容');
+
+  // **此刻临时转录被宿主删除**（关键时序）
+  fs.rmSync(tmpDirZ, { recursive: true, force: true });
+  assert.ok(!fs.existsSync(tmpTranscript), '临时转录应已消失（模拟宿主清理）');
+
+  // worker 用 --transcript 读快照：应能完成审查（不再 no_transcript）
+  const snapPath = path.join(snapDir, snaps[0]);
+  const stateFile = path.join(stateDir, 'sess-snap1.json');
+  const rw = spawnSync(process.execPath, [HOOK, 'review-worker', '--state', stateFile, '--transcript', snapPath], {
+    input: '', env
+  });
+  assert.strictEqual(rw.status, 0);
+
+  const state = readState(stateDir, 'snap1');
+  assert.strictEqual(state.reviews, 1, 'worker 应完成一次审查（不再 no_transcript）');
+  assert.ok(state.pendingNotes.length > 0, 'mock 模式应产出意见');
+  assert.ok((state.dropped && state.dropped.no_transcript) == null, '不应再有 no_transcript 丢弃');
+});

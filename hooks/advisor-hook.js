@@ -276,10 +276,35 @@ function onStopAsync(ctx) {
     s.lastActivity = new Date().toISOString();
   });
 
+  // —— 转录快照（ZCode 宿主契约适配）——
+  // ZCode 给 hook 的 transcript_path 是**每轮临时快照**（/var/folders/.../T/zcode-*-hook-*/），
+  // Stop 返回后即被清理。async 的 worker 在 hook 退出后才读 → 必然 no_transcript
+  // （实测：reviews=0 全部丢弃于此）。因此 Stop 侧在 spawn 之前**同步读增量并快照**，
+  // worker 改读快照文件。
+  let snapshotPath = '';
+  try {
+    const cur = loadState(file);
+    if (cur && cur.transcriptPath && fs.existsSync(cur.transcriptPath)) {
+      const snapDir = path.join(stateDir, 'snapshots');
+      fs.mkdirSync(snapDir, { recursive: true });
+      snapshotPath = path.join(snapDir, `${sessionId}.jsonl`);
+      fs.copyFileSync(cur.transcriptPath, snapshotPath);
+      // 防堆积：快照目录只保留最近 10 个文件（旧会话的快照无保留价值）
+      const snaps = fs.readdirSync(snapDir).map((n) => ({
+        n, t: fs.statSync(path.join(snapDir, n)).mtimeMs
+      })).sort((a, b) => b.t - a.t);
+      for (const old of snaps.slice(10)) {
+        try { fs.unlinkSync(path.join(snapDir, old.n)); } catch (_) {}
+      }
+    }
+  } catch (_) { /* 快照失败走原路径（worker 会计 no_transcript）*/ }
+
   // 测试/调试钩子：跳过真实派生，由外部直接调 review-worker。
   if (process.env.ZCODE_ADVISOR_NO_SPAWN === '1') return;
 
-  const child = spawn(process.execPath, [__filename, 'review-worker', '--state', file], {
+  const workerArgs = ['review-worker', '--state', file];
+  if (snapshotPath) workerArgs.push('--transcript', snapshotPath);
+  const child = spawn(process.execPath, [__filename, ...workerArgs], {
     detached: true,
     stdio: 'ignore',
     cwd: PLUGIN_ROOT,
@@ -465,6 +490,12 @@ async function handleReviewWorker(args) {
   const file = idx !== -1 ? args[idx + 1] : '';
   if (!file) return;
 
+  // --transcript：Stop 侧把转录快照到持久目录后传来的路径。
+  // ZCode 的原 transcript_path 是每轮临时快照（Stop 返回即删），
+  // worker 延后读取必然 no_transcript——快照优先。
+  const snapIdx = args.indexOf('--transcript');
+  const transcriptOverride = snapIdx !== -1 ? args[snapIdx + 1] : '';
+
   const cfg = loadConfig(PLUGIN_ROOT, process.env);
   const apiKeyInfo = resolveApiKey(cfg, process.env);
   const myPid = String(process.pid);
@@ -491,10 +522,17 @@ async function handleReviewWorker(args) {
     }
     state.disabledReason = '';
 
-    const delta = readDelta(state.transcriptPath, state.byteOffset, {
-      expectedHeadHash: state.lastHeadHash,
-      backfillLimitBytes: cfg.backfillLimitBytes
-    });
+    // 快照模式：ZCode 每轮给 hook 的转录是**本轮完整快照**且每轮重写，
+    // 因此用快照时从 0 全量读（byteOffset 是针对持续追加文件的指针，跨轮不适用）。
+    // 代价：与上游 dsh-advisor 的"只审增量"不同，这里每轮审整轮——
+    // 换取的是 no_transcript 完全消失（该取舍已在 README 局限节声明）。
+    const usingSnapshot = Boolean(transcriptOverride);
+    const delta = readDelta(transcriptOverride || state.transcriptPath,
+      usingSnapshot ? 0 : state.byteOffset,
+      usingSnapshot ? {} : {
+        expectedHeadHash: state.lastHeadHash,
+        backfillLimitBytes: cfg.backfillLimitBytes
+      });
     if (delta.missing) {
       mutateStateExclusive(file, (s) => {
         bumpDrop(s, 'no_transcript');
@@ -535,8 +573,12 @@ async function handleReviewWorker(args) {
     // 最终落盘：短临界区内重读最新状态、只写自己拥有的字段——
     // 审查期间 UPS/ctl 的修改（清队列、off、model set）不会被旧快照覆盖。
     mutateStateExclusive(file, (s) => {
-      s.byteOffset = delta.nextOffset;
-      s.lastHeadHash = delta.headHash;
+      if (!usingSnapshot) {
+        // 持续文件路径（Claude Code 同构宿主）：正常推进增量指针
+        s.byteOffset = delta.nextOffset;
+        s.lastHeadHash = delta.headHash;
+      }
+      // 快照模式：不推进指针、不改 transcriptPath——每轮快照独立全量审。
       s.reviews = (s.reviews || 0) + 1;
       s.lastActivity = new Date().toISOString();
       accumulateUsage(s, result);
