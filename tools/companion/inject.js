@@ -256,6 +256,8 @@
     if (Number.isFinite(mt)) out.maxTokens = mt;
     const key = f.apiKey.value.trim();
     if (key) out.apiKey = key;
+    const en = document.getElementById('zca-enabled');
+    if (en) out.startEnabled = en.checked;
     return out;
   }
 
@@ -338,7 +340,11 @@
     p.id = 'zca-panel';
     p.style.display = 'none';
     p.innerHTML = `
-      <h3><span>🛡️ 顾问设置</span><span class="zca-close" id="zca-close">✕</span></h3>
+      <h3><span>🛡️ 顾问设置
+        <label class="zca-switch" title="新会话是否自动启用审查">
+          <input type="checkbox" id="zca-enabled"> <span class="zca-switch-text">启用</span>
+        </label></span>
+        <span class="zca-close" id="zca-close">✕</span></h3>
       <div class="zca-status" id="zca-status">读取中…</div>
       <label class="zca-label">端点（OpenAI 兼容，支持第三方）</label>
       <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">

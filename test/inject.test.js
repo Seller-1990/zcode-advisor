@@ -567,3 +567,48 @@ test('controller / reviewer 的端点归一化规则一致（修复 Ping 404）'
   assert.strictEqual(ctrlNorm('http://192.168.50.139:8788/v1'),
     'http://192.168.50.139:8788/v1/chat/completions', '基地址应补全路径');
 });
+
+// ---------------- 顾问总开关（startEnabled 往返） ----------------
+
+test('inject.js：面板含顾问开关，且随保存载荷提交 startEnabled', async () => {
+  const saved = [];
+  const fetchStub = async (url, opt) => {
+    if (String(url).includes('/api/config')) {
+      saved.push(JSON.parse((opt && opt.body) || '{}'));
+      return { json: async () => ({ ok: true, file: '/tmp/x.json' }) };
+    }
+    return { json: async () => ({ ok: false }) };
+  };
+  const dom = runInject({ fetch: fetchStub });
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  const panel = dom.byId.get('zca-panel');
+
+  const en = dom.byId.get('zca-enabled');
+  assert.ok(en, '面板应有顾问开关 #zca-enabled');
+  console.error('[dbg] en.tagName=', en.tagName, '| en.checked 初值=', en.checked, '| 身份稳定=', dom.document.getElementById('zca-enabled') === en);
+  en.checked = false;   // 关闭
+  console.error('[dbg] 设置后 en.checked=', en.checked);
+  await panel.querySelector('#zca-save')._listeners.click[0]();
+
+  console.error('[dbg] saved=', JSON.stringify(saved));
+  // /api/config 会被多次调用（refreshStatus 与 save 都走它），
+  // 带非空 body 的那次才是保存请求——不能断言 saved[0]。
+  const savePayloads = saved.filter((p) => Object.keys(p).length > 0);
+  assert.ok(savePayloads.length > 0, '应发出保存请求');
+  assert.strictEqual(savePayloads[savePayloads.length - 1].startEnabled, false, '关闭状态应进入保存载荷');
+});
+
+test('inject.js：发行包 payload 与 auto-enable 脚本就位（自动启用载体）', () => {
+  const fs2 = require('fs');
+  const path2 = require('path');
+  const root = path2.join(__dirname, '..');
+  // auto-enable 脚本存在
+  assert.ok(fs2.existsSync(path2.join(root, 'tools/companion/auto-enable.cjs')), 'auto-enable.cjs 应存在');
+  // build-installer 会把 plugin payload 打进发行包（stagePluginPayload 条目清单）
+  const bi = fs2.readFileSync(path2.join(root, 'tools/companion/build-installer.cjs'), 'utf8');
+  assert.match(bi, /stagePluginPayload/, '构建脚本应调用 stagePluginPayload');
+  assert.match(bi, /auto-enable\.cjs/, '构建脚本应打包 auto-enable');
+  // NSIS 安装后自动执行（ExecWait 在 packagers 的 NSIS 模板里）
+  const pk = fs2.readFileSync(path2.join(root, 'tools/companion/packagers.cjs'), 'utf8');
+  assert.match(pk, /ExecWait/, 'NSIS 应在安装后执行自动启用');
+});

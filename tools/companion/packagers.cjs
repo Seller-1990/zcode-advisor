@@ -88,6 +88,10 @@ Section "Install"
 
   WriteUninstaller "$INSTDIR\\uninstall.exe"
 
+  ; 自动启用插件（通过 ZCode 官方 CLI：marketplace add / install / enable）
+  ; 失败不阻断安装——用户仍可在 ZCode 内手动启用
+  ExecWait '"$INSTDIR\\bin\\node.exe" "$INSTDIR\\auto-enable.cjs"'
+
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ZCodeAdvisor" "DisplayName" "ZCode Advisor"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ZCodeAdvisor" "DisplayIcon" "$INSTDIR\\advisor.ico"
   WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ZCodeAdvisor" "DisplayVersion" "${version}"
@@ -186,6 +190,9 @@ if [ -z "$NODE" ] || [ ! -x "$NODE" ]; then
 fi
 
 # 日志追加；controller 自身有单实例锁，重复点击不会重复注入
+# 插件自动启用（幂等；失败不阻断角标外挂的启动）
+"$NODE" "$DIR/app/auto-enable.cjs" >>"$LOG" 2>&1 || true
+
 nohup "$NODE" "$DIR/app/controller.cjs" >>"$LOG" 2>&1 &
 exit 0
 `;
@@ -212,7 +219,7 @@ function macAppPlist(version) {
 
 // 在 destDir 下生成 "ZCode Advisor.app"（自包含），返回 .app 路径。
 function stageMacApp(opts) {
-  const { destDir, version, runtimeFiles, companionDir, nodeBinPath, icnsBuf } = opts;
+  const { destDir, version, runtimeFiles, companionDir, nodeBinPath, icnsBuf, pluginDir } = opts;
   const appDir = path.join(destDir, 'ZCode Advisor.app');
   const contents = path.join(appDir, 'Contents');
   const macos = path.join(contents, 'MacOS');
@@ -230,6 +237,12 @@ function stageMacApp(opts) {
   for (const f of runtimeFiles) {
     fs.copyFileSync(path.join(companionDir, f), path.join(appRes, f));
   }
+  // 插件 payload + 自动启用脚本（.app 首启时由启动器调用）
+  if (opts.pluginDir && fs.existsSync(opts.pluginDir)) {
+    fs.cpSync(opts.pluginDir, path.join(appRes, 'plugin'), { recursive: true });
+  }
+  const autoEnable = path.join(companionDir, 'auto-enable.cjs');
+  if (fs.existsSync(autoEnable)) fs.copyFileSync(autoEnable, path.join(appRes, 'auto-enable.cjs'));
   if (nodeBinPath && fs.existsSync(nodeBinPath)) {
     fs.copyFileSync(nodeBinPath, path.join(resources, 'node'));
     fs.chmodSync(path.join(resources, 'node'), 0o755);

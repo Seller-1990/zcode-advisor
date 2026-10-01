@@ -316,7 +316,14 @@ function readUserConfig() {
 
 function saveUserConfig(patch) {
   const allowed = {};
-  for (const k of ['apiKey', 'model', 'baseUrl', 'reviewMode', 'maxTokens']) {
+  for (const k of ['apiKey', 'model', 'baseUrl', 'reviewMode', 'maxTokens', 'startEnabled']) {
+    // startEnabled 是顾问总开关（新会话是否自动启用）：布尔处理
+    if (k === 'startEnabled') {
+      if (v === true || v === false) allowed[k] = v;
+      else if (v === 'true') allowed[k] = true;
+      else if (v === 'false') allowed[k] = false;
+      continue;
+    }
     const v = patch[k];
     if (k === 'maxTokens') {
       const mt = parseInt(v, 10);
@@ -432,7 +439,8 @@ function startApi(cdpPort, apiPort, token) {
           ok: true,
           config: {
             model: c.model || '', baseUrl: c.baseUrl || '', reviewMode: c.reviewMode || 'async',
-            maxTokens: c.maxTokens || 2048, keyMasked: c.apiKey ? maskKey(c.apiKey) : '（未设置）'
+            maxTokens: c.maxTokens || 2048, keyMasked: c.apiKey ? maskKey(c.apiKey) : '（未设置）',
+            enabled: c.startEnabled !== false
           },
           cdpPort
         });
@@ -504,6 +512,22 @@ async function main() {
   acquireLock();
   injectSource = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
   log('zcode-advisor 输入框角标外挂启动');
+
+  // 插件自动启用（幂等）：通过 ZCode 官方 CLI 注册/安装/启用审查插件。
+  // 这是「双击安装包后自动开启」的执行点——zip/tar.gz 用户没有安装器，
+  // 靠这里在每次外挂启动时确保插件处于启用状态（失败只记日志，不阻断角标）。
+  try {
+    const autoEnable = path.join(__dirname, 'auto-enable.cjs');
+    if (fs.existsSync(autoEnable)) {
+      const env2 = Object.assign({}, process.env);
+      delete env2.ELECTRON_RUN_AS_NODE;
+      const r = spawnSync(process.execPath, [autoEnable], { env: env2, timeout: 150000 });
+      const out = String((r.stdout || '') + (r.stderr || '')).trim();
+      for (const line of out.split('\n').filter((l) => l.includes('✓') || l.includes('✗'))) log(line.replace(/^.*\[(auto-enable)\] /, '[$1] '));
+      if (r.status !== 0) log(`自动启用未完全成功（status=${r.status}），详见 ${LOG_FILE}`);
+    }
+  } catch (_) { /* 自动启用失败不阻断外挂 */ }
+
   const cdpPort = await ensureCdp();
   const apiPort = await pickApiPort();
   const token = crypto.randomBytes(16).toString('hex');

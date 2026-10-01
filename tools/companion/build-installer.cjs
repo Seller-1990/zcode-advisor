@@ -67,6 +67,41 @@ const warn = (...a) => console.warn('[build][警告]', ...a);
 
 function stageDir(p) { fs.mkdirSync(p, { recursive: true }); return p; }
 
+// 把「插件 payload」（.zcode-plugin/hooks/commands 等）递归写入 dest/plugin/。
+// 安装器会在安装后/首次启动时调用 auto-enable.cjs，通过 ZCode 官方 CLI 注册并启用——
+// 这是「双击安装包后自动开启」的载体：没有这份 payload，安装器无从安装插件本体。
+function stagePluginPayload(dest) {
+  const payloadRoot = path.join(dest, 'plugin');
+  const items = [
+    '.zcode-plugin', '.claude-plugin', 'hooks', 'commands', 'package.json', 'README.md'
+  ];
+  for (const item of items) {
+    const src = path.join(ROOT, item);
+    if (!fs.existsSync(src)) continue;
+    const dst = path.join(payloadRoot, item);
+    fs.cpSync(src, dst, { recursive: true, force: true });
+  }
+  // auto-enable 脚本本身也要随包（安装器/controller 调它）
+  fs.copyFileSync(path.join(COMPANION_DIR, 'auto-enable.cjs'), path.join(payloadRoot, 'auto-enable.cjs'));
+  return payloadRoot;
+}
+
+// 递归收集目录为归档条目（相对 base），保留可执行位
+function collectEntries(base, relPrefix, mode) {
+  const out = [];
+  const walk = (dir) => {
+    for (const name of fs.readdirSync(dir)) {
+      const full = path.join(dir, name);
+      const st = fs.statSync(full);
+      const rel = path.join(relPrefix, path.relative(base, full)).split(path.sep).join('/');
+      if (st.isDirectory()) walk(full);
+      else out.push({ path: rel, data: fs.readFileSync(full), mode: (st.mode & 0o777) || mode });
+    }
+  };
+  walk(base);
+  return out;
+}
+
 async function download(url) {
   // 大文件（Node 发行包 30~60MB）在连续请求时可能因连接复用/代理抖动而失败，
   // 实测同一 URL 单独请求可成功、连续请求会 `fetch failed`。故做有限重试，
@@ -251,6 +286,11 @@ async function buildMac(arch, opts) {
     }
   }
 
+  // 插件 payload + 自动启用脚本（.app 首次启动时调用，实现"装完自动开启"）
+  const pluginRoot = stagePluginPayload(path.join(DIST, `.stage-mac-payload-${arch}`));
+  entries.push(...collectEntries(pluginRoot, 'plugin', 0o644));
+  entries.push({ path: 'auto-enable.cjs', data: fs.readFileSync(path.join(COMPANION_DIR, 'auto-enable.cjs')), mode: 0o755 });
+
   entries.push({ path: 'README-install.txt', data: Buffer.from(T.macReadme(embedded), 'utf8'), mode });
   entries.push({ path: 'BUILD-INFO.txt', data: Buffer.from(T.MAC_BUILD_INFO(arch, embedded), 'utf8'), mode });
 
@@ -285,7 +325,8 @@ async function buildMac(arch, opts) {
           runtimeFiles,
           companionDir: COMPANION_DIR,
           nodeBinPath,
-          icnsBuf: makeIcns()
+          icnsBuf: makeIcns(),
+          pluginDir: path.join(DIST, '.stage-mac-payload-x64')   // plugin payload（含 auto-enable）
         });
         const dmgPath = path.join(DIST, `ZCodeAdvisor-${VERSION}-macos-${arch}.dmg`);
         const r = P.buildDmg({
