@@ -21,11 +21,16 @@ const LOG = process.env.ZCODE_ADVISOR_COMPANION_LOG
 
 function log(...a) {
   const line = `[${new Date().toLocaleTimeString()}] [auto-enable] ${a.join(' ')}`;
-  try { process.stdout.write(line + '\n'); } catch (_) {}
+  // **只写一份**：调用方（.app 启动器 / controller / NSIS）通常已把 stdout
+  // 重定向到同一 LOG，若这里再写 stdout 会与文件写冲突造成每行重复
+  // （实测：日志中每条 auto-enable 记录都出现两次）。
   try {
     fs.mkdirSync(path.dirname(LOG), { recursive: true });
     fs.appendFileSync(LOG, line + '\n', 'utf8');
-  } catch (_) {}
+  } catch (_) {
+    // 日志不可写时退到 stderr（调用方通常也重定向了），不影响主流程
+    try { process.stderr.write(line + '\n'); } catch (_) {}
+  }
 }
 
 // ── 1) 定位插件市场目录（含 .claude-plugin/marketplace.json）──
@@ -90,12 +95,62 @@ function findZcodeCli() {
 }
 
 // ── 3) 通过官方 CLI 注册/安装/启用 ──
+// ── 单飞锁（single-flight）──
+// 两个调用点会在同一次启动中**并行**跑到这里：
+//   ① .app 启动器（packagers.cjs 的 MAC_APP_LAUNCHER）
+//   ② controller 启动时（controller.cjs 的自动启用）
+// 实测 11:08:45（启动器）与 11:08:50（controller）各跑了一套
+// marketplace add/update + install + enable —— 并发的 install/enable
+// 在干净机器上可能互相踩（同一个缓存目录被两个进程同时改写）。
+// 用 mkdir 原子锁保证只跑一套；后来者看到锁直接退出（0 = 净结果已达成）。
+function acquireSingleFlight() {
+  const lockDir = path.join(os.homedir(), '.zcode', 'advisor-auto-enable.lock');
+  const info = path.join(lockDir, 'info');
+  try {
+    fs.mkdirSync(lockDir, { recursive: false });
+    fs.writeFileSync(info, `pid=${process.pid}\nstarted=${Date.now()}\n`, 'utf8');
+    return { lockDir, acquired: true };
+  } catch (_) {
+    // 锁已存在：判断持锁进程是否还活着
+    let pid = '';
+    try { pid = (/(?:^|\n)pid=(\d+)/.exec(fs.readFileSync(info, 'utf8')) || [])[1] || ''; } catch (_) {}
+    const alive = pid && (() => { try { process.kill(Number(pid), 0); return true; } catch (_) { return false; } })();
+    if (alive) return { lockDir, acquired: false, holder: pid };
+    // 陈旧锁（崩溃/被 kill）：接管
+    try {
+      fs.writeFileSync(info, `pid=${process.pid}\nstarted=${Date.now()}\n`, 'utf8');
+      return { lockDir, acquired: true, stale: true };
+    } catch (_) {
+      return { lockDir, acquired: false, holder: pid };
+    }
+  }
+}
+
 function main() {
   if (process.env.ZCODE_ADVISOR_NO_AUTO_ENABLE === '1') {
     log('ZCODE_ADVISOR_NO_AUTO_ENABLE=1，跳过自动启用');
     return 0;
   }
 
+  // 单飞：另一个实例正在跑就不重复执行（0 = 结果由它达成）
+  const flight = acquireSingleFlight();
+  if (!flight.acquired) {
+    log(`已有自动启用实例在运行（pid ${flight.holder || '未知'}），本次跳过以免并发踩踏`);
+    return 0;
+  }
+  if (flight.stale) log('发现陈旧自动启用锁（持锁进程已退出），接管');
+  const releaseFlight = () => { try { fs.rmSync(flight.lockDir, { recursive: true, force: true }); } catch (_) {} };
+  process.on('exit', releaseFlight);
+
+  try {
+    return runEnable();
+  } finally {
+    releaseFlight();
+  }
+}
+
+// 实际的启用流程（由 main 在持有单飞锁后调用）
+function runEnable() {
   const payload = findPluginPayload();
   if (!payload) {
     log('未找到插件市场目录（.claude-plugin/marketplace.json）——跳过自动启用');
