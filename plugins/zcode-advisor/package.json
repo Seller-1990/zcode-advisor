@@ -1,6 +1,6 @@
 {
   "name": "zcode-advisor",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "description": "Passive per-turn reviewer advisor plugin for ZCode (port of dsh-advisor).",
   "license": "MIT",
