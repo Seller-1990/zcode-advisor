@@ -49,3 +49,28 @@ test('同步脚本幂等：连续两次 --check 均无漂移', () => {
   assert.strictEqual(run(), 0);
   assert.strictEqual(run(), 0);
 });
+
+test('同步清单覆盖 plugin.json 声明的全部组件（防再漏 tools/ 之类）', () => {
+  const fs2 = require('fs');
+  const path2 = require('path');
+  const root = path2.join(__dirname, '..');
+  const plugin = JSON.parse(fs2.readFileSync(path2.join(root, '.zcode-plugin', 'plugin.json'), 'utf8'));
+
+  // 从 plugin.json 提取声明的目录/文件
+  const declared = [];
+  if (typeof plugin.commands === 'string') declared.push(plugin.commands.replace(/^\.\//, ''));
+  if (typeof plugin.hooks === 'string') declared.push(plugin.hooks.replace(/^\.\//, ''));
+  else if (fs2.existsSync(path2.join(root, 'hooks', 'hooks.json'))) declared.push('hooks');
+  // mcpServers 的 args 里引用的路径必须存在（config-bridge 曾因此缺失）
+  for (const srv of Object.values(plugin.mcpServers || {})) {
+    for (const arg of srv.args || []) {
+      const m = /\$\{CLAUDE_PLUGIN_ROOT\}\/(.+)$/.exec(arg);
+      if (m) declared.push(m[1]);
+    }
+  }
+
+  const dest = path2.join(root, 'plugins', 'zcode-advisor');
+  const missing = declared.filter((rel) => !fs2.existsSync(path2.join(dest, rel)));
+  assert.deepStrictEqual(missing, [],
+    `副本目录缺少 plugin.json 声明的组件：${missing.join(', ')}（同步清单漏项会让插件功能失效）`);
+});

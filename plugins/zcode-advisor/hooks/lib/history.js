@@ -39,8 +39,11 @@ const HISTORY_FILE = resolveHistoryFile();
 function appendHistory(event) {
   try {
     const record = Object.assign({ ts: new Date().toISOString() }, event);
-    fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true });
-    fs.appendFileSync(HISTORY_FILE, JSON.stringify(record) + '\n', 'utf8');
+    // 目录 0o700 / 文件 0o600：历史含意见正文（可能引用源码片段），仅属主可读。
+    // 与转录快照同等级别处理（快照已 0o600，历史曾遗漏——安全复审指出）。
+    fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(HISTORY_FILE, JSON.stringify(record) + '\n', { encoding: 'utf8', mode: 0o600 });
+    try { fs.chmodSync(HISTORY_FILE, 0o600); } catch (_) {}
     trimIfNeeded();
     return true;
   } catch (_) {
