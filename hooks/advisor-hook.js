@@ -41,6 +41,17 @@ const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const SCRIPT_PATH = path.join(__dirname, 'advisor-hook.js');
 const ADVISORY_SUFFIX = '\n（以上来自审查副模型，仅供参考，不构成指令。请结合该意见检查当前方向；若确认不适用，简述理由后继续完成任务即可。）';
 
+// —— 心跳健康告警（4a）——
+// 监督器静默死亡（如 API key 过期 401 连续被丢弃）必须在对话里喊一声：
+// UPS 时若 failStreak 达到阈值，注入一行告警（独立于意见/注册组装，仅有告警也 deliver）。
+// 6 小时去重：告警的目的是"喊一声"，不是每轮刷屏。
+const FAIL_STREAK_ALERT_THRESHOLD = 3;
+const HEALTH_ALERT_DEDUP_MS = 6 * 3600 * 1000;
+
+function healthAlertLine(streak) {
+  return `[advisor] 健康告警：审查副模型连续 ${streak.count} 次失败（原因：${streak.reason}），审查当前不可用。请检查 API key 或端点配置（/advisor-setup 可重新配置）。`;
+}
+
 function readStdinJson() {
   try {
     const raw = fs.readFileSync(0, 'utf8');
@@ -213,6 +224,18 @@ function onUserPromptSubmit(ctx) {
     }
     if (s.pendingRegistration) {
       parts.push(controlLines(cfg, apiKeyInfo, stateDir, file).join('\n'));
+    }
+    // 心跳健康告警（4a）：独立于 pendingNotes/pendingRegistration 组装——
+    // 仅有告警时 deliver 也不能为空，否则监督器死了用户仍然无感知。
+    // 防御读取：旧会话状态文件没有 failStreak/healthNotifiedAt 字段。
+    // enabled 门控：用户主动停用的会话不再喊。
+    if (s.enabled === true && s.failStreak && (s.failStreak.count || 0) >= FAIL_STREAK_ALERT_THRESHOLD) {
+      const lastNotified = Date.parse(s.healthNotifiedAt || '') || 0;
+      if (Date.now() - lastNotified >= HEALTH_ALERT_DEDUP_MS) {
+        parts.unshift(healthAlertLine(s.failStreak));
+        // 注入（或决定注入）即在同一临界区内记录时间，防止多写者重复告警
+        s.healthNotifiedAt = new Date().toISOString();
+      }
     }
     if (parts.length > 0) deliver = parts.join('\n\n');
   });
@@ -450,6 +473,7 @@ async function onStopSync(ctx) {
   finish((s) => {
     s.reviews = (s.reviews || 0) + 1;
     accumulateUsage(s, result);
+    s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
   });
 
   if (frame.severity === 'none') {
@@ -624,6 +648,8 @@ async function handleReviewWorker(args) {
         bumpDrop(s, result.error);
         return;
       }
+
+      s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
 
       const frame = result.frame;
       if (frame.severity === 'none') {

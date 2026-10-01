@@ -113,3 +113,66 @@ test('bumpDrop：空 reason 归为 unknown（保持既有行为）', () => {
   assert.strictEqual(s.dropped.unknown, 1);
   assert.ok(s.droppedAt.unknown);
 });
+
+// ---------------- 4a 心跳健康告警：failStreak 连击语义 ----------------
+// 监督器静默死亡问题：审查连续失败只进 dropped 计数，用户无感知。
+// failStreak 让"连续失败"成为可检测状态，UPS 侧据此注入健康告警。
+
+test('4a failStreak：freshState 初始化为 null / healthNotifiedAt 为空', () => {
+  const s = freshState('x', '', true);
+  assert.strictEqual(s.failStreak, null);
+  assert.strictEqual(s.healthNotifiedAt, '');
+});
+
+test('4a failStreak：同因累加到 3', () => {
+  const s = freshState('x', '', true);
+  bumpDrop(s, 'llm_http_401');
+  bumpDrop(s, 'llm_http_401');
+  bumpDrop(s, 'llm_http_401');
+  assert.deepStrictEqual(s.failStreak, { reason: 'llm_http_401', count: 3 });
+  // 既有 dropped/droppedAt 行为不变
+  assert.strictEqual(s.dropped.llm_http_401, 3);
+  assert.ok(s.droppedAt.llm_http_401);
+});
+
+test('4a failStreak：白名单异因切换重置为 1', () => {
+  const s = freshState('x', '', true);
+  bumpDrop(s, 'llm_http_401');
+  bumpDrop(s, 'llm_http_401');
+  bumpDrop(s, 'unparsed');
+  assert.deepStrictEqual(s.failStreak, { reason: 'unparsed', count: 1 });
+  // llm_* 家族内部切换同样重置
+  bumpDrop(s, 'llm_empty_response');
+  bumpDrop(s, 'llm_timeout');
+  assert.deepStrictEqual(s.failStreak, { reason: 'llm_timeout', count: 1 });
+});
+
+test('4a failStreak：非白名单原因冻结不改写', () => {
+  const s = freshState('x', '', true);
+  bumpDrop(s, 'llm_http_401');
+  bumpDrop(s, 'llm_http_401');
+  // 审查没跑成 ≠ 审查失败：busy/global_busy/worker_error/spawn_failed/queue_overflow 冻结
+  bumpDrop(s, 'busy');
+  bumpDrop(s, 'global_busy');
+  bumpDrop(s, 'worker_error');
+  bumpDrop(s, 'spawn_failed');
+  bumpDrop(s, 'queue_overflow');
+  assert.deepStrictEqual(s.failStreak, { reason: 'llm_http_401', count: 2 });
+  // 非 llm_ 前缀的相近名不得误匹配（startsWith('llm_') 要求下划线）
+  bumpDrop(s, 'llmfoo');
+  assert.deepStrictEqual(s.failStreak, { reason: 'llm_http_401', count: 2 });
+  // dropped 计数照常累加（既有行为不变）
+  assert.strictEqual(s.dropped.busy, 1);
+});
+
+test('4a failStreak：白名单精确项逐项计入', () => {
+  for (const reason of ['unparsed', 'parse_empty', 'no_transcript', 'ledger_write_failed']) {
+    const s = freshState('x', '', true);
+    bumpDrop(s, reason);
+    assert.deepStrictEqual(s.failStreak, { reason, count: 1 }, reason);
+  }
+  // 空 reason 归为 unknown：非白名单，冻结（不产生 failStreak）
+  const s = freshState('x', '', true);
+  bumpDrop(s, '');
+  assert.strictEqual(s.failStreak, null);
+});
