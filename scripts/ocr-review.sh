@@ -21,6 +21,39 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
+# ── 并发锁（实测教训）──
+# pre-push hook 每次推送都会起一个评审，而完整评审要 5–15 分钟。
+# 连续推送（或 tag + main 分开推）会让多个评审同时跑：既争抢上游配额，
+# 又争抢同一个报告文件 .git/ocr-review-last.txt，且各自耗内存。
+# 实测曾同时存在 6 个 ocr review 进程，最久的已跑 38 分钟。
+#
+# 用 mkdir 做原子锁（POSIX 下最可靠；flock 在 macOS 上不可用）。
+# 锁内含 pid + 起始时间；发现锁时：
+#   - 持锁进程仍活着 → 提示并退出（不重复评审）
+#   - 持锁进程已死（崩溃/被 kill）→ 视为陈旧锁，接管
+LOCK_DIR="$REPO_ROOT/.git/ocr-review.lock"
+LOCK_INFO="$LOCK_DIR/info"
+# OCR_REVIEW_FORCE=1 可绕过（需要并行评审时显式指定）
+if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
+    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+  else
+    HOLD_PID=""
+    [ -f "$LOCK_INFO" ] && HOLD_PID="$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)"
+    if [ -n "$HOLD_PID" ] && kill -0 "$HOLD_PID" 2>/dev/null; then
+      echo "[ocr-review] 已有评审在进行（pid $HOLD_PID），本次跳过以免重复消耗。"
+      echo "[ocr-review] 已有报告：$REPO_ROOT/.git/ocr-review-last.txt"
+      echo "[ocr-review] 如需强制并行，设 OCR_REVIEW_FORCE=1"
+      exit 0
+    fi
+    # 陈旧锁：持锁进程已不存在，接管
+    echo "[ocr-review] 发现陈旧锁（pid ${HOLD_PID:-未知} 已退出），接管"
+    printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
+    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+  fi
+fi
+
 # ocr 装在 nvm 全局；cron/非交互 shell 不继承 PATH，这里显式补上。
 # 先看 PATH 里有没有，没有再补常见位置（不把某个固定版本当成唯一来源）。
 if ! command -v ocr >/dev/null 2>&1; then
