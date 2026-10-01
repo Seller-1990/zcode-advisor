@@ -82,12 +82,22 @@ test('Windows 包：NSIS 引用的关键文件都被 buildWin 打包', () => {
   assert.match(winBody, /stagePluginPayload/, 'buildWin 必须打包插件 payload（否则 Windows 装不上插件）');
 });
 
-test('macOS 包：stageMacApp 的 pluginDir 跟随 arch，不硬编码', () => {
+test('macOS 包：stageMacApp 的 pluginDir 不得硬编码架构，且 payload 语义正确', () => {
   const bi = read('tools/companion/build-installer.cjs');
-  assert.ok(!/pluginDir:\s*path\.join\(DIST,\s*['`]\.stage-mac-payload-x64['`]\)/.test(bi),
-    'pluginDir 不得硬编码 x64——arm64 DMG 会缺插件本体（CI 曾绿灯放行）');
-  assert.match(bi, /pluginDir:\s*path\.join\(DIST,\s*`\.stage-mac-payload-\$\{arch\}`\)/,
-    'pluginDir 应使用当前 arch 变量');
+
+  // 不能硬编码 x64（曾使 arm64 DMG 缺插件本体）
+  assert.ok(!/\.stage-mac-payload-x64/.test(bi),
+    'pluginDir 不得硬编码 x64——arm64 DMG 会缺插件本体');
+
+  // pluginRoot 必须由 arch 推导
+  assert.match(bi, /stagePluginPayload\(path\.join\(DIST,\s*`\.stage-mac-payload-\$\{arch\}`\)\)/,
+    'payload 目录应由当前 arch 推导');
+
+  // stageMacApp 收到的必须是 pluginRoot（= <stage>/plugin），而非其父目录：
+  // cpSync(pluginDir, Resources/app/plugin) 是"整体拷为"，传父目录会多套一层。
+  const winStart = bi.indexOf('async function buildMac');
+  const macBody = bi.slice(winStart);
+  assert.match(macBody, /pluginDir:\s*pluginRoot/, 'pluginDir 应传 pluginRoot（避免 plugin/plugin 嵌套）');
 });
 
 test('stagePluginPayload：items 覆盖 plugin.json 声明的全部组件（含 tools/）', () => {
