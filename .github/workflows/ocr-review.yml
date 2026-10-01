@@ -32,7 +32,7 @@ permissions:
 jobs:
   code-review:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       # composite action 内部自做 full checkout（fetch-depth: 0），
       # 这一步只为把 action 本体落进 workspace。
@@ -54,3 +54,8 @@ jobs:
           sticky_summary: 'true'
           incremental: 'true'
           upload_artifacts: 'true'
+          # 首跑实测：高延迟端点下逐文件多轮工具调用超过 30 分钟被 runner 强杀。
+          # 提高单请求超时、开进度流（日志可观测）、并发 4 提速。
+          llm_timeout: '600'
+          stream_progress: 'true'
+          review_concurrency: '4'
