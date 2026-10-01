@@ -116,6 +116,19 @@ jobs:
             arm64) [ "$(uname -m)" = "arm64" ]  || { echo "目标 arm64 但 runner 不是 arm64"; exit 1; } ;;
           esac
 
+      # arm64 runner 磁盘较小（实测 hdiutil create 报 No space left on device）：
+      # 内嵌 Node 运行时 116MB + 构建中间产物会撑爆。先腾出空间。
+      - name: 清理 runner 磁盘空间
+        run: |
+          set -euo pipefail
+          echo "--- 清理前 ---"; df -h /
+          sudo rm -rf /Users/runner/Library/Android/sdk 2>/dev/null || true
+          sudo rm -rf /usr/local/lib/android 2>/dev/null || true
+          sudo rm -rf /Users/runner/Library/Caches/Homebrew 2>/dev/null || true
+          sudo rm -rf /usr/local/Homebrew/Library/Taps 2>/dev/null || true
+          rm -rf ~/Library/Caches/ms-playwright 2>/dev/null || true
+          echo "--- 清理后 ---"; df -h /
+
       - name: 构建（跳过 Windows）
         run: node tools/companion/build-installer.cjs --skip-win --mac-arch=${{ matrix.arch }}
 

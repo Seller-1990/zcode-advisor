@@ -339,8 +339,12 @@ async function buildMac(arch, opts) {
           companionDir: COMPANION_DIR,
           nodeBinPath,
           icnsBuf: makeIcns(),
-          // 必须跟随当前 arch——硬编码 x64 会让 arm64 DMG 缺插件（且 verifyDmg 不校验）
-          pluginDir: path.join(DIST, `.stage-mac-payload-${arch}`)
+          // 必须跟随当前 arch——硬编码 x64 会让 arm64 DMG 缺插件（且 verifyDmg 不校验）。
+          // 语义：stageMacApp 执行 cpSync(pluginDir, Resources/app/plugin)，
+          // 即把 pluginDir **整体拷为** plugin/。因此必须传 pluginRoot
+          // （= <stage>/plugin，其下直接是 .claude-plugin/hooks/…），
+          // 传父目录会得到 plugin/plugin/… 的嵌套，verifyDmg 会（正确地）拒绝。
+          pluginDir: pluginRoot
         });
         const dmgPath = path.join(DIST, `ZCodeAdvisor-${VERSION}-macos-${arch}.dmg`);
         const r = P.buildDmg({
