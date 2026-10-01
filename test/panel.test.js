@@ -143,3 +143,26 @@ test('配置面板 HTTP：页面与保存接口', async (t) => {
   assert.strictEqual(saved.model, 'glm-5.3');
   assert.strictEqual(saved.maxTokens, 4096);
 });
+
+test('配置面板 HTTP：一次保存恰好一次原子落盘（单次 RMW，锁/重试不产生额外写）', async () => {
+  // 审计 A1：maxTokens 曾在保存后再读一次再写一次（两次独立 RMW）。修正后必须恰好一次；
+  // 本轮加的跨进程锁只增删 .lock 文件（不 rename），rename 重试也只对同一次落盘生效。
+  try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
+  const origRename = fs.renameSync;
+  let configRenames = 0;
+  fs.renameSync = function (a, b) {
+    if (String(a).includes('.tmp-')) configRenames++;
+    return origRename.call(fs, a, b);
+  };
+  try {
+    const saveRes = await (await fetch('http://127.0.0.1:8799/api/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'glm-5.3', maxTokens: 4096 })
+    })).json();
+    assert.strictEqual(saveRes.ok, true, `保存应成功：${JSON.stringify(saveRes)}`);
+  } finally {
+    fs.renameSync = origRename;
+  }
+  assert.strictEqual(configRenames, 1, '一次 /api/save 应恰好一次 tmp→目标 rename');
+});

@@ -113,3 +113,17 @@ test('隔离：测试不真实调用宿主 CLI（不改动本机插件安装）'
   assert.ok(!/✓ plugins /.test(log), `不应出现真实 CLI 调用痕迹：\n${log}`);
   resetLock();
 });
+
+// 回归（审计第三轮）：pid→process.pid 的改法只覆盖「kill 无错=存活」分支，丢掉了
+// EPERM（存在但无权限→应判存活）这个原始 bug（把任何异常当已死）的唯一判别性用例。
+// pid 1 在类 Unix 非 root 下恰是 EPERM 语义；Windows 无 pid 1（ESRCH）、root 下 kill 成功，
+// 都不适用，故加平台门。
+test('存活 pid（EPERM 语义）：类 Unix 非 root 下 pid 1 识别为存活并跳过', {
+  skip: process.platform === 'win32' || (typeof process.getuid === 'function' && process.getuid() === 0)
+}, () => {
+  resetLock();
+  writeLock(1, Date.now());
+  const log = runAutoEnable();
+  assert.match(log, /已有自动启用实例在运行/, 'kill(1,0)=EPERM（存在但无权限）应判存活并跳过');
+  resetLock();
+});

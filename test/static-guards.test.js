@@ -152,6 +152,26 @@ test('面板开关：refreshStatus 回填 zca-enabled（防"保存即静默关�
   assert.match(body, /zca-enabled/, 'refreshStatus 必须回填顾问总开关，否则默认未勾选会被保存为 false');
 });
 
+test('配置锁协议：config-bridge 与 controller 的 vendored 双副本一致（防协议漂移复活丢更新）', () => {
+  // 两份 withConfigLock 是同一协议的复制（发行包不含 hooks/，无法 require 共享）。
+  // 协议若单侧漂移（锁路径/陈旧阈值/属主检查），一方会偷走另一方的新鲜锁 → RMW 竞态复活。
+  // 这里锁住协议的关键标记；改协议必须两处同改（本测试会拦住只改一侧的提交）。
+  const bridge = read('tools/config-bridge.js');
+  const ctrl = read('tools/companion/controller.cjs');
+  const markers = [
+    'function withConfigLock',
+    '`${target}.lock`',    // 锁路径后缀（<target>.lock）
+    '10000',               // 陈旧阈值 10s
+    "flag: 'wx'",          // wx 抢建
+    'process.kill(pid, 0)', // 持有者存活检查（EPERM=存活）
+    'code !== \'EEXIST\'',  // 仅竞争重试，EACCES/EROFS 立即失败
+  ];
+  for (const m of markers) {
+    assert.ok(bridge.includes(m), `tools/config-bridge.js 缺锁协议标记：${m}`);
+    assert.ok(ctrl.includes(m), `tools/companion/controller.cjs 缺锁协议标记：${m}`);
+  }
+});
+
 test('测试文件：无遗留的调试输出', () => {
   for (const f of fs.readdirSync(path.join(ROOT, 'test'))) {
     if (!f.endsWith('.test.js')) continue;

@@ -64,6 +64,8 @@ function emit(obj) {
   process.stdout.write(JSON.stringify(obj));
 }
 
+// 非匿名化标识：32 位 djb2 变体、无盐、确定性——可被字典穷举确认、同前缀跨会话可关联，
+// 仅用于状态文件名与日志 requestId 的弱区分，不得当作脱敏手段。
 function hashId(s) {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
@@ -138,6 +140,15 @@ function logReview(cfg, entry) {
   } catch (_) { /* 日志是辅助功能，失败不影响审查 */ }
 }
 
+// 单轮审查总预算。sync 复用被钳制的 reviewTimeoutMs（≤300s，单轮 < Stop hook 硬超时 320s）；
+// async 由后台 worker 执行、无宿主硬限，放宽到 2×reviewTimeoutMs——首次尝试烧满 T 后
+// 重试仍有 ≥T 预算（v0.2.7 曾把 async 一并压到 1×，重试预算被首尝试挤占）。
+// 不变量：worker 锁 staleMs（=2×timeout+60s）> worker 最坏生命周期（预算 + 有界 ε），
+// 2×预算仍满足，双开窗口保持关闭。
+function reviewBudgetMs(cfg) {
+  return cfg.reviewMode === 'sync' ? cfg.reviewTimeoutMs : cfg.reviewTimeoutMs * 2;
+}
+
 async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock) {
   if (process.env.ZCODE_ADVISOR_MOCK === '1' && allowMock) {
     const frame = mockFrame(cfg);
@@ -145,10 +156,8 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
     return { frame };
   }
   const systemPrompt = cfg.systemPrompt && cfg.systemPrompt.trim() ? cfg.systemPrompt : DEFAULT_SYSTEM_PROMPT;
-  // **整轮共享同一截止时间**：空响应重试也复用它，保证单轮审查总耗时 ≤ reviewTimeoutMs
-  // （早期实现每次重试各自起算 → 最坏 2×reviewTimeoutMs，sync 模式下会突破 Stop hook
-  // 的 320s 硬超时。审计报告 A2）。
-  const deadline = Date.now() + cfg.reviewTimeoutMs;
+  // **整轮共享同一截止时间**（审计报告 A2）：空响应重试复用同一 deadline，预算按模式区分（见 reviewBudgetMs）。
+  const deadline = Date.now() + reviewBudgetMs(cfg);
   const t0 = Date.now();
   const reviewParams = {
     baseUrl: cfg.baseUrl,
@@ -780,6 +789,9 @@ async function handleCtl(args) {
     if ((drops.parse_empty || 0) > 0) {
       hints.push('parse_empty：转录有完整行但全部无法解析 → 转录格式与预期不符，请带样例反馈');
     }
+    if ((drops.llm_timeout || 0) > 0) {
+      hints.push('llm_timeout：审查超时 → 提高 reviewTimeoutMs（配置面板或 /advisor-setup；sync 模式上限 300s）');
+    }
     for (const h of hints) lines.push(`  提示: ${h}`);
 
     for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
@@ -915,13 +927,20 @@ async function main() {
   // 未知事件：安静退出。
 }
 
-main().catch((err) => {
-  // 绝不因 advisor 的错误影响主会话：吞掉一切异常，空输出、exit 0。
-  // ZCODE_ADVISOR_DEBUG=1 时把栈写到 stderr（hook 运行记录会捕获错误流），便于排查。
-  try {
-    if (process.env.ZCODE_ADVISOR_DEBUG === '1') {
-      process.stderr.write(`[advisor] hook error: ${err && err.stack ? err.stack : String(err)}\n`);
-    }
-  } catch (_) {}
-  process.exitCode = 0;
-});
+// 宿主以 `node advisor-hook.js <event>` 直接执行本文件（require.main === module 成立）；
+// 守卫只是让测试可以 require 本模块（否则会挂死在读 stdin）。CLI 行为不变。
+if (require.main === module) {
+  main().catch((err) => {
+    // 绝不因 advisor 的错误影响主会话：吞掉一切异常，空输出、exit 0。
+    // ZCODE_ADVISOR_DEBUG=1 时把栈写到 stderr（hook 运行记录会捕获错误流），便于排查。
+    try {
+      if (process.env.ZCODE_ADVISOR_DEBUG === '1') {
+        process.stderr.write(`[advisor] hook error: ${err && err.stack ? err.stack : String(err)}\n`);
+      }
+    } catch (_) {}
+    process.exitCode = 0;
+  });
+}
+
+// 仅供测试导出（test/log-review.test.js）；生产调用方全部走 CLI 入口。
+module.exports = { reviewTurn, logReview, reviewBudgetMs };

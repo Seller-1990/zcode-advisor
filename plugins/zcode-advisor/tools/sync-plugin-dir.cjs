@@ -71,10 +71,34 @@ function copyIfChanged(src, dest) {
     return;
   }
   try {
-    if (fs.readFileSync(dest).equals(fs.readFileSync(src))) return;   // 内容一致：不动目标文件
+    if (fs.readFileSync(dest).equals(fs.readFileSync(src))) {
+      // 内容一致：不动数据，但修复权限漂移（如执行位丢失）。仅类 Unix（Windows mode 恒
+      // 0o666/0o444 无意义，且 --check（diffTree）只比对内容，chmod 不会制造伪漂移）。
+      if (process.platform !== 'win32') {
+        try {
+          const dm = fs.statSync(dest).mode & 0o777;
+          const sm = st.mode & 0o777; // 掩掉文件类型位，直接传 chmodSync 会 EINVAL
+          if (dm !== sm) fs.chmodSync(dest, sm);
+        } catch (_) {}
+      }
+      return;
+    }
   } catch (_) { /* 目标缺失/不可读：走复制分支 */ }
+  // tmp + rename 原子替换：并发读者（宿主加载插件文件）不会读到半文件；
+  // rename 撞上杀毒句柄 EPERM 时退避重试（hooks/lib/state.js saveState 同款），退出时清尸。
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.copyFileSync(src, dest);
+  const tmp = `${dest}.tmp-${process.pid}`;
+  fs.copyFileSync(src, tmp);
+  try {
+    for (let i = 0; ; i++) {
+      try { fs.renameSync(tmp, dest); return; } catch (err) {
+        if (i >= 2 || !err || (err.code !== 'EPERM' && err.code !== 'EACCES')) throw err;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30 * (i + 1));
+      }
+    }
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
 }
 
 function sync() {

@@ -320,6 +320,55 @@ function readUserConfig() {
   try { return JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8')) || {}; } catch (_) { return {}; }
 }
 
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch (_) {}
+}
+
+// 配置文件跨进程 RMW 临界区。
+// **锁协议的 vendored 双副本必须逐字一致**：本文件与 tools/config-bridge.js（本发行包
+// 不含 hooks/，无法 require 共享，只能复制；test/static-guards.test.js 锁两副本的协议
+// 标记防漂移）。写方全景：config-bridge writeUserConfig（桥接启动 + setup-server 面板
+// 保存）、本文件 saveUserConfig（controller 面板保存）；auto-enable 仅「不存在则创建」。
+//   协议：锁文件 <target>.lock，内容=持有者 pid，wx 抢建；持有者 pid 已死或锁 mtime>10s
+//   → 接管；进入与写入前双查属主，仅属主清除；EEXIST 重试 40×25ms≈1s，EACCES/EROFS
+//   等永久性失败立即放弃。
+function withConfigLock(target, fn) {
+  const lock = `${target}.lock`;
+  const myPid = String(process.pid);
+  let got = false;
+  for (let i = 0; i < 40 && !got; i++) {
+    try {
+      fs.writeFileSync(lock, myPid, { flag: 'wx' });
+      got = true;
+    } catch (err) {
+      if (!err || err.code !== 'EEXIST') return false;
+      let holder = '';
+      try { holder = fs.readFileSync(lock, 'utf8').trim(); } catch (_) {}
+      let stale = true;
+      try { stale = Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch (_) {}
+      const pid = parseInt(holder, 10);
+      let alive = false;
+      if (pid > 0) {
+        try { process.kill(pid, 0); alive = true; } catch (e) { alive = !!(e && e.code === 'EPERM'); }
+      }
+      if (!alive || stale) { try { fs.unlinkSync(lock); } catch (_) {} }
+      sleepSync(25);
+    }
+  }
+  if (!got) return false;
+  const ownLock = () => {
+    try { return fs.readFileSync(lock, 'utf8').trim() === myPid; } catch (_) { return false; }
+  };
+  try {
+    if (!ownLock()) return false;
+    return fn();
+  } finally {
+    try { if (fs.readFileSync(lock, 'utf8').trim() === myPid) fs.unlinkSync(lock); } catch (_) {}
+  }
+}
+
 function saveUserConfig(patch) {
   const allowed = {};
   for (const k of ['apiKey', 'model', 'baseUrl', 'reviewMode', 'maxTokens', 'startEnabled']) {
@@ -340,14 +389,30 @@ function saveUserConfig(patch) {
       allowed[k] = v.trim();
     }
   }
-  const merged = Object.assign({}, readUserConfig(), allowed);
-  // 配置含明文 apiKey：目录 0700、文件 0600（与转录快照/意见历史同级）。
+  // 读-合-写全程在跨进程临界区内：与 config-bridge 桥接启动写、setup-server 面板保存
+  // 并发时不再互相覆盖（丢更新）。锁协议见上方 withConfigLock 注释。
+  // 抢锁前先建目录：wx 建锁需要父目录存在（否则 ENOENT 被误判为永久性失败立即放弃）。
   fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true, mode: 0o700 });
-  const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, USER_CONFIG);
-  try { fs.chmodSync(USER_CONFIG, 0o600); } catch (_) {}
-  return merged;
+  const outcome = withConfigLock(USER_CONFIG, () => {
+    const merged = Object.assign({}, readUserConfig(), allowed);
+    // 配置含明文 apiKey：目录 0700、文件 0600（与转录快照/意见历史同级）。
+    const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { encoding: 'utf8', mode: 0o600 });
+    try {
+      for (let i = 0; ; i++) {
+        try { fs.renameSync(tmp, USER_CONFIG); break; } catch (err) {
+          if (i >= 2 || !err || (err.code !== 'EPERM' && err.code !== 'EACCES')) throw err;
+          sleepSync(30 * (i + 1)); // Windows 杀毒持有目标句柄时 rename EPERM（state.js 同款实证）
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+    }
+    try { fs.chmodSync(USER_CONFIG, 0o600); } catch (_) {}
+    return merged;
+  });
+  if (outcome === false) return { lockTimeout: true };
+  return outcome;
 }
 
 // —— 本机 API ——
@@ -449,7 +514,7 @@ function startApi(cdpPort, apiPort, token) {
           ok: true,
           config: {
             model: c.model || '', baseUrl: c.baseUrl || '', reviewMode: c.reviewMode || 'async',
-            maxTokens: c.maxTokens || 2048, keyMasked: c.apiKey ? maskKey(c.apiKey) : '（未设置）',
+            maxTokens: c.maxTokens || 4096, keyMasked: c.apiKey ? maskKey(c.apiKey) : '（未设置）',
             enabled: c.startEnabled !== false
           },
           cdpPort
@@ -457,7 +522,11 @@ function startApi(cdpPort, apiPort, token) {
       }
       if (req.method === 'POST' && req.url === '/api/config') {
         const body = await readBody();
-        saveUserConfig(body);
+        const r = saveUserConfig(body);
+        // 锁超时必须以失败态呈现：保存不会「下次再补」，静默 ok:true 会让用户以为存上了。
+        if (r && r.lockTimeout) {
+          return done(503, { ok: false, error: '配置文件正被其他进程写入，请等几秒重试；若持续出现，删除 ~/.zcode/advisor.config.json.lock 后再试' });
+        }
         return done(200, { ok: true, file: USER_CONFIG });
       }
       if (req.method === 'POST' && req.url === '/api/models') {

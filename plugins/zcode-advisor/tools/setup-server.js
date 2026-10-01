@@ -81,8 +81,8 @@ function page() {
  <option value="async"${(cfg.reviewMode || 'async') === 'async' ? ' selected' : ''}>async（默认：零体感延迟，意见随下一条消息送达）</option>
  <option value="sync"${cfg.reviewMode === 'sync' ? ' selected' : ''}>sync（当轮打断：concern/blocker 立即送达，每轮收尾等待审查）</option>
 </select>
-<label style="margin-top:14px">max_tokens（高级，默认 2048；思考型模型建议 4096）</label>
-<input id="maxTokens" type="number" min="64" max="16384" value="${cfg.maxTokens || 2048}">
+<label style="margin-top:14px">max_tokens（高级，引擎默认 4096；越界会被钳到 64–16384）</label>
+<input id="maxTokens" type="number" min="64" max="16384" value="${cfg.maxTokens || 4096}">
 <button onclick="save()">保存配置</button>
 <button class="alt" onclick="ping()">Ping 测试（验证 key 与模型）</button>
 <div id="msg"></div>
@@ -195,6 +195,12 @@ const server = http.createServer((req, res) => {
       try {
         const patch = JSON.parse(body || '{}');
         const r = saveUserConfig(patch);
+        // 锁超时必须以失败态呈现：fillMissingOnly/覆盖语义都不会「下次再补」，
+        // 静默 ok:true 会让用户以为存上了（配置 panel 前端按 ok 分红绿条）。
+        if (r.lockTimeout) {
+          send(503, { ok: false, error: '配置文件正被其他进程写入，请等几秒重试；若持续出现，删除 ~/.zcode/advisor.config.json.lock 后再试' });
+          return;
+        }
         send(200, { ok: true, file: r.file });
       } catch (err) {
         send(500, { ok: false, error: String(err).slice(0, 200) });

@@ -47,7 +47,7 @@ ZCode（z.ai CLI）插件：**每轮被动审查对话增量的独立审查副�
 
 配置加载优先级：**环境变量 > 用户级配置 `~/.zcode/advisor.config.json`（①②③写入的都是它）> 插件目录 `advisor.config.json` > 内置默认**。hook 每次调用都会重读配置，因此**保存后无需重启会话**。随时用 `ctl doctor` 查看配置解析链与 key 来源（脱敏显示）。
 
-**模型怎么选**：审查模型建议与主对话模型形成能力差（主模型是 flash 级时，审查优先试 `glm-5.3` 等更强模型，以套餐实际可用为准）。配置面板与 `/advisor-setup` 都能一键 Ping 验证候选模型；会话级临时切换用 `/advisor-model set <model-id>`（自下一轮审查生效）。注意 `maxTokens: 2048` 默认值**未在本插件目标端点验证过**——思考型模型建议 4096（768 会把预算耗在思考上导致空转，有实测）。
+**模型怎么选**：审查模型建议与主对话模型形成能力差（主模型是 flash 级时，审查优先试 `glm-5.3` 等更强模型，以套餐实际可用为准）。配置面板与 `/advisor-setup` 都能一键 Ping 验证候选模型；会话级临时切换用 `/advisor-model set <model-id>`（自下一轮审查生效）。`maxTokens` 默认即 4096（有实证支撑的下限：768 会把预算耗在思考上导致空转，有实测）；越界值会被钳到 64–16384 并在 `/advisor-status` 的「配置问题」行登记。
 
 ## 发行包
 
@@ -192,13 +192,13 @@ dsh 端教训（`ADVISOR-GUARD-REPORT.md`，[issue #102](https://github.com/omds
 | `reviewMode` | `async` | `async`（亚秒级固定税，意见下条消息送达）或 `sync`（立即打断，超时自动钳制 ≤300s） |
 | `immuneTurns` | 3 | steer 后的冷却轮数；冷却期内 concern 降级顺延（blocker 不受限） |
 | `maxDeltaMessages` / `maxContextChars` | 60 / 48000 | 送审窗口（条数 / 总字符）。两者同时生效，长消息下字符帽先到 |
-| `maxTokens` | 2048 | 单次审查输出预算；思考型模型建议 4096（见上方证据声明） |
+| `maxTokens` | 4096 | 单次审查输出预算；接受字符串数字，越界钳到 64–16384 并登记「配置问题」 |
 | `temperature` | 0.2 | 审查调用温度 |
 | `proseFallback` / `maxNoteChars` | true / 768 | 无 JSON 帧时把清洗后的散文救回为 nit；JSON 帧与散文的 note 统一按码点截断到该上限 |
 | `systemPrompt` | 内置 | **完全替换**内置审查提示词（含 advisory-only 纪律）。注意：插件目录可被会话内的工具写入，不建议设置——保持内置纪律不可被改写 |
 | `startEnabled` | true | 新会话是否自动启用（会话级仍可 `/advisor-off`） |
 | `maxBlocksPerTurn` | 2 | sync 单轮 steer 上限（纵深防御，正常流程不触达） |
-| `reviewTimeoutMs` | 240000 | 单次审查超时（含重试共享截止）；sync 模式自动钳制 ≤300000 |
+| `reviewTimeoutMs` | 240000 | 单次审查超时（含重试共享截止）；<1000 回退默认，sync 钳制 ≤300000，async 钳制 ≤600000（async 单轮总预算为其 2×，仍小于 worker 锁过期窗 2×+60s） |
 | `maxGlobalWorkers` | 4 | 全局同时在飞审查上限（跨会话，只计新鲜锁），超限计 `global_busy` |
 | `backfillLimitBytes` | 2097152 | offset 大幅落后时的尾部回读上限 |
 | `pendingNotesCap` | 5 | 顺延队列上限，溢出计 `queue_overflow` |
@@ -253,6 +253,7 @@ ZCODE_ADVISOR_REVIEW_MODE=sync \
 | `llm_empty_response` | 模型把输出预算耗在思考上，正文为空 | `maxTokens` 提到 4096 |
 | `unparsed` | 无合法 JSON 帧且救回被守门拒绝 | 确认 `proseFallback: true`；换格式稳定的模型 |
 | `llm_timeout` | 审查超时（含重试共享截止） | 提高 `reviewTimeoutMs`（sync 已自动钳制 ≤300s）或缩小 `maxDeltaMessages`（20~30） |
+| 面板保存 503 | 配置文件正被其他进程写入（跨进程锁在保护它） | 等几秒重试；持续出现则删除 `~/.zcode/advisor.config.json.lock`（进程崩溃残留，锁协议会自动接管死主的锁，正常无需手动） |
 | `llm_http_4xx/5xx` | 端点/认证/限流错误 | 检查 key 与模型 id；429/5xx 已内置一次共享截止的退避重试 |
 | `llm_error` | 网络层失败（DNS/连接） | 检查端点可达性 |
 | `no_transcript` | 转录文件缺失 | 宿主契约问题，带 `ZCODE_ADVISOR_DEBUG=1` 反馈 |
@@ -268,7 +269,7 @@ ZCODE_ADVISOR_REVIEW_MODE=sync \
 - **注入链残余风险（如实声明）**：本插件向主会话新增两条自动注入通道（sync 的 Stop block、async 的 additionalContext）。**能影响转录内容的一方**（被 Read 的网页/代码注释/工具输出）理论上可经审查模型植入 note 影响主模型；缓解是 note 码点截断（768）、帧校验（多帧取末帧而非最高severity）、advisory 前缀与"仅供参考"框架、内置提示词禁止 note 携带可执行指令——但对蓄意注入无硬性防线。选型提示拆开说：**担心注入链 → 用 async**（无强制续跑）；**担心 blocker 迟到 → 用 sync**（当轮打断），两个维度独立决策。
 - **敏感数据外发（如实声明）**：转录增量（代码、路径、可能的密钥）不做脱敏直接发送到 `baseUrl`；主模型 Read `.env` 后其内容会进入转录并外发。当前无可配置脱敏规则——请自行权衡端点可信度；插件目录（含本配置文件）可被会话内工具改写，"独立审查"对被审查者不设防，`/advisor-status` 的配置警告行可辅助发现端点篡改。
 - **key 落盘**：用户级配置（`~/.zcode/advisor.config.json`）不在任何 git 仓库内、跨升级保留；插件目录的 `advisor.config.json` 已被 gitignore（模板见 example）。共享 env key（`ZAI_API_KEY` 等）发往非官方端点会在状态中警告；`http://` 非本机端点会警告明文传输。
-- **成本可观测**：每次调用的 usage 解析入账（`/advisor-status` 的 Token 累计；数字来自端点自报，恶意端点可伪造）；单次调用输入上限 48K 字符 + `maxTokens` 输出。空转（有调用无产出）在 `Dropped:llm_empty_response` 可见。
+- **成本可观测**：每次调用的 usage 解析入账（`/advisor-status` 的 Token 累计；数字来自端点自报，恶意端点可伪造）；单次调用输入上限 48K 字符 + `maxTokens` 输出，单轮（含空响应重试）最多 3 次调用、总耗时 ≤ 预算上界（sync=1×、async=2× `reviewTimeoutMs`）。空转（有调用无产出）在 `Dropped:llm_empty_response` 可见。
 
 ## 局限（如实声明）
 

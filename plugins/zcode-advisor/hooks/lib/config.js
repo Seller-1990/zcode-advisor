@@ -154,11 +154,49 @@ function loadConfig(pluginRoot, env) {
     cfg.immuneTurns = DEFAULTS.immuneTurns;
   }
 
+  // reviewMode 归一化：大小写漂移（手写 "SYNC"）会同时漏掉下面的 sync 钳制与预算分支
+  // （都用 === 'sync' 判断）→ 脏值绕过 300s 钳制。未知值/非字符串一律归一 async 并登记。
+  if (typeof cfg.reviewMode === 'string') cfg.reviewMode = cfg.reviewMode.trim().toLowerCase();
+  if (cfg.reviewMode !== 'sync') {
+    if (cfg.reviewMode !== 'async') {
+      problems.push(`config_normalized: reviewMode=${JSON.stringify(cfg.reviewMode)} 非法，已归一为 async`);
+    }
+    cfg.reviewMode = 'async';
+  }
+
+  // maxTokens 专守卫：接受字符串数字（手写配置常见，Number("8192")=8192 直接采用）；
+  // 数值越界**钳到** [64,16384]（贴近用户意图，低侧回退是 64 倍成本惩罚、高侧回退是 4 倍质量退化）；
+  // 非整数垃圾（""/null/true/[]）回退默认。修复：字符串被静默降级、999999999 无上界直发、浮点穿透。
+  const mtRaw = Number(cfg.maxTokens);
+  if (!Number.isInteger(mtRaw) || mtRaw <= 0) {
+    problems.push(`config_out_of_range: maxTokens=${JSON.stringify(cfg.maxTokens)} 不是正整数，已回退默认 ${DEFAULTS.maxTokens}`);
+    cfg.maxTokens = DEFAULTS.maxTokens;
+  } else if (mtRaw < 64 || mtRaw > 16384) {
+    const clamped = Math.min(16384, Math.max(64, mtRaw));
+    problems.push(`config_out_of_range: maxTokens=${mtRaw} 越界 [64,16384]，已钳制到 ${clamped}`);
+    cfg.maxTokens = clamped;
+  } else {
+    cfg.maxTokens = mtRaw;
+  }
+
+  // reviewTimeoutMs 下界：<1000ms 时 reviewer 的预检（remaining()<1000）直接 0 请求返回，
+  // 审查全废且只有 llm_timeout 计数——回退默认并登记。（1000~5000 的本地快模型合法，不钳。）
+  if (Number.isFinite(cfg.reviewTimeoutMs) && cfg.reviewTimeoutMs < 1000) {
+    problems.push(`config_out_of_range: reviewTimeoutMs=${cfg.reviewTimeoutMs} 低于最小 1000ms，已回退默认 ${DEFAULTS.reviewTimeoutMs}`);
+    cfg.reviewTimeoutMs = DEFAULTS.reviewTimeoutMs;
+  }
+
   // sync 模式超时联动：reviewTimeoutMs 不得逼近 hooks.json 的 Stop 硬超时（320s），
   // 否则宿主强杀 hook → 指针不落盘 → 每轮重审同一增量的停滞循环。
   if (cfg.reviewMode === 'sync' && cfg.reviewTimeoutMs > SYNC_TIMEOUT_CAP_MS) {
     problems.push(`reviewTimeoutMs_clamped: sync 模式下 ${cfg.reviewTimeoutMs}ms 超过上限，已钳制到 ${SYNC_TIMEOUT_CAP_MS}ms（Stop hook 硬超时 320s）`);
     cfg.reviewTimeoutMs = SYNC_TIMEOUT_CAP_MS;
+  }
+  // async 上界：无宿主硬限也须有界——预算按 2× 放大后，worker 最坏占全局槽 2×上限、
+  // 崩溃残留锁让该会话 busy 2×上限+60s。10 分钟 = 实证上限（dsh 端 319s）的 30 倍余量。
+  if (cfg.reviewMode !== 'sync' && cfg.reviewTimeoutMs > 600000) {
+    problems.push(`reviewTimeoutMs_clamped: async 模式下 ${cfg.reviewTimeoutMs}ms 超过上限，已钳制到 600000ms`);
+    cfg.reviewTimeoutMs = 600000;
   }
 
   cfg.problems = problems;

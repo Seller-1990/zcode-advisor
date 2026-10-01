@@ -283,12 +283,14 @@ function runEnable() {
     || path.join(os.homedir(), '.zcode', 'advisor.config.json');
   if (!fs.existsSync(cfg)) {
     try {
-      fs.mkdirSync(path.dirname(cfg), { recursive: true });
+      fs.mkdirSync(path.dirname(cfg), { recursive: true, mode: 0o700 });
+      // 'wx'：existsSync 检查与写入之间有窗口，被并发创建时放弃（避免整文件覆盖）；
+      // 0600：该文件随后会由面板写入 API key，初始权限就不放宽。
       fs.writeFileSync(cfg, JSON.stringify({
         baseUrl: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
         model: 'glm-5.3-flash',
         apiKey: ''
-      }, null, 2) + '\n', 'utf8');
+      }, null, 2) + '\n', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
       log(`✓ 已生成用户级配置：${cfg}（请在设置面板填 API key）`);
     } catch (_) {}
   }

@@ -979,6 +979,55 @@ fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');  // 0644</div>
     <p style="margin-top:8px"><strong>提交状态（更新）：</strong>本节修复已随 PR #1（分支 <code>fix/audit-round2-hardening</code>，提交 <code>6cbdefb</code>）提交，不再是「仅落盘工作区待授权」的初稿状态；主席复审（8 顾问评审）提出的后续修正——本节文字勘误（A2 算术 / A5 机制）、文档与 fillMissingOnly 语义对齐、配置文件权限收紧（0600）、面板 Origin/Host 校验、版本号 bump——随复审提交补充。</p>
   </div></div>
 
+  <h3 class="section-title" id="recheck3">🔁 复审修复登记（第三轮 · 主席复审）</h3>
+  <div class="card"><div class="card-body">
+    <p><strong>口径：</strong>对第二轮遗留风险清单（P2×5 + P3 若干）逐项细化修复方案（v1），经后端/逻辑/反驳三位对抗顾问复审方案本身（v1.1 → v2.0），裁决后实施。顾问引用基线代码的 3 处陈旧前提（「重试各自满血 3T」「setup-server 二次裸写」「config-bridge 无等值跳过」——均为 d350ddf 已修内容）经 <code>git show</code> 核实后丢弃。</p>
+    <p style="margin-top:8px"><strong>验证：</strong>见提交内测试统计；新增 9 项回归（log-review 5 + panel 写入计数 1 + EPERM 1 + 锁协议一致性 1 + 预算 helper 随附）。</p>
+  </div></div>
+
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>C1. async 重试预算恢复 + deadline 全程覆盖</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-info">已修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 hooks/advisor-hook.js reviewBudgetMs / hooks/lib/reviewer.js</span><span>🎯 审查超时</span></div>
+    <div class="problem"><strong>判定：</strong>v0.2.7 把 async 一并压到 1×预算，重试预算被首尝试挤占（async 无宿主 320s 硬限，收窄未声明）。修复：新增 <code>reviewBudgetMs(cfg)</code>——sync=1×（≤300s &lt; Stop 硬限）、async=2×（首试烧满 T 后重试仍有 ≥T；2T &lt; worker 锁 staleMs=2T+60s，双开窗保持关闭，不变量已注释）。token 最坏次数（3 次调用）不变，变化的是耗时上界。</div>
+    <div class="problem"><strong>连带修复（顾问击穿）：</strong>reviewer.js 的 abort 计时器原在 fetch resolve（响应头到达）即清理——慢滴流 body 读取不受 deadline 约束，可无限突破预算。现在守卫定时器活到 body 消费完成，body 阶段超时归类 <code>llm_timeout</code>；<code>/advisor-status</code> hints 表补 llm_timeout 行。</div>
+  </div>
+
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>C2. maxTokens 数值链路口径统一</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-info">已修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 hooks/lib/config.js / tools/setup-server.js / tools/companion/controller.cjs / README</span><span>🎯 配置口径</span></div>
+    <div class="problem"><strong>判定：</strong>引擎默认 4096 而两个面板 GET 兜底/预填 2048（README:50/195 亦错写 2048）——未设置用户在任一面板保存一次即被钉死 2048，思考型模型随即空转。修复：两处面板预填/兜底统一 4096，README 同步；config.js 新增专守卫——接受字符串数字、数值越界<b>钳到</b> [64,16384]（顾问裁决：低侧回退是 64 倍成本惩罚、高侧回退是 4 倍质量退化，钳制更贴意图）、非整数垃圾回退默认，全部登记 problems。修掉字符串静默降级、无上界直发、浮点穿透三个洞。</div>
+  </div>
+
+  <div class="finding severity-high">
+    <div class="finding-header">
+      <h4>C3. 配置文件跨进程 RMW 互斥锁（丢更新窗口关闭）</h4>
+      <span class="badge badge-high">high</span>
+      <span class="badge badge-info">已修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 tools/config-bridge.js / tools/companion/controller.cjs（vendored 双副本）</span><span>🎯 数据一致性</span></div>
+    <div class="problem"><strong>判定：</strong>配置文件原有 4 个写入方、最多 3 个做 RMW（桥接启动、setup-server 面板、controller 面板——后者为发行包隔离的独立实现，顾问击穿指出 v1 方案漏盘点），彼此无锁，仓库自立的 mutateStateExclusive 写纪律未覆盖此文件。修复：vendored 同协议 <code>withConfigLock</code>（<code>&lt;target&gt;.lock</code>、wx+pid 抢建、持有者已死或 mtime&gt;10s 接管、双查属主、仅属主清除、EEXIST 重试 1s、EACCES/EROFS 立即失败），临界区内 读→合并→等值比较→0600 原子写（rename EPERM 3 次退避重试，state.js 同款）。</div>
+    <div class="problem"><strong>失败语义（顾问裁决）：</strong>锁超时如实报错——setup-server /api/save 与 controller /api/config 均返回 503 + 自愈指引，<b>不再静默 ok:true</b>（fillMissingOnly 只填缺失键，本次写入不会被「下次会话」补回，静默成功=用户改动永久丢失）。auto-enable 的「不存在则创建」不入锁，但补 'wx'+0600。static-guards 新增锁协议一致性测试防双副本漂移。</div>
+  </div>
+
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>C4. 「改了但没锁住」清单补测试 + 杂项加固</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-info">已修复</span>
+    </div>
+    <div class="finding-meta"><span>📍 test/log-review.test.js（新）/ panel.test.js / auto-enable-lock.test.js / hooks/lib/config.js</span><span>🎯 回归保护</span></div>
+    <div class="problem"><strong>内容：</strong>① advisor-hook.js 加 require.main 守卫并导出 reviewTurn/logReview/reviewBudgetMs（宿主仍以文件路径执行，CLI 行为不变）；② 新增 log-review.test.js：DEBUG=1 落盘 JSONL 字段断言 / 默认零落盘 / 预算 helper / sync、async 预算集成计时；③ panel.test.js 断言一次保存恰好一次原子落盘（锁 A1 修复）；④ auto-enable-lock 恢复 EPERM 分支的判别性用例（平台门：类 Unix 非 root + pid 1）；⑤ config.js reviewMode 归一化（手写 "SYNC" 曾同时绕过 sync 钳制与预算分支）、reviewTimeoutMs &lt;1000 回退 + async &gt;600000 钳制；⑥ copyIfChanged 等值分支补权限修复（仅类 Unix）、复制分支 tmp+rename 原子替换；⑦ mergeUserConfig 跳过 <code>__proto__</code> 键（等值跳过保证曾被自有键击穿）；⑧ reviewer.js finish_reason 截断 40 字符（防被劫持端点借 hint 无界注入日志）；⑨ hashId 注明非匿名化。</div>
+    <div class="problem"><strong>延期（登记）：</strong>key 删除路径（GUI 范围）；桥接 fillMissingOnly 跳过键的 VERBOSE stderr 信号；「插件与 companion 需同时更新」的版本倾斜提示（README 已有升级说明，暂不加运行时提示）。</div>
+  </div>
+
   </div>
 <script>
   const sections = document.querySelectorAll('[id]');
