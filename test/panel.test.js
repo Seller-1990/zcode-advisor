@@ -169,6 +169,14 @@ test('配置面板 HTTP：一次保存恰好一次原子落盘（单次 RMW，�
 
 // —— 延期项 D1：/api/clear-key ——
 
+async function postJson(url, body) {
+  return fetch('http://127.0.0.1:8799' + url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {})
+  });
+}
+
 test('配置面板 HTTP：清除 API key（成功分支，页面元素齐备）', async () => {
   try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
   const post = (url, body, origin) => fetch('http://127.0.0.1:8799' + url, {
@@ -204,4 +212,17 @@ test('配置面板 HTTP：clear-key 拒绝非本机来源（403 JSON）', async 
   const body = await r.json();
   assert.strictEqual(body.ok, false);
   assert.ok(body.error, '错误必须是 JSON（前端按 ok 分红绿条）');
+});
+
+test('配置面板 HTTP：clear-key 拒绝非 JSON body（400，不执行删除）', async () => {
+  await (await postJson('/api/save', { apiKey: 'keep-me' })).json();
+  const r = await fetch('http://127.0.0.1:8799/api/clear-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: 'not-json{{'
+  });
+  assert.strictEqual(r.status, 400);
+  assert.strictEqual((await r.json()).ok, false);
+  assert.strictEqual(JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8')).apiKey, 'keep-me',
+    '非法 body 不得触发删除');
 });

@@ -135,8 +135,11 @@ async function clearKey(){
  const btn=$('clearBtn');btn.disabled=true;
  try{
   const r=await post('/api/clear-key',{});
-  msg(r.ok?(r.removed&&r.removed.length?('已清除 API key（'+r.removed.join('、')+'）'):'配置里没有已保存的 API key'):(r.lockTimeout?'清除失败：配置文件正被其他进程写入，请稍后重试':('清除失败：'+r.error)),r.ok);
-  if(r.ok)$('st-key').textContent='（未设置）';
+  const cleared=r.ok&&r.removed&&r.removed.length;
+  // 只有真删了才把状态行置为未设置：env key（ZCODE_ADVISOR_API_KEY 等）不在配置文件里，
+  // 清除不影响它——无差别写「未设置」会让用户以为 env key 也没了，而审查/Ping 其实照常。
+  msg(r.ok?(cleared?('已清除 API key（'+r.removed.join('、')+'）；若环境变量仍配了 key，审查与 Ping 仍会成功'):'配置里没有已保存的 API key（环境变量 key 不受影响）'):(r.lockTimeout?'清除失败：配置文件正被其他进程写入，请稍后重试':('清除失败：'+r.error)),r.ok);
+  if(cleared)$('st-key').textContent='（未设置）';
  }catch(e){msg('清除失败：'+e,false);}finally{btn.disabled=false;}
 }
 </script></body></html>`;
@@ -228,6 +231,9 @@ const server = http.createServer((req, res) => {
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
       try {
+        // 与 /api/save 同构：先验 JSON 再动配置。端点不接收参数，但垃圾 body
+        // 也 400 拒掉——不把"动作未定义的请求"静默当成功执行。
+        JSON.parse(body || '{}');
         const r = removeUserConfigKeys(['apiKey'], USER_CONFIG);
         if (r.error) { send(400, { ok: false, error: r.error }); return; }
         if (r.lockTimeout) {
@@ -236,7 +242,7 @@ const server = http.createServer((req, res) => {
         }
         send(200, { ok: true, removed: r.removed });
       } catch (err) {
-        send(500, { ok: false, error: String(err).slice(0, 200) });
+        send(400, { ok: false, error: '请求体不是合法 JSON：' + String(err).slice(0, 160) });
       }
     });
     return;
