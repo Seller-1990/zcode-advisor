@@ -266,6 +266,12 @@ function buildDmg(opts) {
   if (fs.existsSync(outFile)) fs.unlinkSync(outFile);
   // 不用 -quiet：DMG 创建失败时 stderr 是唯一线索（此前 -quiet 把错误吞掉，
   // 只留下"Command failed: hdiutil create …"这种无法定位的信息）。
+  // TMPDIR 指向输出目录所在卷：hdiutil create 会在 TMPDIR（默认 /tmp）造中间
+  // 原始映像（未压缩可达数百 MB）。GitHub arm64 runner 上实测
+  // "hdiutil: create failed - No space left on device"，
+  // 即便 df 显示根分区有 57Gi 可用——/tmp 在 runner 上受额外限制。
+  // 显式把 TMPDIR 指到构建目录（hdiutil 尊重该环境变量；无 -tmpdir 选项）。
+  const tmpDir = path.dirname(path.resolve(outFile));
   try {
     execFileSync('hdiutil', [
       'create',
@@ -274,7 +280,7 @@ function buildDmg(opts) {
       '-ov',
       '-format', 'UDZO',
       outFile
-    ], { stdio: 'pipe' });
+    ], { stdio: 'pipe', env: Object.assign({}, process.env, { TMPDIR: tmpDir }) });
   } catch (err) {
     const stderr = String((err && err.stderr) || '').trim().slice(0, 300);
     return { ok: false, reason: `hdiutil create 失败：${stderr || (err && err.message)}` };
