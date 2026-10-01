@@ -129,7 +129,7 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
     return { frame };
   }
   const systemPrompt = cfg.systemPrompt && cfg.systemPrompt.trim() ? cfg.systemPrompt : DEFAULT_SYSTEM_PROMPT;
-  const res = await callReviewer({
+  const reviewParams = {
     baseUrl: cfg.baseUrl,
     model: modelOverride || cfg.model,
     apiKey: apiKeyInfo.key,
@@ -138,8 +138,19 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
     maxTokens: cfg.maxTokens,
     temperature: cfg.temperature,
     timeoutMs: cfg.reviewTimeoutMs
-  });
-  if (res.error) return { error: res.error, usage: res.usage };
+  };
+  let res = await callReviewer(reviewParams);
+
+  // **空响应重试**（真机实测）：思考型模型有时把预算全用在推理上、
+  // content 为 null 且推理文本里也没有 JSON 帧，导致 llm_empty_response。
+  // 同一次请求重试一次（并追加"只输出 JSON"的强调）能显著提高成功率——
+  // 实测同一输入有时成功（拿到帧）有时失败，属模型不确定性而非代码缺陷。
+  if (res.error === 'llm_empty_response') {
+    res = await callReviewer(Object.assign({}, reviewParams, {
+      userContent: `${userContent}\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）`
+    }));
+  }
+  if (res.error) return { error: res.error, usage: res.usage, hint: res.hint };
   const frame = parseFrame(res.text, cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
   if (!frame) return { error: 'unparsed', usage: res.usage };
   return { frame, usage: res.usage };

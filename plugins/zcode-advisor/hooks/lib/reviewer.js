@@ -269,10 +269,17 @@ async function callReviewer(params) {
     // **思考型模型兼容**（真机实测发现）：部分端点（本机 8787 网关、DeepSeek-R1
     // 类）把推理内容放在 message.reasoning_content，而 message.content 为 **null**。
     // 只读 content 会误判为"空响应"，顾问永远不出意见（本机曾 100% 命中）。
-    // 回退到 reasoning_content，后续 parseFrame/extractJsonObjects 能从推理文本里
-    // 捞出最终 JSON 帧。
+    //
+    // 但**不能直接把 reasoning_content 当结果**：实测它是纯思考过程（英文、
+    // 上万字符，且可能不含最终 JSON），直接当意见展示会让用户看到一堆推理碎语。
+    // 因此只在"能从推理文本里捞出合法 JSON 帧"时才采用；否则仍报空响应，
+    // 由上层按 finish_reason 给出可操作提示。
     if (!text.trim() && typeof message.reasoning_content === 'string' && message.reasoning_content.trim()) {
-      text = message.reasoning_content;
+      const reasoning = message.reasoning_content;
+      // 与 parseFrame 同源的提取逻辑：只要能找到含 severity/note 的 JSON 对象就采用
+      const objs = extractJsonObjects(reasoning);
+      const frameObj = objs.reverse().find((o) => o && typeof o === 'object' && o.severity && o.note);
+      if (frameObj) text = JSON.stringify(frameObj);
     }
 
     if (!text.trim()) {
