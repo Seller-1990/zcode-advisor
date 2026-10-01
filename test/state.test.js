@@ -118,61 +118,90 @@ test('bumpDrop：空 reason 归为 unknown（保持既有行为）', () => {
 // 监督器静默死亡问题：审查连续失败只进 dropped 计数，用户无感知。
 // failStreak 让"连续失败"成为可检测状态，UPS 侧据此注入健康告警。
 
-test('4a failStreak：freshState 初始化为 null / healthNotifiedAt 为空', () => {
+test('4a failStreak：freshState 初始化为 null / healthNotifiedAt 为空 / 告警与恢复字段归零', () => {
   const s = freshState('x', '', true);
   assert.strictEqual(s.failStreak, null);
   assert.strictEqual(s.healthNotifiedAt, '');
+  assert.strictEqual(s.healthAlertCount, 0);
+  assert.strictEqual(s.healthRecoveryPending, false);
 });
 
-test('4a failStreak：同因累加到 3', () => {
+test('4a failStreak：同因累加到 3，sinceTs 保持连击起点不变', () => {
   const s = freshState('x', '', true);
   bumpDrop(s, 'llm_http_401');
+  assert.ok(s.failStreak.sinceTs, '首次失败应记录连击起点 sinceTs');
+  assert.ok(!Number.isNaN(Date.parse(s.failStreak.sinceTs)), 'sinceTs 应为合法时间');
+  // 固定起点，验证同因累加不移动它
+  s.failStreak.sinceTs = '2000-01-01T00:00:00.000Z';
   bumpDrop(s, 'llm_http_401');
   bumpDrop(s, 'llm_http_401');
-  assert.deepStrictEqual(s.failStreak, { reason: 'llm_http_401', count: 3 });
+  assert.strictEqual(s.failStreak.reason, 'llm_http_401');
+  assert.strictEqual(s.failStreak.count, 3);
+  assert.strictEqual(s.failStreak.sinceTs, '2000-01-01T00:00:00.000Z', '同因累加不应移动连击起点');
   // 既有 dropped/droppedAt 行为不变
   assert.strictEqual(s.dropped.llm_http_401, 3);
   assert.ok(s.droppedAt.llm_http_401);
 });
 
-test('4a failStreak：白名单异因切换重置为 1', () => {
+test('4a failStreak：白名单异因切换重置为 1（sinceTs 重新起算）', () => {
   const s = freshState('x', '', true);
   bumpDrop(s, 'llm_http_401');
   bumpDrop(s, 'llm_http_401');
+  // 固定旧起点（避免同毫秒内 ISO 字符串相同导致断言失真），异因切换必须换新
+  s.failStreak.sinceTs = '2000-01-01T00:00:00.000Z';
   bumpDrop(s, 'unparsed');
-  assert.deepStrictEqual(s.failStreak, { reason: 'unparsed', count: 1 });
+  assert.strictEqual(s.failStreak.reason, 'unparsed');
+  assert.strictEqual(s.failStreak.count, 1);
+  assert.ok(s.failStreak.sinceTs !== '2000-01-01T00:00:00.000Z', '异因重置应更新连击起点');
   // llm_* 家族内部切换同样重置
+  s.failStreak.sinceTs = '2000-01-01T00:00:00.000Z';
   bumpDrop(s, 'llm_empty_response');
   bumpDrop(s, 'llm_timeout');
-  assert.deepStrictEqual(s.failStreak, { reason: 'llm_timeout', count: 1 });
+  assert.strictEqual(s.failStreak.reason, 'llm_timeout');
+  assert.strictEqual(s.failStreak.count, 1);
+  assert.ok(s.failStreak.sinceTs !== '2000-01-01T00:00:00.000Z', '家族内切换同样应更新连击起点');
 });
 
-test('4a failStreak：非白名单原因冻结不改写', () => {
+test('4a failStreak：非白名单原因冻结不改写（count 与 sinceTs 均不动）', () => {
   const s = freshState('x', '', true);
   bumpDrop(s, 'llm_http_401');
   bumpDrop(s, 'llm_http_401');
+  s.failStreak.sinceTs = '2000-01-01T00:00:00.000Z';
   // 审查没跑成 ≠ 审查失败：busy/global_busy/worker_error/spawn_failed/queue_overflow 冻结
   bumpDrop(s, 'busy');
   bumpDrop(s, 'global_busy');
   bumpDrop(s, 'worker_error');
   bumpDrop(s, 'spawn_failed');
   bumpDrop(s, 'queue_overflow');
-  assert.deepStrictEqual(s.failStreak, { reason: 'llm_http_401', count: 2 });
+  assert.strictEqual(s.failStreak.reason, 'llm_http_401');
+  assert.strictEqual(s.failStreak.count, 2);
+  assert.strictEqual(s.failStreak.sinceTs, '2000-01-01T00:00:00.000Z', '冻结不得改写连击起点');
   // 非 llm_ 前缀的相近名不得误匹配（startsWith('llm_') 要求下划线）
   bumpDrop(s, 'llmfoo');
-  assert.deepStrictEqual(s.failStreak, { reason: 'llm_http_401', count: 2 });
+  assert.strictEqual(s.failStreak.count, 2);
   // dropped 计数照常累加（既有行为不变）
   assert.strictEqual(s.dropped.busy, 1);
 });
 
-test('4a failStreak：白名单精确项逐项计入', () => {
+test('4a failStreak：白名单精确项逐项计入（新版形状带 sinceTs）', () => {
   for (const reason of ['unparsed', 'parse_empty', 'no_transcript', 'ledger_write_failed']) {
     const s = freshState('x', '', true);
     bumpDrop(s, reason);
-    assert.deepStrictEqual(s.failStreak, { reason, count: 1 }, reason);
+    assert.strictEqual(s.failStreak.reason, reason, reason);
+    assert.strictEqual(s.failStreak.count, 1, reason);
+    assert.ok(s.failStreak.sinceTs, `应带 sinceTs：${reason}`);
   }
   // 空 reason 归为 unknown：非白名单，冻结（不产生 failStreak）
   const s = freshState('x', '', true);
   bumpDrop(s, '');
   assert.strictEqual(s.failStreak, null);
+});
+
+test('4a failStreak：旧版本 streak 缺 sinceTs 时同因累加防御补齐', () => {
+  const s = freshState('x', '', true);
+  s.failStreak = { reason: 'llm_http_401', count: 2 }; // 模拟旧版本写入的形状
+  bumpDrop(s, 'llm_http_401');
+  assert.strictEqual(s.failStreak.count, 3);
+  assert.ok(s.failStreak.sinceTs, '应补齐 sinceTs');
+  assert.ok(!Number.isNaN(Date.parse(s.failStreak.sinceTs)), '补齐的 sinceTs 应为合法时间');
 });

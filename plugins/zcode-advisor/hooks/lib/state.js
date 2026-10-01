@@ -41,6 +41,8 @@ function freshState(sessionId, transcriptPath, startEnabled) {
     dropped: {},
     failStreak: null,
     healthNotifiedAt: '',
+    healthAlertCount: 0,
+    healthRecoveryPending: false,
     tokensIn: 0,
     tokensOut: 0,
     sessionModel: '',
@@ -258,6 +260,7 @@ function isFailStreakReason(reason) {
 // （既有 status 输出与测试依赖它），时间戳记入同级的 droppedAt[reason]。
 // 同时维护 failStreak（4a）：同因连击累加，白名单异因切换重置，
 // 非白名单原因冻结——UPS 侧据此在连续失败达到阈值时注入健康告警。
+// failStreak.sinceTs 记录本轮连击的起点，告警消息据此显示"停摆约 X 小时"。
 function bumpDrop(state, reason) {
   if (!reason) reason = 'unknown';
   state.dropped = state.dropped || {};
@@ -268,8 +271,10 @@ function bumpDrop(state, reason) {
   if (isFailStreakReason(reason)) {
     if (state.failStreak && state.failStreak.reason === reason) {
       state.failStreak.count = (state.failStreak.count || 0) + 1;
+      // 防御：旧版本写入的 streak 无 sinceTs（升级横跨一次连击），补当前时间为停摆起点
+      if (!state.failStreak.sinceTs) state.failStreak.sinceTs = new Date().toISOString();
     } else {
-      state.failStreak = { reason, count: 1 };
+      state.failStreak = { reason, count: 1, sinceTs: new Date().toISOString() };
     }
   }
 }
