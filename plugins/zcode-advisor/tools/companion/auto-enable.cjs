@@ -103,6 +103,67 @@ function findZcodeCli() {
 // marketplace add/update + install + enable —— 并发的 install/enable
 // 在干净机器上可能互相踩（同一个缓存目录被两个进程同时改写）。
 // 用 mkdir 原子锁保证只跑一套；后来者看到锁直接退出（0 = 净结果已达成）。
+//
+// 两个已知隐患（代码评审指出，均已处理）：
+// ① **接管必须原子**：陈旧锁的"改写 info"若用普通 writeFileSync，两个进程同时
+//    判定陈旧时会都以为自己接管成功，于是并发跑 CLI（正是锁要防的事）。
+//    做法：各自写**唯一临时文件**，再 rename 到 info——rename 在同一文件系统内
+//    原子，只有一个能成功，成功者回读确认 pid 是自己后才算持锁。
+// ② **不能只看 pid 存活**：pid 会被系统复用，`kill(pid,0)` 命中无关进程时
+//    会误判"持锁者仍在运行"→ 每次启动都跳过 → 干净机器上插件**永远装不上
+//    且无重试**。因此加 **TTL**：持锁超过 LOCK_TTL_MS 一律视为陈旧（正常一次
+//    启用只需数秒），并把 pid 存活仅作为辅助判断。
+//    （另有 zcode-advisor 自检：TTL 远大于单次启用耗时，不会误杀正常持锁。）
+const LOCK_TTL_MS = 5 * 60 * 1000;   // 5 分钟：单次启用只需数秒，超时必属异常
+
+function readLockInfo(info) {
+  try {
+    const txt = fs.readFileSync(info, 'utf8');
+    return {
+      pid: Number(((/(?:^|\n)pid=(\d+)/.exec(txt) || [])[1]) || 0),
+      started: Number(((/(?:^|\n)started=(\d+)/.exec(txt) || [])[1]) || 0)
+    };
+  } catch (_) {
+    return { pid: 0, started: 0 };
+  }
+}
+
+// 判断锁是否陈旧：无有效 started → 陈旧；超过 TTL → 陈旧；
+// 仅当 pid 存活**且**未超时才认为有效（避免 pid 复用造成永久阻塞）。
+function isStale(info) {
+  const now = Date.now();
+  if (!info.started) return true;
+  if (now - info.started > LOCK_TTL_MS) return true;
+  if (!info.pid) return true;
+  // 注意 errno 语义（实测）：kill(pid,0) 对**存在但无权限**的进程抛 EPERM，
+  // 只有 ESRCH 才代表进程不存在。早期实现把任何异常都当"已死"，
+  // 会把存活的持锁者误判为陈旧而接管（并发风险）。
+  try {
+    process.kill(info.pid, 0);
+    return false;                       // 存活
+  } catch (err) {
+    if (err && err.code === 'EPERM') return false;   // 存在，只是无权限
+    return true;                        // ESRCH 等 → 不存在
+  }
+}
+
+// 原子接管：写唯一临时文件 → rename 覆盖 info → 回读确认是自己的 pid。
+// rename 在同一文件系统原子；两个竞争者只有一个的 rename 最终可见，
+// 且各自回读能识别"被对方覆盖"从而放弃。
+function tryTakeOver(lockDir, info) {
+  const tmp = `${info}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.writeFileSync(tmp, `pid=${process.pid}\nstarted=${Date.now()}\n`, 'utf8');
+    fs.renameSync(tmp, info);
+    const back = readLockInfo(info);
+    if (back.pid === process.pid) return true;
+    return false;   // 被其他进程覆盖，让给它
+  } catch (_) {
+    try { fs.rmSync(tmp, { force: true }); } catch (_) {}
+    return false;
+  }
+}
+
 function acquireSingleFlight() {
   const lockDir = path.join(os.homedir(), '.zcode', 'advisor-auto-enable.lock');
   const info = path.join(lockDir, 'info');
@@ -111,18 +172,12 @@ function acquireSingleFlight() {
     fs.writeFileSync(info, `pid=${process.pid}\nstarted=${Date.now()}\n`, 'utf8');
     return { lockDir, acquired: true };
   } catch (_) {
-    // 锁已存在：判断持锁进程是否还活着
-    let pid = '';
-    try { pid = (/(?:^|\n)pid=(\d+)/.exec(fs.readFileSync(info, 'utf8')) || [])[1] || ''; } catch (_) {}
-    const alive = pid && (() => { try { process.kill(Number(pid), 0); return true; } catch (_) { return false; } })();
-    if (alive) return { lockDir, acquired: false, holder: pid };
-    // 陈旧锁（崩溃/被 kill）：接管
-    try {
-      fs.writeFileSync(info, `pid=${process.pid}\nstarted=${Date.now()}\n`, 'utf8');
-      return { lockDir, acquired: true, stale: true };
-    } catch (_) {
-      return { lockDir, acquired: false, holder: pid };
-    }
+    const cur = readLockInfo(info);
+    if (!isStale(cur)) return { lockDir, acquired: false, holder: String(cur.pid || '') };
+    // 陈旧：原子接管（只有一个进程能成功）
+    if (tryTakeOver(lockDir, info)) return { lockDir, acquired: true, stale: true };
+    const after = readLockInfo(info);
+    return { lockDir, acquired: false, holder: String(after.pid || '') };
   }
 }
 
