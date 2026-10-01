@@ -24,7 +24,7 @@ const {
 } = require('./lib/config');
 const {
   ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, loadState, mutateStateExclusive,
-  createLock, clearLock, clearLockIfOwner, lockPathFor, countLocks
+  createLock, clearLock, clearLockIfOwner, lockPathFor, countLocks, sanitizeSessionId
 } = require('./lib/state');
 const {
   readDelta, renderDelta
@@ -286,18 +286,31 @@ function onStopAsync(ctx) {
     const cur = loadState(file);
     if (cur && cur.transcriptPath && fs.existsSync(cur.transcriptPath)) {
       const snapDir = path.join(stateDir, 'snapshots');
-      fs.mkdirSync(snapDir, { recursive: true });
-      snapshotPath = path.join(snapDir, `${sessionId}.jsonl`);
-      fs.copyFileSync(cur.transcriptPath, snapshotPath);
-      // 防堆积：快照目录只保留最近 10 个文件（旧会话的快照无保留价值）
-      const snaps = fs.readdirSync(snapDir).map((n) => ({
-        n, t: fs.statSync(path.join(snapDir, n)).mtimeMs
-      })).sort((a, b) => b.t - a.t);
-      for (const old of snaps.slice(10)) {
-        try { fs.unlinkSync(path.join(snapDir, old.n)); } catch (_) {}
+      // 权限 0o700：快照含完整转录（可能有源码/密钥），仅属主可读
+      fs.mkdirSync(snapDir, { recursive: true, mode: 0o700 });
+      // 文件名净化：sessionId 来自 hook stdin，未净化可被 "../../x" 路径穿越
+      const snapFile = path.join(snapDir, `${sanitizeSessionId(sessionId)}.jsonl`);
+      fs.copyFileSync(cur.transcriptPath, snapFile);
+      // **复制成功后才赋值**：若后续清理抛错，不能让 worker 拿到"已赋值但可能不完整"的路径
+      snapshotPath = snapFile;
+      fs.chmodSync(snapFile, 0o600);
+
+      // 防堆积：保留最近 N 个（N 至少容纳在飞 worker 数，避免删掉正在被读的快照）
+      // worker 是 detached 异步读取，保留窗口必须大于并发上限
+      const keep = Math.max(10, (cfg.maxGlobalWorkers || 4) + 6);
+      const snaps = fs.readdirSync(snapDir).map((n) => {
+        try { return { n, t: fs.statSync(path.join(snapDir, n)).mtimeMs }; } catch (_) { return null; }
+      }).filter(Boolean).sort((a, b) => b.t - a.t);
+      for (const oldSnap of snaps.slice(keep)) {
+        // 绝不删除本轮刚写的快照
+        if (path.join(snapDir, oldSnap.n) === snapFile) continue;
+        try { fs.unlinkSync(path.join(snapDir, oldSnap.n)); } catch (_) {}
       }
     }
-  } catch (_) { /* 快照失败走原路径（worker 会计 no_transcript）*/ }
+  } catch (_) {
+    // 快照失败：清空路径，让 worker 退回原路径（会记 no_transcript，但不会拿到坏路径）
+    snapshotPath = '';
+  }
 
   // 测试/调试钩子：跳过真实派生，由外部直接调 review-worker。
   if (process.env.ZCODE_ADVISOR_NO_SPAWN === '1') return;
@@ -529,10 +542,14 @@ async function handleReviewWorker(args) {
     const usingSnapshot = Boolean(transcriptOverride);
     const delta = readDelta(transcriptOverride || state.transcriptPath,
       usingSnapshot ? 0 : state.byteOffset,
-      usingSnapshot ? {} : {
-        expectedHeadHash: state.lastHeadHash,
-        backfillLimitBytes: cfg.backfillLimitBytes
-      });
+      // 快照模式也应用 backfillLimitBytes：超长会话（数 MB 转录）不应整文件载入内存；
+      // 超出上限时 readDelta 从尾部回读并丢弃首个残行，语义与持续文件路径一致。
+      usingSnapshot
+        ? { backfillLimitBytes: cfg.backfillLimitBytes }
+        : {
+            expectedHeadHash: state.lastHeadHash,
+            backfillLimitBytes: cfg.backfillLimitBytes
+          });
     if (delta.missing) {
       mutateStateExclusive(file, (s) => {
         bumpDrop(s, 'no_transcript');

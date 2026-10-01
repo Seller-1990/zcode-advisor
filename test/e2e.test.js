@@ -405,3 +405,56 @@ test('ZCode 快照契约：Stop 后临时转录被删，worker 仍能用快照�
   assert.ok(state.pendingNotes.length > 0, 'mock 模式应产出意见');
   assert.ok((state.dropped && state.dropped.no_transcript) == null, '不应再有 no_transcript 丢弃');
 });
+
+// ---------------- 快照安全与边界（ocr 评审发现的回归防护） ----------------
+
+test('快照文件名净化：含路径穿越的 sessionId 不会逃出 snapshots 目录', (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zca-snapsec-'));
+  t.after(() => { try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) {} });
+  fs.writeFileSync(path.join(stateDir, '.mock-allowed'), '');
+  const env = makeEnv(stateDir);
+
+  const transcript = path.join(stateDir, 't.jsonl');
+  fs.writeFileSync(transcript, JSON.stringify({ type: 'user', message: { role: 'user', content: 'x' } }) + '\n');
+
+  // 恶意/异常 sessionId：含 ../ 与分隔符
+  const evilId = '../../evil';
+  runHook(['session-start'], { session_id: evilId, transcript_path: transcript }, env);
+  runHook(['stop'], { session_id: evilId, transcript_path: transcript, stop_hook_active: false }, env);
+
+  const snapDir = path.join(stateDir, 'snapshots');
+  assert.ok(fs.existsSync(snapDir), '应有快照目录');
+  const names = fs.readdirSync(snapDir);
+  assert.ok(names.length > 0, '应生成快照');
+  for (const n of names) {
+    assert.ok(!n.includes('/') && !n.includes('..'), `快照名应被净化，实际 ${n}`);
+  }
+  // 不应在 stateDir 之外产生文件
+  assert.ok(!fs.existsSync(path.join(stateDir, '..', 'evil.jsonl')), '不得逃出目录');
+});
+
+test('快照清理：保留窗口不小于并发 worker 数（不删在飞快照）', (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zca-snapkeep-'));
+  t.after(() => { try { fs.rmSync(stateDir, { recursive: true, force: true }); } catch (_) {} });
+  fs.writeFileSync(path.join(stateDir, '.mock-allowed'), '');
+  const env = makeEnv(stateDir);
+  const transcript = path.join(stateDir, 't.jsonl');
+  fs.writeFileSync(transcript, JSON.stringify({ type: 'user', message: { role: 'user', content: 'x' } }) + '\n');
+
+  // 造 10 个旧快照
+  const snapDir = path.join(stateDir, 'snapshots');
+  fs.mkdirSync(snapDir, { recursive: true });
+  for (let i = 0; i < 10; i++) {
+    const f = path.join(snapDir, `old-${i}.jsonl`);
+    fs.writeFileSync(f, '{}\n');
+    // 让 mtime 明显更旧
+    const past = new Date(Date.now() - (i + 1) * 60000);
+    fs.utimesSync(f, past, past);
+  }
+
+  runHook(['session-start'], { session_id: 'keepme', transcript_path: transcript }, env);
+  runHook(['stop'], { session_id: 'keepme', transcript_path: transcript, stop_hook_active: false }, env);
+
+  const nowSnap = path.join(snapDir, 'keepme.jsonl');
+  assert.ok(fs.existsSync(nowSnap), '本轮快照必须存在（绝不能被自己触发的清理删掉）');
+});
