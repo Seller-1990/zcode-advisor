@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>zcode-advisor 审计报告</title>
+<style>
+  :root {
+    --sidebar-bg: #1a1f2e;
+    --sidebar-hover: #242a3d;
+    --sidebar-active: #2d3555;
+    --bg: #f0f3f7;
+    --card-bg: #ffffff;
+    --border: #e6eaef;
+    --text: #1e2233;
+    --text-secondary: #6b7394;
+    --accent: #3370ff;
+    --accent-light: #e8f0ff;
+    --success: #34c759;
+    --warning: #ff9500;
+    --danger: #ff3b30;
+    --info: #5ac8fa;
+    --badge-critical: #ff3b30;
+    --badge-high: #ff9500;
+    --badge-medium: #3370ff;
+    --badge-low: #8e8e93;
+    --badge-info: #5ac8fa;
+    --bar-bg: #e8eaed;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.8;
+    display: flex;
+    min-height: 100vh;
+    font-size: 15px;
+  }
+  .sidebar { width: 240px; background: var(--sidebar-bg); color: #fff; flex-shrink: 0; display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+  .sidebar-header { padding: 20px 20px 16px; border-bottom: 1px solid rgba(255,255,255,.06); }
+  .sidebar-header h1 { font-size: 18px; font-weight: 700; letter-spacing: .5px; }
+  .sidebar-header .sub { font-size: 12px; color: rgba(255,255,255,.4); margin-top: 4px; }
+  .sidebar-nav { padding: 8px 0; flex: 1; }
+  .sidebar-nav a { display: flex; align-items: center; gap: 12px; padding: 14px 20px; color: rgba(255,255,255,.6); text-decoration: none; font-size: 14px; transition: all .15s; border-left: 3px solid transparent; }
+  .sidebar-nav a:hover { background: var(--sidebar-hover); color: #fff; }
+  .sidebar-nav a.active { background: var(--sidebar-active); color: #fff; border-left-color: var(--accent); }
+  .sidebar-nav a .icon { width: 18px; text-align: center; font-size: 14px; }
+  .sidebar-footer { padding: 12px 20px; border-top: 1px solid rgba(255,255,255,.06); font-size: 11px; color: rgba(255,255,255,.3); }
+  .main { flex: 1; min-width: 0; padding: 32px 40px 80px; }
+  .page-header { margin-bottom: 32px; }
+  .page-header h2 { font-size: 26px; font-weight: 700; }
+  .page-header .meta { font-size: 14px; color: var(--text-secondary); margin-top: 6px; display: flex; gap: 20px; flex-wrap: wrap; }
+  .page-header .meta span { display: flex; align-items: center; gap: 4px; }
+  .card { background: var(--card-bg); border-radius: 10px; border: 1px solid var(--border); margin-bottom: 20px; overflow: hidden; }
+  .card-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 24px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 15px; }
+  .card-body { padding: 24px; }
+  .score-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+  .score-item { display: flex; flex-direction: column; gap: 8px; padding: 18px 20px; background: #f8fafc; border-radius: 8px; border: 1px solid var(--border); }
+  .score-item .label { font-size: 13px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .4px; }
+  .score-item .bar-row { display: flex; align-items: center; gap: 12px; }
+  .score-item .bar-track { flex: 1; height: 10px; background: var(--bar-bg); border-radius: 5px; overflow: hidden; }
+  .score-item .bar-fill { height: 100%; border-radius: 5px; transition: width .6s ease; }
+  .score-item .value { font-size: 22px; font-weight: 700; min-width: 52px; text-align: right; }
+  .score-item .grade { font-size: 15px; font-weight: 700; min-width: 22px; text-align: center; }
+  .bar-fill.s { background: linear-gradient(90deg, #34c759, #30d158); }
+  .bar-fill.a { background: linear-gradient(90deg, #3370ff, #5e8cff); }
+  .bar-fill.b { background: linear-gradient(90deg, #ff9500, #ffb340); }
+  .bar-fill.c { background: linear-gradient(90deg, #ff3b30, #ff6b61); }
+  .bar-fill.d { background: linear-gradient(90deg, #ff6b61, #ff9f91); }
+  .bar-fill.f { background: linear-gradient(90deg, #9b1d1a, #d63031); }
+  .grade-s { color: #34c759; } .grade-a { color: #3370ff; }
+  .grade-b { color: #ff9500; } .grade-c { color: #ff3b30; }
+  .grade-d { color: #ff6b61; } .grade-f { color: #9b1d1a; }
+  .overall-row { grid-column: 1 / -1; background: linear-gradient(135deg, #1a1f2e, #2d3555); border-color: transparent; }
+  .overall-row .label { color: rgba(255,255,255,.6); }
+  .overall-row .value { color: #fff; }
+  .overall-row .grade { color: #34c759; }
+  .overall-row .bar-fill { background: linear-gradient(90deg, #34c759, #30d158); }
+  .stats-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+  .stat-card { flex: 1; min-width: 140px; padding: 20px 24px; background: var(--card-bg); border-radius: 10px; border: 1px solid var(--border); text-align: center; }
+  .stat-card .num { font-size: 32px; font-weight: 700; line-height: 1.3; }
+  .stat-card .desc { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+  .finding { border-left: 4px solid var(--border); margin-bottom: 20px; padding: 20px 24px; border-radius: 0 10px 10px 0; background: #fafbfc; border: 1px solid var(--border); border-left-width: 4px; }
+  .finding.severity-critical { border-left-color: var(--badge-critical); }
+  .finding.severity-high { border-left-color: var(--badge-high); }
+  .finding.severity-medium { border-left-color: var(--badge-medium); }
+  .finding.severity-low { border-left-color: var(--badge-low); }
+  .finding.severity-info { border-left-color: var(--badge-info); }
+  .finding-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .finding-header h4 { font-size: 16px; font-weight: 600; flex: 1; }
+  .badge { display: inline-block; padding: 3px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; line-height: 1.6; }
+  .badge-critical { background: #ffeae9; color: var(--badge-critical); }
+  .badge-high { background: #fff3e0; color: var(--badge-high); }
+  .badge-medium { background: var(--accent-light); color: var(--badge-medium); }
+  .badge-low { background: #f2f2f5; color: var(--badge-low); }
+  .badge-info { background: #e4f5ff; color: #007aff; }
+  .badge-confirmed { background: #e8ffe8; color: #248a3d; }
+  .badge-suspected { background: #fff8e1; color: #b8860b; }
+  .badge-s { background: #e8ffe8; color: #248a3d; }
+  .badge-a { background: var(--accent-light); color: var(--accent); }
+  .badge-b { background: #fff3e0; color: var(--warning); }
+  .badge-c { background: #ffeae9; color: var(--danger); }
+  .finding-meta { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; color: var(--text-secondary); margin-bottom: 12px; }
+  .finding-meta span { display: flex; align-items: center; gap: 4px; }
+  .finding .evidence { margin: 12px 0; padding: 14px 18px; background: #f0f2f5; border-radius: 8px; font-family: "SF Mono","Fira Code","Consolas",monospace; font-size: 13px; line-height: 1.8; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .finding .problem { font-size: 14px; margin: 12px 0; color: var(--text); line-height: 1.8; }
+  .finding .fix-box { margin-top: 12px; padding: 14px 18px; background: #f0f7ff; border-radius: 8px; border: 1px solid #d6e4ff; font-size: 13px; }
+  .finding .fix-box code { display: block; margin-top: 6px; padding: 12px 16px; background: #1e2233; color: #cdd6f4; border-radius: 6px; font-family: "SF Mono","Fira Code","Consolas",monospace; font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-all; }
+  .fix-label { font-weight: 600; font-size: 11px; color: var(--accent); text-transform: uppercase; letter-spacing: .3px; }
+  .section-title { font-size: 20px; font-weight: 700; margin: 36px 0 20px; padding-bottom: 10px; border-bottom: 2px solid var(--border); display: flex; align-items: center; gap: 8px; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; padding: 12px 16px; font-weight: 600; color: var(--text-secondary); font-size: 12px; text-transform: uppercase; letter-spacing: .4px; border-bottom: 2px solid var(--border); background: #f8fafc; }
+  td { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  .check-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 6px; }
+  .check-item { display: flex; align-items: center; gap: 10px; padding: 8px 12px; font-size: 14px; line-height: 1.6; }
+  .check-item .check { color: var(--success); font-weight: 700; }
+  .check-item .cross { color: var(--danger); font-weight: 700; }
+  .win-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+  .win-card { padding: 16px; background: linear-gradient(135deg, #f0f7ff, #e8f0ff); border-radius: 8px; border: 1px solid #d6e4ff; }
+  .win-card .win-title { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+  .win-card .win-meta { font-size: 11px; color: var(--text-secondary); }
+  .small { font-size: 13px; color: var(--text-secondary); }
+  .code-block { margin: 8px 0; padding: 14px 18px; background: #1e2233; color: #cdd6f4; border-radius: 6px; font-family: "SF Mono","Fira Code","Consolas",monospace; font-size: 13px; overflow-x: auto; white-space: pre; line-height: 1.7; }
+  .hl { color: #f7768e; font-weight: 600; } .cm { color: #565f89; }
+  .kw { color: #bb9af7; } .fn { color: #7aa2f7; }
+  .ty { color: #ff9e64; } .op { color: #89ddff; }
+  .str { color: #9ece6a; } .nu { color: #ff9e64; }
+  @media (max-width: 768px) { .sidebar { display: none; } .main { padding: 16px; } .score-grid { grid-template-columns: 1fr; } .stats-row { flex-direction: column; } .check-list { grid-template-columns: 1fr; } .win-grid { grid-template-columns: 1fr; } }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #c1c7d0; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #a8adb8; }
+</style>
+</head>
+<body>
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h1>审计报告</h1>
+      <div class="sub">zcode-advisor v0.2.1</div>
+    </div>
+    <div class="sidebar-nav">
+      <a href="#summary" class="nav-link active"><span class="icon">📊</span> 评分面板</a>
+      <a href="#executive-summary" class="nav-link"><span class="icon">📝</span> 总体评估</a>
+      <a href="#top-risks" class="nav-link"><span class="icon">⚠️</span> 风险清单</a>
+      <a href="#findings" class="nav-link"><span class="icon">🔍</span> 详细发现</a>
+      <a href="#arch" class="nav-link"><span class="icon">🏗</span> 架构与模块边界</a>
+      <a href="#security" class="nav-link"><span class="icon">🔒</span> 安全</a>
+      <a href="#stability" class="nav-link"><span class="icon">⚡</span> 稳定性与错误处理</a>
+      <a href="#performance" class="nav-link"><span class="icon">🚀</span> 性能与可扩展性</a>
+      <a href="#testing" class="nav-link"><span class="icon">🧪</span> 测试质量</a>
+      <a href="#maint" class="nav-link"><span class="icon">🔧</span> 可维护性</a>
+      <a href="#design" class="nav-link"><span class="icon">📐</span> 设计原则符合度</a>
+      <a href="#release" class="nav-link"><span class="icon">📦</span> 发布与部署</a>
+      <a href="#docs" class="nav-link"><span class="icon">📄</span> 文档准确性</a>
+      <a href="#config" class="nav-link"><span class="icon">⚙</span> 配置安全</a>
+      <a href="#observ" class="nav-link"><span class="icon">📈</span> 可观测性</a>
+      <a href="#fallback" class="nav-link"><span class="icon">🛟</span> 降级与防御代码</a>
+      <a href="#auth" class="nav-link"><span class="icon">🎭</span> 测试真实性</a>
+      <a href="#types" class="nav-link"><span class="icon">🔤</span> 类型安全</a>
+      <a href="#frontend" class="nav-link"><span class="icon">🖥</span> 前端状态管理</a>
+      <a href="#api" class="nav-link"><span class="icon">🔌</span> 后端 API 设计</a>
+      <a href="#deps" class="nav-link"><span class="icon">📚</span> 依赖重量</a>
+      <a href="#consist" class="nav-link"><span class="icon">🎨</span> 代码一致性</a>
+      <a href="#comment" class="nav-link"><span class="icon">💬</span> 注释覆盖</a>
+    </div>
+    <div class="sidebar-footer">Fuck My Shit Mountain v1.0</div>
+  </div>
+  <div class="main">
+  <div class="page-header" id="summary">
+    <h2>zcode-advisor 审计报告</h2>
+    <div class="meta">
+      <span>📅 2026-10-01</span>
+      <span>🔍 Full Audit（19 维度）</span>
+      <span>🛠 人工取证 + 独立子代理复审</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">📊 评分面板</div>
+    <div class="card-body">
+      <div class="score-grid">
+        <div class="score-item">
+          <div class="label">架构与模块边界</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:85%"></div></div>
+            <span class="value grade-a">8.5</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">三形态职责边界清晰、状态归属明确；但 advisor-hook.js 874 行聚合 20 个函数，SRP 违反</div>
+        </div>
+        <div class="score-item">
+          <div class="label">安全</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:75%"></div></div>
+            <span class="value grade-a">7.5</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">密钥仅存 ~/.zcode 且 gitignore；快照/历史已收紧 0o600；但插件 payload 曾漏 tools/ 导致 MCP 失效</div>
+        </div>
+        <div class="score-item">
+          <div class="label">稳定性与错误处理</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:80%"></div></div>
+            <span class="value grade-a">8.0</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">故障有界设计扎实（advisory-only + 空 catch 37 处均为"不拖垮主会话"的有意设计）；快照契约修复彻底</div>
+        </div>
+        <div class="score-item">
+          <div class="label">性能与可扩展性</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:80%"></div></div>
+            <span class="value grade-a">8.0</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">Stop 热路径仅 copyFileSync + readdir；快照/历史/队列均有上限；零依赖</div>
+        </div>
+        <div class="score-item">
+          <div class="label">测试质量</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:85%"></div></div>
+            <span class="value grade-a">8.5</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">192 项，e2e 用真实子进程覆盖三事件与快照契约；守卫测试曾当场抓到漂移</div>
+        </div>
+        <div class="score-item">
+          <div class="label">可维护性</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:70%"></div></div>
+            <span class="value grade-a">7.0</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">注释详尽（多为"为什么"）；但 6 个文件超 300 行、2 处重复实现</div>
+        </div>
+        <div class="score-item">
+          <div class="label">设计原则符合度</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:75%"></div></div>
+            <span class="value grade-a">7.5</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">fail-fast 与 KISS 贯彻好；DRY 有 2 处违反（normalizeChatEndpoint / readHistory 双实现）</div>
+        </div>
+        <div class="score-item">
+          <div class="label">发布与部署</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:80%"></div></div>
+            <span class="value grade-a">8.0</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">CI 六 job 全绿含 NSIS 真机编译；但三层缓存曾导致装出旧代码，且 tag 需手工重打</div>
+        </div>
+        <div class="score-item">
+          <div class="label">文档准确性</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:75%"></div></div>
+            <span class="value grade-a">7.5</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">README 章节完整且如实声明局限；架构文档为本次新增（此前缺失）</div>
+        </div>
+        <div class="score-item">
+          <div class="label">配置安全</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill s" style="width:90%"></div></div>
+            <span class="value grade-s">9.0</span>
+            <span class="grade grade-s">S</span>
+          </div>
+          <div class="small">分层加载 + 每轮重读；example 的 20 个键与代码 DEFAULTS 完全一致</div>
+        </div>
+        <div class="score-item">
+          <div class="label">可观测性</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill b" style="width:65%"></div></div>
+            <span class="value grade-b">6.5</span>
+            <span class="grade grade-b">B</span>
+          </div>
+          <div class="small">/advisor-status 有计数与最近丢弃时间；但 hooks 侧无结构化日志（controller 侧 24 处）</div>
+        </div>
+        <div class="score-item">
+          <div class="label">降级与防御代码</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:75%"></div></div>
+            <span class="value grade-a">7.5</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">37 处空 catch 均有"绝不影响主流程"的设计意图；但无"降级率"观测</div>
+        </div>
+        <div class="score-item">
+          <div class="label">测试真实性</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:70%"></div></div>
+            <span class="value grade-a">7.0</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">e2e 真实子进程 + 系统工具交叉校验；但 inject.test.js 的 DOM 桩无法暴露类名选择器错误</div>
+        </div>
+        <div class="score-item">
+          <div class="label">类型安全</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:75%"></div></div>
+            <span class="value grade-a">7.5</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">纯 JS 无类型系统，但边界处有显式校验（parseInt/Number.isFinite/类型归一）</div>
+        </div>
+        <div class="score-item">
+          <div class="label">前端状态管理</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:75%"></div></div>
+            <span class="value grade-a">7.5</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">inject.js 用闭包 + id 索引，状态简单；但 509 行单文件、DOM 桩覆盖有盲区</div>
+        </div>
+        <div class="score-item">
+          <div class="label">后端 API 设计</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:80%"></div></div>
+            <span class="value grade-a">8.0</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">本机 API 仅 127.0.0.1 + 共享令牌；错误返回结构统一 {ok,error,hint}</div>
+        </div>
+        <div class="score-item">
+          <div class="label">依赖重量</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill s" style="width:100%"></div></div>
+            <span class="value grade-s">10.0</span>
+            <span class="grade grade-s">S</span>
+          </div>
+          <div class="small">零第三方依赖（dependencies/devDependencies 均空），自研 ZIP/TAR/ICO/ICNS</div>
+        </div>
+        <div class="score-item">
+          <div class="label">代码一致性</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill a" style="width:75%"></div></div>
+            <span class="value grade-a">7.5</span>
+            <span class="grade grade-a">A</span>
+          </div>
+          <div class="small">命名与注释风格统一；但错误处理有 catch(_)/catch(err) 混用</div>
+        </div>
+        <div class="score-item">
+          <div class="label">注释覆盖</div>
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill s" style="width:90%"></div></div>
+            <span class="value grade-s">9.0</span>
+            <span class="grade grade-s">S</span>
+          </div>
+          <div class="small">注释质量高：多数解释"为什么"而非"是什么"，且记录了实测教训</div>
+        </div>
+        <div class="score-item overall-row">
+          <div class="label">Overall</div>
+          <div class="bar-row">
+            <div class="bar-track" style="background:rgba(255,255,255,.12)"><div class="bar-fill" style="width:78%;background:linear-gradient(90deg,#34c759,#30d158)"></div></div>
+            <span class="value" style="color:#fff">7.9</span>
+            <span class="grade" style="color:#34c759">A</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="section-title" id="executive-summary">📝 总体评估</h3>
+  <div class="card">
+    <div class="card-header">📋 总体评估</div>
+    <div class="card-body">
+      <p><strong>项目概况：</strong>zcode-advisor 是 ZCode（z.ai 桌面版，Electron/Claude Code 同构）的插件：一个独立配置的审查副模型，每轮对话结束时被动审查转录增量，产出 nit/concern/blocker 三级建议并注回会话。约 5100 行 JavaScript（零第三方依赖），含三个交付形态：插件本体（hooks/commands）、角标外挂（CDP 注入）、发行包（NSIS setup.exe + macOS DMG）。已发布 v0.2.1，192 项测试。</p>
+      <p style="margin-top:12px"><strong>主要风险：</strong>本次审计发现 2 个 blocker，其中「同步清单漏 tools/」会让插件 MCP 完全失效、「插件启用状态丢失」使用户现场跑的是空转版本——两者都已在审计中修复并验证。更结构性的是<b>四层部署缓存</b>（源 → 副本 → 宿主市场缓存 → 宿主 cache）曾三次导致「改了代码却装出旧版本」，现已用同步脚本 + 守卫测试 + 自动化链路封堵。</p>
+      <p style="margin-top:12px"><strong>亮点：</strong>① <b>零第三方依赖</b>贯彻彻底（自研 ZIP/TAR/ICO/ICNS，字节结构经系统工具交叉校验）；② <b>故障有界设计</b>扎实——advisory-only 纪律 + 37 处空 catch 均为「绝不拖垮主会话」的有意取舍，且有测试锁定；③ <b>注释质量高</b>：多数解释「为什么」并记录实测教训（如「诚实说明」类注释）；④ <b>测试真实性强</b>——e2e 用真实子进程覆盖三事件与快照契约，守卫测试在本次审计中<b>当场抓到同步漂移</b>。</p>
+      <p style="margin-top:12px"><strong>优先修复：</strong>① 拆分 advisor-hook.js（874 行 / 20 函数，SRP 违反）；② 消除 normalizeChatEndpoint 与 readHistory 的重复实现；③ 给 ocr-review.sh 加并发锁（实测 4 个进程堆叠）；④ 补 hooks 侧可观测性（当前 0 处日志）；⑤ DOM 桩升级（无法暴露类名选择器错误，UI 改动依赖真机验证）。</p>
+      <p style="margin-top:12px"><strong>总评：</strong><b>A（8.0）</b>——工程纪律明显高于同类个人项目：零依赖、故障有界、注释如实、测试用真实子进程。本次发现的 blocker 属「部署链路」而非「代码质量」，且已修复。剩余问题集中在可维护性（单文件过长、两处重复实现）与工程配套（无并发锁、无 hooks 日志、DOM 桩有盲区），均可增量改进，不阻塞发布。</p>
+    </div>
+  </div>
+
+  <div class="stats-row">
+    <div class="stat-card"><div class="num">10</div><div class="desc">总发现</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--badge-critical)">2</div><div class="desc">Blocker</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--badge-high)">1</div><div class="desc">High</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--badge-medium)">4</div><div class="desc">Medium</div></div>
+    <div class="stat-card"><div class="num" style="color:var(--badge-low)">3</div><div class="desc">Low</div></div>
+  </div>
+
+  <h3 class="section-title" id="top-risks">⚠️ 风险清单</h3>
+  <div class="card">
+    <div class="card-body" style="padding:0">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:60px">#</th><th>发现</th><th style="width:100px">严重度</th><th style="width:90px">状态</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>同步清单漏 tools/ —— 插件 MCP 无法启动</td><td><span class="badge badge-critical">blocker</span></td><td>已确认</td></tr>
+            <tr><td>2</td><td>插件启用状态丢失 —— 用户现场跑的是空转版本</td><td><span class="badge badge-critical">blocker</span></td><td>已确认</td></tr>
+            <tr><td>3</td><td>三层缓存导致「改了代码却装出旧版本」</td><td><span class="badge badge-high">high</span></td><td>已确认</td></tr>
+            <tr><td>4</td><td>advisor-hook.js 874 行聚合 20 个函数（SRP 违反）</td><td><span class="badge badge-medium">medium</span></td><td>已确认</td></tr>
+            <tr><td>5</td><td>重复实现：normalizeChatEndpoint 与 readHistory 各两份</td><td><span class="badge badge-medium">medium</span></td><td>已确认</td></tr>
+            <tr><td>6</td><td>意见历史文件未收紧权限</td><td><span class="badge badge-medium">medium</span></td><td>已确认</td></tr>
+            <tr><td>7</td><td>缺少架构文档 —— AI 协作者反复误判的根因</td><td><span class="badge badge-medium">medium</span></td><td>已确认</td></tr>
+            <tr><td>8</td><td>ocr 评审进程无并发锁 —— 每次 push 堆叠</td><td><span class="badge badge-low">low</span></td><td>已确认</td></tr>
+            <tr><td>9</td><td>inject.test.js 的 DOM 桩无法暴露类名选择器错误</td><td><span class="badge badge-low">low</span></td><td>已确认</td></tr>
+            <tr><td>10</td><td>hooks 侧无可观测性（无结构化日志）</td><td><span class="badge badge-low">low</span></td><td>已确认</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="section-title" id="findings">🔍 详细发现</h3>
+  <div class="finding severity-blocker">
+    <div class="finding-header">
+      <h4>1. 同步清单漏 tools/ —— 插件 MCP 无法启动</h4>
+      <span class="badge badge-critical">blocker</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 tools/sync-plugin-dir.cjs:25</span>
+      <span>🎯 sync-plugin-dir.cjs ITEMS 白名单</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>plugin.json 的 mcpServers 声明 config-bridge 从 ${CLAUDE_PLUGIN_ROOT}/tools/config-bridge.js 启动，但 ITEMS 白名单未含 tools/。副本目录与宿主 cache 均缺该文件，导致 MCP 启动失败、插件设置表单的配置桥接完全失效。</div>
+    <div class="evidence">const ITEMS = [
+  '.zcode-plugin', 'hooks', 'commands',
+  'package.json', 'README.md'
+];  // ← 缺 tools/</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>const ITEMS = [
+  '.zcode-plugin', 'hooks', 'commands', 'tools',
+  'package.json', 'README.md', 'advisor.config.example.json'
+];</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~15 分钟 &nbsp;·&nbsp; <strong>回归测试：</strong> 新增守卫测试：从 plugin.json 声明反推应有文件，漏项即失败（已实现）
+    </div>
+  </div>
+  <div class="finding severity-blocker">
+    <div class="finding-header">
+      <h4>2. 插件启用状态丢失 —— 用户现场跑的是空转版本</h4>
+      <span class="badge badge-critical">blocker</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 ~/.zcode/cli/config.json</span>
+      <span>🎯 ZCode 宿主 config.json</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>宿主 config.json 的 enabledPlugins 为空对象，插件实际未启用。结合 no_transcript 未修复，用户会话中顾问全程空转（reviews=0）。</div>
+    <div class="evidence">{"enabledPlugins": {}, "options": {}}  ← 空</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>按 update → install → enable 完整链路恢复；
+验证 plugins list 显示 [enabled] 且 mcp: config-bridge 已挂载</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~10 分钟 &nbsp;·&nbsp; <strong>回归测试：</strong> enable.sh 已自动化该链路；插件列表断言 mcp 段存在
+    </div>
+  </div>
+  <div class="finding severity-high">
+    <div class="finding-header">
+      <h4>3. 三层缓存导致「改了代码却装出旧版本」</h4>
+      <span class="badge badge-high">high</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 tools/sync-plugin-dir.cjs + enable.sh</span>
+      <span>🎯 部署链路</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>源仓库 → plugins/ 副本 → 宿主市场缓存 → 宿主 cache，四层中任一层不刷新都装出旧代码。实测踩过三次：no_transcript 修复未进入 cache，顾问现场仍空转。</div>
+    <div class="evidence">源 → [sync] → plugins/ → [update] → 宿主市场缓存 → [install] → 宿主 cache
+        缺任一步 → 装出旧代码</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>enable.sh / auto-enable.cjs 按序自动化；
+新增 test/plugin-dir.test.js 守卫副本一致性（曾在本次审计中当场抓到漂移）</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~30 分钟 &nbsp;·&nbsp; <strong>回归测试：</strong> 副本一致性 + plugin.json 声明完整性（均已实现）
+    </div>
+  </div>
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>4. advisor-hook.js 874 行聚合 20 个函数（SRP 违反）</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">待处理</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 hooks/advisor-hook.js:1-874</span>
+      <span>🎯 事件分发 / 审查 / worker / ctl / doctor</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>单文件同时承担：三事件分发、async 与 sync 两条审查路径、review-worker 入口、ctl 命令（status/on/off/model/doctor）、主入口。工作区规范目标为 ≤300 行。</div>
+    <div class="evidence">readStdinJson resolveStateDir emit hashId effectiveModel isStopHookActive
+controlLines mockAllowed mockFrame reviewTurn accumulateUsage
+onSessionStart onUserPromptSubmit onStop onStopAsync onStopSync
+handleReviewWorker handleCtl ctlDoctor main   ← 20 个函数</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>按职责拆为 hooks/handlers/{events,worker,ctl}.js，主文件只做分发与入口
+（纯机械拆分，不改逻辑，e2e 可完整回归）</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~2 小时 &nbsp;·&nbsp; <strong>回归测试：</strong> 拆分后 e2e 三事件 + 快照契约测试应全绿（现有 192 项即回归网）
+    </div>
+  </div>
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>5. 重复实现：normalizeChatEndpoint 与 readHistory 各两份</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">部分待处理</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 hooks/lib/reviewer.js:182 / tools/companion/controller.cjs:358</span>
+      <span>🎯 端点归一化；历史读取</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>normalizeChatEndpoint 在 reviewer.js 与 controller.cjs 各实现一份；readHistory 在 history.js 与 controller.cjs 各一份。规则若变更需同步改两处，已有漂移风险（当前行为一致）。</div>
+    <div class="evidence">reviewer.js:182  function normalizeChatEndpoint(baseUrl)
+controller.cjs:358 function normalizeChatEndpoint(baseUrl)   ← 重复
+history.js:63  function readHistory(limit)
+controller.cjs:30 function readHistory(limit)                ← 重复</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>readHistory 已加两端一致性测试（防漂移）；
+进一步：抽到共享模块或由 controller 以子进程调用（发行包不含 hooks/ 是当前不共享的原因）</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~40 分钟 &nbsp;·&nbsp; <strong>回归测试：</strong> 已有「两端规则一致」测试（test/inject.test.js）；建议补 normalizeChatEndpoint 的等价性断言
+    </div>
+  </div>
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>6. 意见历史文件未收紧权限</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 hooks/lib/history.js:30</span>
+      <span>🎯 appendHistory</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>意见历史含正文（可能引用源码片段），但未设置文件权限。转录快照已 0o600/0o700，历史遗漏。</div>
+    <div class="evidence">fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true });
+fs.appendFileSync(HISTORY_FILE, JSON.stringify(record) + '\n', 'utf8');
+  ← 无 mode</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>fs.mkdirSync(..., { recursive: true, mode: 0o700 });
+fs.appendFileSync(..., { encoding: 'utf8', mode: 0o600 });
+fs.chmodSync(HISTORY_FILE, 0o600);</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~15 分钟 &nbsp;·&nbsp; <strong>回归测试：</strong> 断言写入后 statSync().mode & 0o777 === 0o600
+    </div>
+  </div>
+  <div class="finding severity-medium">
+    <div class="finding-header">
+      <h4>7. 缺少架构文档 —— AI 协作者反复误判的根因</h4>
+      <span class="badge badge-medium">medium</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">已完成修复</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 ARCHITECTURE.md（新增）</span>
+      <span>🎯 项目级文档</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>项目无 ARCHITECTURE.md / CONTEXT.md / docs_ai。README 面向用户、章节齐全但缺运行期视角（三形态协作、事件生命周期、状态归属、部署链路）。审查副模型因此多次把有意设计误判为缺陷。</div>
+    <div class="evidence">docs/ 仅有 INSTALL-CHECK.md；根目录无 CONTEXT.md / ARCHITECTURE.md</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>新增 ARCHITECTURE.md：三形态职责边界、事件生命周期、数据流与状态归属、
+配置分层、安全边界、三层部署缓存、测试结构与局限、改动前必读清单</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~1 小时 &nbsp;·&nbsp; <strong>回归测试：</strong> 文档类改动，建议在 README 顶部加一行指向 ARCHITECTURE.md
+    </div>
+  </div>
+  <div class="finding severity-low">
+    <div class="finding-header">
+      <h4>8. ocr 评审进程无并发锁 —— 每次 push 堆叠</h4>
+      <span class="badge badge-low">low</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">待处理</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 scripts/ocr-review.sh</span>
+      <span>🎯 评审入口</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>pre-push hook 每次推送都启动一个评审，脚本无互斥锁。实测同时有 4 个进程（运行 28 分钟），既争抢上游配额，也可能争抢同一报告文件。</div>
+    <div class="evidence">ps 输出：56557(13min) 57645(10min) 58967(3min) 59015(3min)
+  ← 4 个并发 ocr-review.sh</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>在 ocr-review.sh 开头加基于仓库路径的锁文件（flock 或 mkdir 原子锁）；
+已有进程在跑时直接退出并提示复用其报告</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~20 分钟 &nbsp;·&nbsp; <strong>回归测试：</strong> 并发启动两次，断言第二次提前退出且不产生新进程
+    </div>
+  </div>
+  <div class="finding severity-low">
+    <div class="finding-header">
+      <h4>9. inject.test.js 的 DOM 桩无法暴露类名选择器错误</h4>
+      <span class="badge badge-low">low</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">待处理</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 test/inject.test.js:132</span>
+      <span>🎯 querySelector 桩</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>桩的 querySelector 仅支持 #id，而生产代码 findAnchor() 用类名选择器（.chat-composer-input-surface …）。桩用 anchorEls Map 单独模拟，因此类名写错不会被测试发现，只能靠真机验证。</div>
+    <div class="evidence">querySelector(sel) {
+  if (sel.startsWith('#')) return byId.get(sel.slice(1)) || null;
+  return null;   // ← 类名一律 null，靠 Map 兜底
+}</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>桩支持简单类名匹配（遍历已建元素比对 className），
+或引入 jsdom 做真 DOM（桩已 ~150 行且持续增长）</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~1 小时 &nbsp;·&nbsp; <strong>回归测试：</strong> 故意改错一个类名选择器，断言测试失败
+    </div>
+  </div>
+  <div class="finding severity-low">
+    <div class="finding-header">
+      <h4>10. hooks 侧无可观测性（无结构化日志）</h4>
+      <span class="badge badge-low">low</span>
+      <span class="badge badge-confirmed">已确认</span>
+      <span class="badge badge-info">待处理</span>
+    </div>
+    <div class="finding-meta">
+      <span>📍 hooks/advisor-hook.js</span>
+      <span>🎯 全文件</span>
+    </div>
+    <div class="problem"><strong>问题：</strong>controller 侧有 24 处日志（含落盘），但 hooks 侧为 0——审查失败只能通过 /advisor-status 的计数间接观察，无法回溯单次失败原因（ZCODE_ADVISOR_DEBUG=1 才有 stderr）。</div>
+    <div class="evidence">grep -c "log(\|console." hooks/advisor-hook.js → 0
+tools/companion/controller.cjs → 24</div>
+    <div class="fix-box">
+      <div class="fix-label">最小修复</div>
+      <code>失败路径（callReviewer 错误、parseFrame 拒绝）在 DEBUG=1 时写结构化行到 state/review.log；
+默认关闭，不产生常驻 IO</code>
+    </div>
+    <div class="fix-box" style="margin-top:6px;background:#fff8e1;border-color:#ffe082">
+      <strong>⏱ 工作量：</strong> ~40 分钟 &nbsp;·&nbsp; <strong>回归测试：</strong> DEBUG=1 跑一轮，断言日志含 error 分类与 requestId
+    </div>
+  </div>
+
+  <h3 class="section-title" id="arch">🏗 架构与模块边界</h3>
+  <div class="card"><div class="card-body">
+    <p><strong>职责边界清晰：</strong>三形态（插件本体 / 角标外挂 / 发行包）解耦良好——②③ 缺失不影响 ① 的审查功能，这是本次审计确认的设计优点。</p>
+    <p style="margin-top:10px"><strong>状态归属明确：</strong>会话状态归 state/（跨进程临界区写）、用户配置归 ~/.zcode/、页面状态归注入脚本闭包，三者不混淆。</p>
+    <p style="margin-top:10px"><strong>主要问题：</strong>advisor-hook.js 874 行聚合 20 个函数（见发现 4）。</p>
+  </div></div>
+
+  <h3 class="section-title" id="security">🔒 安全</h3>
+  <div class="card"><div class="card-body">
+    <p><strong>已确认良好：</strong>API key 仅存 ~/.zcode/（gitignore）；本机 API 仅监听 127.0.0.1 + 共享令牌（每次启动随机）；CDP 注入不碰 ZCode 安装目录/签名；模型产出用 textContent 填充（防 HTML 注入）；快照与历史的文件名经 sanitizeSessionId（防路径穿越）。</p>
+    <p style="margin-top:10px"><strong>已修复：</strong>意见历史权限未收紧（见发现 6）；转录快照已 0o700/0o600。</p>
+  </div></div>
+
+  <h3 class="section-title" id="stability">⚡ 稳定性与错误处理</h3>
+  <div class="card"><div class="card-body">
+    <p><strong>故障有界设计扎实：</strong>所有失败路径都指向「绝不拖垮主会话」——hook 顶层 catch 吞掉一切并 exit 0；37 处空 catch 均有此意图的注释说明；错误分类计入 Dropped 而非抛出。</p>
+    <p style="margin-top:10px"><strong>快照契约修复彻底：</strong>Stop 侧同步快照 + worker 读快照 + 4 处安全/边界修复（ocr 评审发现），e2e 用「Stop 后删临时转录」的关键时序锁定。</p>
+  </div></div>
+
+  <h3 class="section-title" id="observ">📈 可观测性</h3>
+  <div class="card"><div class="card-body">
+    <p><strong>已有：</strong>/advisor-status 展示审查次数、steer 数、顺延队列、token 累计、Dropped 分类计数与<b>最近丢弃时间</b>（KD-I3 可见性），并针对 empty/unparsed/parse_empty 给修复提示。</p>
+    <p style="margin-top:10px"><strong>缺口：</strong>hooks 侧 0 处日志（controller 侧 24 处），单次失败原因需 DEBUG=1 才能看到（见发现 10）。</p>
+  </div></div>
+
+  <h3 class="section-title" id="deps">📚 依赖重量</h3>
+  <div class="card"><div class="card-body">
+    <p><strong>满分项：</strong>dependencies 与 devDependencies 均为空——ZIP/TAR 归档、ICO/ICNS/PNG 图标、NSIS 脚本、DMG 构建、CDP 通信、DOM 桩全部自研或使用 Node 内置模块。这是本项目最强的工程特征之一。</p>
+  </div></div>
+
+  <h3 class="section-title" id="release">📦 发布与部署</h3>
+  <div class="card"><div class="card-body">
+    <p><strong>CI 完整：</strong>六 job（test / windows NSIS 真机编译 / macos x64 / macos arm64 / plan / release），tag 触发自动发布六产物。</p>
+    <p style="margin-top:10px"><strong>已修复的部署缺陷：</strong>三层缓存导致装出旧代码（见发现 3）、自动启用链路（NSIS ExecWait / .app 启动器 / controller 兜底）。</p>
+    <p style="margin-top:10px"><strong>流程建议：</strong>tag 需手工重打才能含最新修复——可考虑在 CI 中校验「tag 指向 HEAD」或改用 release 分支。</p>
+  </div></div>
+
+  <h3 class="section-title" id="comment">💬 注释覆盖</h3>
+  <div class="card"><div class="card-body">
+    <p><strong>优秀：</strong>注释普遍解释「为什么」而非「是什么」，且大量记录实测教训（例：「实测踩过：目录叫 .stage-win-nsis 而脚本里写的 stage」「父进程若带 ELECTRON_RUN_AS_NODE=1，ZCode 的 Electron 主二进制会被当成 Node 解释器」）。这类注释对后续维护价值极高。</p>
+    <p style="margin-top:10px"><strong>建议：</strong>本次新增的 ARCHITECTURE.md 已把分散的关键决策汇总，建议 README 顶部加指向链接。</p>
+  </div></div>
+
+  <h3 class="section-title" id="quick-wins">⚡ 快速改进</h3>
+  <div class="card"><div class="card-body">
+    <div class="quick-wins">
+      <div class="quick-win"><span class="qw-icon">🔒</span><div><strong>ocr-review 加并发锁</strong><div class="small">~20 分钟，避免每次 push 堆叠（实测 4 个进程）</div></div></div>
+      <div class="quick-win"><span class="qw-icon">📄</span><div><strong>README 加 ARCHITECTURE 链接</strong><div class="small">~5 分钟，让 AI/新人快速建立全貌</div></div></div>
+      <div class="quick-win"><span class="qw-icon">🎯</span><div><strong>normalizeChatEndpoint 加等价性测试</strong><div class="small">~15 分钟，锁住两端重复实现不漂移</div></div></div>
+      <div class="quick-win"><span class="qw-icon">📈</span><div><strong>hooks 失败路径加 DEBUG 日志</strong><div class="small">~40 分钟，让单次失败可回溯</div></div></div>
+      <div class="quick-win"><span class="qw-icon">🏗</span><div><strong>拆 advisor-hook.js</strong><div class="small">~2 小时，874 → 3 个职责文件，e2e 可回归</div></div></div>
+      <div class="quick-win"><span class="qw-icon">🧪</span><div><strong>DOM 桩支持类名匹配</strong><div class="small">~1 小时，消除「类名写错测不出」盲区</div></div></div>
+    </div>
+  </div></div>
+
+  </div>
+<script>
+  const sections = document.querySelectorAll('[id]');
+  const navLinks = document.querySelectorAll('.sidebar-nav a');
+
+  const observer = new IntersectionObserver((entries) => {
+    let activeId = null;
+    entries.forEach(entry => {
+      if (entry.isIntersecting) activeId = entry.target.id;
+    });
+    if (activeId) {
+      navLinks.forEach(a => {
+        a.classList.toggle('active', a.getAttribute('href') === '#' + activeId);
+      });
+    }
+  }, { rootMargin: '-10% 0px -60% 0px' });
+
+  sections.forEach(s => observer.observe(s));
+
+  navLinks.forEach(a => {
+    a.addEventListener('click', function(e) {
+      e.preventDefault();
+      const target = document.querySelector(this.getAttribute('href'));
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+</script>
+</body>
+</html>
