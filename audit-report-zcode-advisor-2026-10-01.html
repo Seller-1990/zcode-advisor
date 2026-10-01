@@ -886,7 +886,7 @@ fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');  // 0644</div>
     </div>
     <div class="finding-meta"><span>📍 hooks/advisor-hook.js reviewTurn / hooks/lib/reviewer.js callReviewer</span><span>🎯 审查超时</span></div>
     <div class="problem"><strong>判定：</strong>成立，但根因不是「余量 30s 太小」。<code>callReviewer</code> 内部的 429/5xx 退避重试本就共享 deadline，真正的问题是<b>外层</b>：<code>reviewTurn</code> 的「空响应重试」每次调用 <code>callReviewer</code> 都各自起算 <code>Date.now() + timeoutMs</code>。</div>
-    <div class="problem"><strong>后果：</strong>单轮最坏 2×<code>reviewTimeoutMs</code>（240s×2=480s），突破 <code>hooks.json</code> 的 Stop 硬超时 320s → 宿主强杀 hook → 指针不落盘 → 每轮重审同一增量的<b>停滞循环</b>。这与 <code>reviewer.js</code> 注释自述的「全部尝试共享同一截止时间」纪律自相矛盾。</div>
+    <div class="problem"><strong>后果：</strong>初次 + 最多 2 次空响应重试共 <b>3 次调用</b>、每次各自起算——默认 <code>reviewTimeoutMs</code>=240s 时最坏 3×240=720s，sync 模式钳制 300s 时最坏 900s，均远超 <code>hooks.json</code> 的 Stop 硬超时 320s → 宿主强杀 hook → 指针不落盘 → 每轮重审同一增量的<b>停滞循环</b>。这与 <code>reviewer.js</code> 注释自述的「全部尝试共享同一截止时间」纪律自相矛盾。<span class="small">（勘误：本报告初稿误写为「2×240=480s」——漏算了初次调用且未按 sync 钳制 300s 计。修复方案不变：整轮共享 deadline 后单轮 ≤300s &lt; 320s。）</span></div>
     <div class="fix-box"><div class="fix-label">修复</div><code>callReviewer 接受调用方传入的 deadline；reviewTurn 整轮生成一次 deadline 写入 reviewParams，空响应重试复用同一对象；重试前加预算守卫（剩余 &lt;10s 直接放弃）</code></div>
     <div class="fix-box" style="margin-top:6px;background:#e8ffe8;border-color:#a5d6a7">
       <strong>✅ 验证：</strong>观测夹具记录同一轮 3 次 <code>callReviewer</code> 调用，<b>deadline 完全相同</b>（修复前该参数恒为 <code>undefined</code>，即各自起算）；另新增 2 项单元回归（外部 deadline 生效 / 预算耗尽不再发请求）。
@@ -931,7 +931,7 @@ fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');  // 0644</div>
       <span class="badge badge-info">已修复</span>
     </div>
     <div class="finding-meta"><span>📍 tools/sync-plugin-dir.cjs</span><span>🎯 镜像同步</span></div>
-    <div class="problem"><strong>根因：</strong>同步用 <code>fs.cpSync(force)</code>，会重写<b>内容相同</b>的文件 → 索引 stat 缓存过期 + <code>core.autocrlf=true</code> → <code>git status</code> 报出零内容差异的 " M"。用 <code>git hash-object</code> 与 <code>git rev-parse :&lt;path&gt;</code> 对 8 个文件逐一比对，工作区与索引对象哈希<b>完全一致</b>，证实是伪改动。</div>
+    <div class="problem"><strong>现象：</strong><code>git status</code> 报出零内容差异的 " M"——用 <code>git hash-object</code> 与 <code>git rev-parse :&lt;path&gt;</code> 对 8 个文件逐一比对，工作区与索引对象哈希<b>完全一致</b>，证实是伪改动。<strong>根因（勘误）：</strong>诱因确定是同步用 <code>fs.cpSync(force)</code> 重写了<b>内容相同</b>的文件——跳过等值复制后实测清零且不反弹；但「stat 缓存失效 × <code>core.autocrlf</code>」的完整机制链未定案（主席复审用 <code>git ls-files --eol</code> 证实规范库 blob 均为 LF，与初稿的 autocrlf 叙事存在张力），初稿对机制的表述过于确定。</div>
     <div class="fix-box"><div class="fix-label">修复</div><code>新增 copyIfChanged(src, dest)：内容一致则跳过复制（保留目标 mtime），从源头消除伪改动；对历史遗留做一次性索引刷新（git add --renormalize + git reset）</code></div>
     <div class="fix-box" style="margin-top:6px;background:#e8ffe8;border-color:#a5d6a7">
       <strong>✅ 验证：</strong>刷新后 <code>git status</code> 伪改动清零（23 → 15），剩余 15 项与 <code>git diff --numstat</code> 的真实内容变更<b>完全吻合</b>；再次执行同步后计数不反弹。
@@ -976,7 +976,7 @@ fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');  // 0644</div>
 
   <div class="card"><div class="card-body">
     <p><strong>本轮未覆盖（明确排除）：</strong>发现 8（ocr-review.sh 并发锁）不在本轮范围；Memory Palace 相关事项按要求忽略。</p>
-    <p style="margin-top:8px"><strong>未做 git 提交：</strong>改动仅落盘工作区，未 commit（待授权）。</p>
+    <p style="margin-top:8px"><strong>提交状态（更新）：</strong>本节修复已随 PR #1（分支 <code>fix/audit-round2-hardening</code>，提交 <code>6cbdefb</code>）提交，不再是「仅落盘工作区待授权」的初稿状态；主席复审（8 顾问评审）提出的后续修正——本节文字勘误（A2 算术 / A5 机制）、文档与 fillMissingOnly 语义对齐、配置文件权限收紧（0600）、面板 Origin/Host 校验、版本号 bump——随复审提交补充。</p>
   </div></div>
 
   </div>

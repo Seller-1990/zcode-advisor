@@ -159,6 +159,24 @@ async function ping(body) {
   return { ok: false, error: res.error, detail: res.detail, hint: hint(res.error) };
 }
 
+// CSRF/DNS-rebinding 防护：写接口只接受本机来源。
+// - Host 必须是回环地址：DNS rebinding 会把 Host 换成攻击者域名 → 拒绝；
+// - 浏览器跨源请求必带 Origin（text/plain 简单请求免预检也会带上），非回环来源一律拒绝——
+//   否则恶意网页可静默 POST /api/save 改写 baseUrl/apiKey，下轮审查会把对话增量外传；
+// - curl 等本机工具不带 Origin，不受影响；端口可变（EADDRINUSE 重试），只比对主机名。
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+function isLocalRequest(req) {
+  const host = String(req.headers.host || '').replace(/:\d+$/, '').toLowerCase();
+  if (!LOOPBACK_HOSTS.has(host)) return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return LOOPBACK_HOSTS.has(new URL(String(origin)).hostname.toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
 const server = http.createServer((req, res) => {
   const send = (code, obj) => {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -170,6 +188,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === 'POST' && req.url === '/api/save') {
+    if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
@@ -188,6 +207,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === 'POST' && req.url === '/api/ping') {
+    if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {

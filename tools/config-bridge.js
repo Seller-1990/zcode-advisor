@@ -74,9 +74,11 @@ function writeUserConfig(guiValues, file, opts) {
   if (JSON.stringify(merged) === JSON.stringify(existing)) {
     return { changed: false, file: target };
   }
-  fs.mkdirSync(path.dirname(target), { recursive: true });
+  // 该文件含 API key：新建目录/文件收紧到 0700/0600，不依赖 umask（默认会落成 0644）。
+  // rename 整体替换目标文件，历史遗留的宽权限文件也一并收紧；Windows 忽略 mode（ACL 继承）。
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   const tmp = `${target}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');
+  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tmp, target);
   return { changed: true, file: target, keys: Object.keys(values) };
 }
