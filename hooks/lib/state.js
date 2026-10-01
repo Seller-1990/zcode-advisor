@@ -42,6 +42,13 @@ function freshState(sessionId, transcriptPath, startEnabled) {
     tokensIn: 0,
     tokensOut: 0,
     sessionModel: '',
+    // 会话级 API 覆盖（/advisor-api set 写入）。三键独立可空：只存显式设置过的项，
+    // 空项回落全局配置。apiKey 含明文——saveState 落盘收紧到 0600（见下）。
+    sessionApi: {
+      baseUrl: '',
+      apiKey: '',
+      model: ''
+    },
     lastAction: '',
     lastActivity: '',
     createdAt: new Date().toISOString()
@@ -50,7 +57,7 @@ function freshState(sessionId, transcriptPath, startEnabled) {
 
 // 找不到就创建（幂等）。所有调用方都必须拿到一个可用 state，保证流程可继续。
 function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
-  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const file = stateFilePath(stateDir, sessionId);
   if (fs.existsSync(file)) {
     const current = loadStateDetailed(file);
@@ -112,7 +119,8 @@ function saveState(file, state) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${attempt}`;
     try {
-      fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+      // state 可能含会话级 API key（sessionApi.apiKey）：0600 落盘，不依赖 umask。
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(tmp, file);
       return;
     } catch (err) {
