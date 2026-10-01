@@ -761,6 +761,7 @@ async function handleCtl(args) {
     }
     lines.push(`  模式: ${cfg.reviewMode}`);
     lines.push(`  模型: ${eff.model}（${eff.source === 'session-override' ? '本会话覆盖' : '全局默认'}）`);
+    lines.push(`  API 来源: ${cfg.apiSourceLabel || (cfg.apiSource === 'zcode' ? 'ZCode 已维护' : '手动维护')}`);
     lines.push(`  端点: ${cfg.baseUrl}`);
     lines.push(`  审查次数: ${state.reviews || 0} | steer 记录: ${state.steers || 0}（sync=实际送达；async=入队数） | 冷却剩余: ${state.immuneTurns || 0} 轮`);
     lines.push(`  顺延队列: ${(state.pendingNotes || []).length} 条 | 历史顺延: ${state.deferred || 0}`);
@@ -864,6 +865,7 @@ async function ctlDoctor(cfg, args) {
   lines.push('advisor 体检');
   lines.push(`  配置来源: ${(cfg.configSources && cfg.configSources.length) ? cfg.configSources.join(' → ') : '(全部内置默认)'}`);
   lines.push(`  用户级配置: ${fs.existsSync(userConfigPath()) ? userConfigPath() : '不存在（/advisor-setup 可创建，跨升级保留）'}`);
+  lines.push(`  API 来源: ${cfg.apiSourceLabel || (cfg.apiSource === 'zcode' ? 'ZCode 已维护' : '手动维护')}`);
   lines.push(`  端点: ${cfg.baseUrl}`);
   lines.push(`  模式: ${cfg.reviewMode} | 预算: maxTokens=${cfg.maxTokens}, 审查超时=${cfg.reviewTimeoutMs}ms`);
   const gateReasons = gate(cfg, apiKeyInfo);

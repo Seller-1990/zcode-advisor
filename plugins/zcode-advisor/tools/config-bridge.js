@@ -19,6 +19,12 @@ const path = require('path');
 const USER_CONFIG = process.env.ZCODE_ADVISOR_USER_CONFIG
   || path.join(os.homedir(), '.zcode', 'advisor.config.json');
 
+// 旧版 plugin.json（≤0.2.7）曾把智谱官方端点写成 userConfig default——宿主会把它
+// 展开进 env，桥接再落盘，这正是「第三方端点总被改回智谱」的根因（默认值已改空串，
+// fillMissingOnly 也不再覆盖已有值）。这里再挡一道：已缓存旧表单/旧宿主展开出的
+// 官方默认端点，同样视为「未显式配置」跳过，防止降级安装路径复发。
+const LEGACY_DEFAULT_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
+
 // 从 env 提取 GUI 表单值（由 plugin.json mcpServers env 的 ${user_config.*} 模板填充）。
 function guiValuesFromEnv(env) {
   const out = {};
@@ -31,7 +37,9 @@ function guiValuesFromEnv(env) {
   for (const [envKey, cfgKey] of Object.entries(map)) {
     const v = String(env[envKey] || '').trim();
     // 宿主可能把未填字段展开为字面模板串——同样跳过。
-    if (v && !v.includes('${')) out[cfgKey] = v;
+    if (!v || v.includes('${')) continue;
+    if (cfgKey === 'baseUrl' && v === LEGACY_DEFAULT_BASE_URL) continue;
+    out[cfgKey] = v;
   }
   return out;
 }

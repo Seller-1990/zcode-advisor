@@ -166,3 +166,70 @@ test('配置面板 HTTP：一次保存恰好一次原子落盘（单次 RMW，�
   }
   assert.strictEqual(configRenames, 1, '一次 /api/save 应恰好一次 tmp→目标 rename');
 });
+
+test('guiValuesFromEnv：旧版默认的智谱端点视为未配置（防「第三方端点被改回智谱」复发）', () => {
+  // 回归：≤0.2.7 的 plugin.json 把官方端点写成 userConfig default，宿主展开进 env 后
+  // 桥接落盘，覆盖用户的第三方端点。默认值已改空串，这里挡住旧宿主/旧缓存展开出的值。
+  const v = guiValuesFromEnv({
+    ZCODE_ADVISOR_CFG_API_KEY: '',
+    ZCODE_ADVISOR_CFG_MODEL: 'glm-5.3-flash',
+    ZCODE_ADVISOR_CFG_BASE_URL: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    ZCODE_ADVISOR_CFG_REVIEW_MODE: ''
+  });
+  assert.deepStrictEqual(v, { model: 'glm-5.3-flash' });
+});
+
+test('配置面板 HTTP：apiSource/zcode 键可保存，非法 apiSource 被丢弃', async () => {
+  try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
+  const res = await (await fetch('http://127.0.0.1:8799/api/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiSource: 'zcode', zcodeProvider: 'prov-1', zcodeModel: 'm-1', apiSourceBad: 'x' })
+  })).json();
+  assert.strictEqual(res.ok, true);
+  const saved = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
+  assert.strictEqual(saved.apiSource, 'zcode');
+  assert.strictEqual(saved.zcodeProvider, 'prov-1');
+  assert.strictEqual(saved.zcodeModel, 'm-1');
+
+  const res2 = await (await fetch('http://127.0.0.1:8799/api/save', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiSource: 'BOTH' })
+  })).json();
+  assert.strictEqual(res2.ok, true);
+  const saved2 = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
+  assert.strictEqual(saved2.apiSource, 'zcode', '非法 apiSource 应被丢弃，保留既有值');
+});
+
+test('配置面板 HTTP：/api/zcode-models 返回服务商模型清单（不含 apiKey）', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-panel-v2-'));
+  const v2file = path.join(dir, 'v2-config.json');
+  fs.writeFileSync(v2file, JSON.stringify({ provider: {
+    prov1: { name: '网关', kind: 'openai-compatible', options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-secret' }, models: { 'm-a': {}, 'm-b': {} } }
+  } }));
+  const origEnv = process.env.ZCODE_ADVISOR_ZCODE_CONFIG;
+  process.env.ZCODE_ADVISOR_ZCODE_CONFIG = v2file;
+  try {
+    const r = await (await fetch('http://127.0.0.1:8799/api/zcode-models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ providerId: 'prov1' })
+    })).json();
+    assert.strictEqual(r.ok, true);
+    assert.deepStrictEqual(r.models, ['m-a', 'm-b']);
+    assert.strictEqual(r.baseURL, 'http://10.0.0.8:8088/v1');
+    assert.strictEqual(JSON.stringify(r).includes('sk-secret'), false, '响应不得携带 apiKey 明文');
+  } finally {
+    if (origEnv === undefined) delete process.env.ZCODE_ADVISOR_ZCODE_CONFIG;
+    else process.env.ZCODE_ADVISOR_ZCODE_CONFIG = origEnv;
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+  }
+});
+
+test('配置面板页面：API 来源分段与 zcode 服务商区渲染', async () => {
+  const html = await (await fetch('http://127.0.0.1:8799/')).text();
+  for (const marker of ['src-zcode', 'src-manual', 'zcodeProvider', 'zcodeModel', 'manualSec', 'API 来源', '启用']) {
+    assert.ok(html.includes(marker), `页面应包含 ${marker}`);
+  }
+});

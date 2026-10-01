@@ -12,13 +12,15 @@ argument-hint: "[<api-key>] [model:<model-id>]"
    - **API key**（必填）：智谱 BigModel/Z.ai 的 API key。提醒用户：key 将明文写入用户主目录下的 `~/.zcode/advisor.config.json`（Windows 即 `%USERPROFILE%\.zcode\advisor.config.json`），该文件不在任何 git 仓库内。
    - **审查模型**（可选，默认 `glm-5.3-flash`）：向用户说明——审查模型建议比主对话模型更强或至少不同；若用户的主对话就是 flash 级，推荐尝试 `glm-5.3` 等更强模型（以用户套餐实际可用为准）。用户不确定时可先跳过，稍后用 Ping 逐个试。
    - **端点**（可选，默认 `https://open.bigmodel.cn/api/paas/v4/chat/completions`）：仅当用户明确使用兼容网关时才修改；非官方端点会触发配置警告。
+   - **API 来源**（可选，默认 `manual`）：若用户想直接使用 ZCode 里已维护的第三方 API（改 ZCode 设置无需再同步本插件），可改用 zcode 模式——在配置里写 `"apiSource": "zcode"`、`"zcodeProvider": "<ZCode 设置里该服务商的 id 或名称>"`、`"zcodeModel": "<模型 id>"`（省略 zcodeModel 取该服务商模型列表首项），此时端点/key 可跳过。服务商 id 可在 ZCode 设置的模型服务商配置或 `~/.zcode/v2/config.json` 的 `provider.*` 中查看。
 3. **写入用户级配置**：先用 Bash 运行 `node -e "console.log(require('os').homedir())"` 拿到用户主目录；若 `~/.zcode/advisor.config.json` 已存在，先 Read 出现有内容并**合并**（保留用户已设置的其他字段），再用 Write 写入。内容形如：
 
    ```json
    {
      "apiKey": "<用户提供的 key>",
      "model": "<选定模型>",
-     "baseUrl": "<端点，未变则省略此字段>"
+     "baseUrl": "<端点，未变则省略此字段>",
+     "apiSource": "manual（或 zcode + zcodeProvider/zcodeModel，见上）"
    }
    ```
 

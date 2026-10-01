@@ -13,6 +13,13 @@ const DEFAULTS = {
   model: 'glm-5.3-flash',
   apiKey: '',
   apiKeyEnv: ['ZCODE_ADVISOR_API_KEY', 'ZAI_API_KEY', 'Z_AI_API_KEY', 'ZHIPUAI_API_KEY', 'BIGMODEL_API_KEY'],
+  // API 获取方式：manual = 用本插件配置里的 key/端点/模型（推荐写在用户级 advisor.config.json）；
+  // zcode = 直接读取 ZCode 已维护的第三方 API（~/.zcode/v2/config.json 的 provider.*），
+  // 一处维护两处生效，改 ZCode 设置无需再同步本插件。
+  apiSource: 'manual',
+  // zcode 模式下选中的 provider（v2 config 的 id，容忍写名称）与模型 id；留空模型取列表首项。
+  zcodeProvider: '',
+  zcodeModel: '',
   systemPrompt: '',
   // 审查模式：async（默认，Stop 立即返回，审查在后台完成，意见下条消息送达）
   // 或 sync（Stop 内联审查，concern/blocker 立即送达，但每轮收尾要等审查完成）。
@@ -56,6 +63,87 @@ function userConfigPath(env) {
   // 测试/特殊部署可覆盖；默认在用户主目录（跨插件升级/重装保留）。
   if (e.ZCODE_ADVISOR_USER_CONFIG) return e.ZCODE_ADVISOR_USER_CONFIG;
   return path.join(os.homedir(), '.zcode', 'advisor.config.json');
+}
+
+// ZCode 桌面版把用户维护的模型服务商（含第三方 API）存在 ~/.zcode/v2/config.json：
+// provider.<id> = { name, kind: 'anthropic'|'openai'|'openai-compatible',
+//                   options: { baseURL, apiKey }, models: { <modelId>: … } }。
+// 本插件审查通道只走 OpenAI 兼容 chat/completions（见 reviewer.js），kind=anthropic 不可用。
+function zcodeConfigPath(env) {
+  const e = env || process.env;
+  // 测试/特殊部署可覆盖。
+  if (e.ZCODE_ADVISOR_ZCODE_CONFIG) return e.ZCODE_ADVISOR_ZCODE_CONFIG;
+  return path.join(os.homedir(), '.zcode', 'v2', 'config.json');
+}
+
+// 读取全部 provider（含 apiKey，仅供 hook 解析/本机面板 Ping 等本地路径使用）。
+// 读取失败返回 []（ZCode 未装/未配置过 provider 时是正常状态，不挂 problems）。
+function readZcodeProviders(env) {
+  let raw = null;
+  try {
+    raw = JSON.parse(fs.readFileSync(zcodeConfigPath(env), 'utf8'));
+  } catch (_) {
+    return [];
+  }
+  const map = raw && raw.provider && typeof raw.provider === 'object' ? raw.provider : {};
+  const out = [];
+  for (const [id, p] of Object.entries(map)) {
+    if (!p || typeof p !== 'object') continue;
+    const opts = p.options && typeof p.options === 'object' ? p.options : {};
+    const models = p.models && typeof p.models === 'object' ? Object.keys(p.models) : [];
+    out.push({
+      id,
+      name: String(p.name || ''),
+      kind: String(p.kind || ''),
+      baseURL: String(opts.baseURL || '').trim(),
+      apiKey: String(opts.apiKey || '').trim(),
+      models,
+      eligible: p.kind === 'openai' || p.kind === 'openai-compatible'
+    });
+  }
+  return out;
+}
+
+// 面板/状态展示用：剔除 apiKey 明文，只给掩码标记。
+function listZcodeProviders(env) {
+  return readZcodeProviders(env).map((p) => ({
+    id: p.id, name: p.name, kind: p.kind, baseURL: p.baseURL,
+    models: p.models, eligible: p.eligible, hasApiKey: Boolean(p.apiKey)
+  }));
+}
+
+function findZcodeProvider(providers, want) {
+  const w = String(want || '').trim();
+  if (!w) return null;
+  return providers.find((p) => p.id === w) || providers.find((p) => p.name && p.name === w) || null;
+}
+
+// apiSource=zcode 时用 ZCode 维护的 provider 覆盖 baseUrl/apiKey/model。
+// 在用户级配置层之后、环境变量层之前执行：显式 env 仍可覆盖 zcode 选择。
+// provider 缺失/协议不兼容时保留手动配置值并挂 problems（降级不静默）。
+function applyZcodeSource(cfg, problems, sources, env) {
+  cfg.apiSourceLabel = '手动维护';
+  if (String(cfg.apiSource || '').trim().toLowerCase() !== 'zcode') return;
+  const providers = readZcodeProviders(env);
+  const found = findZcodeProvider(providers, cfg.zcodeProvider);
+  if (!found) {
+    problems.push(`zcode_provider_missing: apiSource=zcode 但 ZCode 配置里找不到 provider「${String(cfg.zcodeProvider || '').trim() || '(未指定)'}」，已沿用手动配置值`);
+    return;
+  }
+  if (!found.eligible) {
+    problems.push(`zcode_provider_ineligible: provider「${found.name || found.id}」协议为 ${found.kind || '未知'}，审查通道仅支持 OpenAI 兼容端点，已沿用手动配置值`);
+    return;
+  }
+  if (found.baseURL) cfg.baseUrl = found.baseURL;
+  if (found.apiKey) cfg.apiKey = found.apiKey;
+  const wantModel = String(cfg.zcodeModel || '').trim();
+  if (wantModel) {
+    cfg.model = wantModel; // 显式指定的模型即使不在 provider 列表里也尊重（列表可能滞后）
+  } else if (found.models.length > 0) {
+    cfg.model = found.models[0];
+  }
+  cfg.apiSourceLabel = `ZCode 已维护（${found.name || found.id.slice(0, 8)}）`;
+  sources.push(`zcode-provider:${found.name || found.id}`);
 }
 
 // 占位符样式的 key（REPLACE_YOUR_KEY / your-api-key / test-key 等）视为未配置。
@@ -127,6 +215,10 @@ function loadConfig(pluginRoot, env) {
     sources.push('user:~/.zcode/advisor.config.json');
   }
 
+  // apiSource=zcode：从 ZCode 维护的第三方 API 解析 baseUrl/apiKey/model。
+  // 放在用户层之后、env 之前——env 显式覆盖仍然优先于「跟随 ZCode」。
+  applyZcodeSource(cfg, problems, sources, env);
+
   if (env.ZCODE_ADVISOR_BASE_URL) cfg.baseUrl = env.ZCODE_ADVISOR_BASE_URL;
   if (env.ZCODE_ADVISOR_MODEL) cfg.model = env.ZCODE_ADVISOR_MODEL;
   if (env.ZCODE_ADVISOR_API_KEY) cfg.apiKey = env.ZCODE_ADVISOR_API_KEY;
@@ -162,6 +254,16 @@ function loadConfig(pluginRoot, env) {
       problems.push(`config_normalized: reviewMode=${JSON.stringify(cfg.reviewMode)} 非法，已归一为 async`);
     }
     cfg.reviewMode = 'async';
+  }
+
+  // apiSource 归一化：只认 manual/zcode，脏值回退 manual 并登记（applyZcodeSource 已按
+  // 「非 zcode 即手动」处理，这里负责把脏值改写为合法值，避免配置面板回显脏状态）。
+  if (typeof cfg.apiSource === 'string') cfg.apiSource = cfg.apiSource.trim().toLowerCase();
+  if (cfg.apiSource !== 'zcode') {
+    if (cfg.apiSource !== 'manual') {
+      problems.push(`config_normalized: apiSource=${JSON.stringify(cfg.apiSource)} 非法，已归一为 manual`);
+    }
+    cfg.apiSource = 'manual';
   }
 
   // maxTokens 专守卫：接受字符串数字（手写配置常见，Number("8192")=8192 直接采用）；
@@ -255,5 +357,6 @@ function maskKey(key) {
 
 module.exports = {
   DEFAULTS, SYNC_TIMEOUT_CAP_MS, loadConfig, resolveApiKey, gate, configWarnings,
-  isPlaceholderKey, userConfigPath, maskKey
+  isPlaceholderKey, userConfigPath, maskKey,
+  zcodeConfigPath, readZcodeProviders, listZcodeProviders, findZcodeProvider
 };
