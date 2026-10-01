@@ -53,7 +53,22 @@ function findPluginPayload() {
 function findZcodeCli() {
   try {
     const zp = require('./zcode-path.cjs');
-    const found = zp.detectZcodePath({ platform: process.platform, env: process.env, config: {} });
+    // **必须传 deps**：detectZcodePath 通过注入的 fs/statSync/readFileSync 判定
+    // 「可执行文件是否存在」。不传时 isRunnableFile 恒为 false，
+    // 整条探测链静默返回空 → 自动启用失效（真机测试发现：干净机器上 .app
+    // 日志只有"未找到 ZCode CLI"，而本机 /Applications/ZCode.app 明明存在）。
+    const found = zp.detectZcodePath({
+      platform: process.platform,
+      env: process.env,
+      config: {},
+      deps: {
+        fs, path, os,
+        existsSync: fs.existsSync,
+        statSync: fs.statSync,
+        readFileSync: fs.readFileSync,
+        homedir: os.homedir
+      }
+    });
     if (!found || !found.path) return null;
     // found.path 可能是 .app 内部可执行（macOS：<app>/Contents/MacOS/ZCode）
     // 或 Windows 的 ZCode.exe。CLI 相对它上溯 1~3 层尝试。

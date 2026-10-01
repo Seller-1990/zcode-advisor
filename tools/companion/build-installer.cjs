@@ -85,6 +85,25 @@ function stagePluginPayload(dest) {
     const dst = path.join(payloadRoot, item);
     fs.cpSync(src, dst, { recursive: true, force: true });
   }
+  // **改写 marketplace.json 的 source 为 './'**：
+  // 仓库根的清单写的是 './plugins/zcode-advisor'（仓库布局：根目录下有 plugins/ 子目录），
+  // 但 payload 自身就是插件本体（.zcode-plugin/hooks/commands/tools 直接在其下），
+  // 没有 plugins/ 子目录。不改写则宿主报
+  //   plugin_marketplace_invalid: Unsupported or missing plugin source: ./plugins/zcode-advisor
+  // 导致 install 失败、自动启用落空（干净机器真机测试发现，CI 不覆盖安装环节）。
+  for (const rel of ['.claude-plugin/marketplace.json', '.zcode-plugin/marketplace.json']) {
+    const mf = path.join(payloadRoot, rel);
+    try {
+      if (!fs.existsSync(mf)) continue;
+      const doc = JSON.parse(fs.readFileSync(mf, 'utf8'));
+      let changed = false;
+      for (const pl of doc.plugins || []) {
+        if (pl && typeof pl.source === 'string' && pl.source !== './') { pl.source = './'; changed = true; }
+      }
+      if (changed) fs.writeFileSync(mf, JSON.stringify(doc, null, 2) + '\n', 'utf8');
+    } catch (_) { /* 改写失败不阻断构建，安装时会给出明确错误 */ }
+  }
+
   // auto-enable 脚本本身也要随包（安装器/controller 调它）
   fs.copyFileSync(path.join(COMPANION_DIR, 'auto-enable.cjs'), path.join(payloadRoot, 'auto-enable.cjs'));
   return payloadRoot;
