@@ -149,6 +149,32 @@ function main() {
   }
 }
 
+// 幂等快路径：若插件已启用且缓存版本与包内一致，则无需跑完整的
+// marketplace add/update + install + enable（四次 CLI 调用，数秒）。
+// 为什么需要：单飞锁只能防**并发**，防不了**串行重复**——
+// .app 启动器先跑完（约 5 秒）并释放锁，controller 稍后才启动，
+// 于是又完整跑一遍（实测日志 11:16:12 与 11:16:17 各一套）。
+// 这既浪费几秒，也会无谓改写宿主缓存目录。
+function alreadyEnabled(cli, nodeBin, payload) {
+  try {
+    const env = Object.assign({}, process.env);
+    delete env.ELECTRON_RUN_AS_NODE;
+    const out = execFileSync(nodeBin, [cli, 'plugins', 'list'], {
+      encoding: 'utf8', timeout: 60000, env
+    });
+    if (!/zcode-advisor@\S+\s+\[enabled\]/.test(out)) return false;
+    // 版本也要一致：包升级后必须重装，否则仍跑旧代码
+    let pkgVersion = '';
+    try {
+      pkgVersion = JSON.parse(fs.readFileSync(path.join(payload, 'package.json'), 'utf8')).version || '';
+    } catch (_) {}
+    if (!pkgVersion) return true;
+    return out.includes(`zcode-advisor/${pkgVersion}`);
+  } catch (_) {
+    return false;
+  }
+}
+
 // 实际的启用流程（由 main 在持有单飞锁后调用）
 function runEnable() {
   const payload = findPluginPayload();
@@ -165,6 +191,13 @@ function runEnable() {
 
   // 运行 CLI 的 node：安装器/controller 传入的进程即合适的 node（可能是内嵌运行时）
   const nodeBin = process.execPath;
+
+  // 幂等快路径：已启用且版本一致 → 直接返回（避免串行重复跑完整流程）
+  if (alreadyEnabled(cli, nodeBin, payload)) {
+    log('插件已启用且版本一致，跳过（幂等快路径）');
+    return 0;
+  }
+
   log(`插件市场：${payload}`);
   log(`ZCode CLI：${cli}`);
 

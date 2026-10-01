@@ -107,7 +107,7 @@ NSIS 是业界标准安装器（非 IExpress 自解压），快捷方式直接�
 
 `.github/workflows/build-installers.yml`：
 
-- **打 tag 即自动发布**：`git tag v0.2.1 && git push origin v0.2.1` → 三平台并行构建 →
+- **打 tag 即自动发布**：`git tag v0.2.2 && git push origin v0.2.2` → 三平台并行构建 →
   安装包自动挂到 Release；
 - **手动触发**：Actions 页面 `Run workflow`，只上传 artifact 供验证，不发 Release。
 
