@@ -145,9 +145,18 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
   // content 为 null 且推理文本里也没有 JSON 帧，导致 llm_empty_response。
   // 同一次请求重试一次（并追加"只输出 JSON"的强调）能显著提高成功率——
   // 实测同一输入有时成功（拿到帧）有时失败，属模型不确定性而非代码缺陷。
-  if (res.error === 'llm_empty_response') {
+  // 空响应重试（最多 2 次，逐步强化）：
+  // 实测思考型模型（hy4-preview-f 等）有一定概率把预算全用在推理上、
+  // content 为 null 且推理文本里也没有 JSON 帧。单纯重复请求成功率低；
+  // 回灌上一步推理并明确要求"只输出 JSON"后显著改善（实测 2/3 → 3/4）。
+  for (let attempt = 0; attempt < 2 && res.error === 'llm_empty_response'; attempt++) {
+    const carry = res.reasoningText
+      ? `\n\n【你上一步的分析（供参考，不要重复）】\n${res.reasoningText.slice(0, 3000)}\n\n请基于以上分析，只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}。不要输出任何其他文字。`
+      : '\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）';
     res = await callReviewer(Object.assign({}, reviewParams, {
-      userContent: `${userContent}\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）`
+      userContent: `${userContent}${carry}`,
+      // 重试时温度归零，减少发散
+      temperature: 0
     }));
   }
   if (res.error) return { error: res.error, usage: res.usage, hint: res.hint };

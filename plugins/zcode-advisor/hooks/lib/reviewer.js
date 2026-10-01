@@ -280,6 +280,11 @@ async function callReviewer(params) {
       const objs = extractJsonObjects(reasoning);
       const frameObj = objs.reverse().find((o) => o && typeof o === 'object' && o.severity && o.note);
       if (frameObj) text = JSON.stringify(frameObj);
+      else if (reasoning.trim()) {
+        // 推理文本里没有 JSON 帧：把原文带回给上层，重试时可作为上下文回灌，
+        // 让模型"基于已完成的分析直接给出结论"——比单纯重复请求成功率高。
+        return { error: 'llm_empty_response', reasoningText: reasoning.slice(0, 4000) };
+      }
     }
 
     if (!text.trim()) {
