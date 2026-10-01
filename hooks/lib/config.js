@@ -22,7 +22,7 @@ const DEFAULTS = {
   // 768 对思考型模型不够（dsh-advisor issue #102 的实测教训）。注意：2048/240s 这组默认值
   // 没有在本插件的目标端点上独立验证过；有实证支撑的下限是 4096（dsh 端 guard 通道实测零丢弃）。
   // 思考型模型建议 4096；提高预算时同步关注 reviewTimeoutMs。
-  maxTokens: 2048,
+  maxTokens: 4096,
   temperature: 0.2,
   // 散文救回默认开启（对齐 dsh 端本地补丁 v2.2 的实际生效状态；上游 dsh-advisor 默认 false）。
   proseFallback: true,

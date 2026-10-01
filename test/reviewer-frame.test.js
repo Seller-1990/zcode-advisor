@@ -157,3 +157,60 @@ test('normalizeChatEndpoint：空值与空串安全', () => {
   assert.strictEqual(normalizeChatEndpoint(undefined), '');
   assert.strictEqual(normalizeChatEndpoint('   '), '');
 });
+
+// ---------------- 思考型模型兼容（reasoning_content） ----------------
+// 真机实测：本机 8787 网关（hy4-preview-f）把推理内容放在 message.reasoning_content，
+// message.content 为 null → 只读 content 会判 llm_empty_response，顾问 100% 空转。
+// 修复后应回退到 reasoning_content 并成功解析出帧。
+
+test('callReviewer：content 为 null 时回退 reasoning_content（思考型模型）', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  const frameJson = '{"severity":"concern","note":"直接拼接 SQL 有注入风险，建议参数化查询"}';
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      choices: [{
+        index: 0,
+        finish_reason: 'stop',
+        message: { role: 'assistant', content: null, reasoning_content: `推理过程…\n${frameJson}\n完毕` }
+      }],
+      usage: { prompt_tokens: 10, completion_tokens: 20 }
+    })
+  });
+  try {
+    const r = await callReviewer({
+      baseUrl: 'http://127.0.0.1:9/v1',
+      model: 'm', apiKey: 'k',
+      systemPrompt: 'sp', userContent: 'uc',
+      maxTokens: 2048, temperature: 0, timeoutMs: 5000
+    });
+    assert.ok(!r.error, `不应报错，实际 ${r.error}`);
+    assert.ok(r.text && r.text.includes('severity'), '应回退到 reasoning_content 取得文本');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('callReviewer：content 正常时不使用 reasoning_content（优先级正确）', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    json: async () => ({
+      choices: [{ index: 0, finish_reason: 'stop',
+        message: { content: '{"severity":"nit","note":"来自 content"}', reasoning_content: '{"severity":"blocker","note":"来自 reasoning"}' } }],
+      usage: {}
+    })
+  });
+  try {
+    const r = await callReviewer({
+      baseUrl: 'http://127.0.0.1:9/v1', model: 'm', apiKey: 'k',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 100, temperature: 0, timeoutMs: 5000
+    });
+    assert.ok(r.text.includes('来自 content'), 'content 非空时必须优先用 content');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

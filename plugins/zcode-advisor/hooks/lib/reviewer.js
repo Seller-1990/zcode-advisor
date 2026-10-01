@@ -260,11 +260,37 @@ async function callReviewer(params) {
   try {
     const data = await resp.json();
     const choice = data && Array.isArray(data.choices) && data.choices[0];
-    const content = choice && choice.message && choice.message.content;
+    const message = (choice && choice.message) || {};
+    const content = message.content;
     let text = '';
     if (typeof content === 'string') text = content;
     else if (Array.isArray(content)) text = content.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('');
-    if (!text.trim()) return { error: 'llm_empty_response' };
+
+    // **思考型模型兼容**（真机实测发现）：部分端点（本机 8787 网关、DeepSeek-R1
+    // 类）把推理内容放在 message.reasoning_content，而 message.content 为 **null**。
+    // 只读 content 会误判为"空响应"，顾问永远不出意见（本机曾 100% 命中）。
+    // 回退到 reasoning_content，后续 parseFrame/extractJsonObjects 能从推理文本里
+    // 捞出最终 JSON 帧。
+    if (!text.trim() && typeof message.reasoning_content === 'string' && message.reasoning_content.trim()) {
+      text = message.reasoning_content;
+    }
+
+    if (!text.trim()) {
+      // 区分空响应的成因（真机实测：思考型模型会把 max_tokens 全部耗在
+      // reasoning 上，finish_reason=length 且 content 为空）。
+      // 只报 llm_empty_response 会让用户无从下手；带上成因与建议。
+      const fin = (data.choices && data.choices[0] && data.choices[0].finish_reason) || '';
+      const details = (data.usage && data.usage.completion_tokens_details) || {};
+      const reasoning = Number(details.reasoning_tokens) || 0;
+      if (fin === 'length' && reasoning > 0) {
+        return {
+          error: 'llm_empty_response',
+          hint: `思考型模型把 max_tokens 全部用于推理（reasoning=${reasoning}，finish=length）——` +
+                `请调大 maxTokens（建议 ≥4096）`
+        };
+      }
+      return { error: 'llm_empty_response', hint: fin ? `finish_reason=${fin}` : '' };
+    }
     // usage 解析：成本可观测（此前被整体丢弃）。
     const usage = data.usage && typeof data.usage === 'object'
       ? {
