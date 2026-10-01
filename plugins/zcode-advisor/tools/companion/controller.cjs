@@ -16,7 +16,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
-const { spawn, execSync } = require('child_process');
+const { spawn, spawnSync, execSync } = require('child_process');
 const { modelsUrl, parseModels } = require('./lib.cjs');
 const { detectZcodePath, missingHint } = require('./zcode-path.cjs');
 
@@ -24,8 +24,14 @@ const { detectZcodePath, missingHint } = require('./zcode-path.cjs');
 // 为什么不复用 hooks/lib/history：发行包只随带 companion 四个文件（hooks/ 不存在），
 // 跨目录 require 会静默失效。读取逻辑只有十几行，这里内联一份；
 // 写入侧仍统一在 hooks/lib/history（单写多读，格式漂移风险由测试锁住）。
-const HISTORY_FILE = process.env.ZCODE_ADVISOR_HISTORY
-  || path.join(os.homedir(), '.zcode', 'advisor-history.jsonl');
+// 路径解析必须与 hooks/lib/history.js 一致（含 STATE_DIR 隔离分支），
+// 否则设置 STATE_DIR 的部署里，写入与读取指向不同文件、面板永远空白。
+function resolveHistoryFile() {
+  if (process.env.ZCODE_ADVISOR_HISTORY) return process.env.ZCODE_ADVISOR_HISTORY;
+  if (process.env.ZCODE_ADVISOR_STATE_DIR) return path.join(process.env.ZCODE_ADVISOR_STATE_DIR, 'advisor-history.jsonl');
+  return path.join(os.homedir(), '.zcode', 'advisor-history.jsonl');
+}
+const HISTORY_FILE = resolveHistoryFile();
 
 function readHistory(limit) {
   const max = Number.isFinite(limit) && limit > 0 ? limit : 50;
@@ -317,6 +323,9 @@ function readUserConfig() {
 function saveUserConfig(patch) {
   const allowed = {};
   for (const k of ['apiKey', 'model', 'baseUrl', 'reviewMode', 'maxTokens', 'startEnabled']) {
+    // 注意：v 必须在所有分支之前声明——曾把 startEnabled 分支写在 const v 之前，
+    // 触发 TDZ（Cannot access 'v' before initialization），使**所有保存请求** 500。
+    const v = patch[k];
     // startEnabled 是顾问总开关（新会话是否自动启用）：布尔处理
     if (k === 'startEnabled') {
       if (v === true || v === false) allowed[k] = v;
@@ -324,7 +333,6 @@ function saveUserConfig(patch) {
       else if (v === 'false') allowed[k] = false;
       continue;
     }
-    const v = patch[k];
     if (k === 'maxTokens') {
       const mt = parseInt(v, 10);
       if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) allowed[k] = mt;
@@ -333,10 +341,12 @@ function saveUserConfig(patch) {
     }
   }
   const merged = Object.assign({}, readUserConfig(), allowed);
-  fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true });
+  // 配置含明文 apiKey：目录 0700、文件 0600（与转录快照/意见历史同级）。
+  fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true, mode: 0o700 });
   const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');
+  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tmp, USER_CONFIG);
+  try { fs.chmodSync(USER_CONFIG, 0o600); } catch (_) {}
   return merged;
 }
 
@@ -554,4 +564,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { findZcodePath, normalizeChatEndpoint, main };
+module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile };

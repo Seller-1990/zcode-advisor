@@ -98,9 +98,13 @@ mkdir -p "$SUPPORT/bin" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ${runtimeFiles.map((f) => `[ -f "$SRC/${f}" ] || { echo "[错误] 发行包缺少 ${f}" >&2; exit 1; }`).join('\n')}
 ${runtimeFiles.map((f) => `cp -f "$SRC/${f}" "$SUPPORT/"`).join('\n')}
 
-# 同步插件子目录并自动启用插件（通过 ZCode 官方 CLI）
-if [ -f "$SRC/tools/sync-plugin-dir.cjs" ]; then
-  "$SUPPORT/bin/node" "$SRC/tools/sync-plugin-dir.cjs" 2>/dev/null || true
+# 安装插件本体（包内 payload → 调用 auto-enable 走 ZCode 官方 CLI 注册/安装/启用）。
+# 这是 tar.gz 路径的"自动启用"执行点：包内携带 plugin/ 与 auto-enable.cjs，
+# 缺此步骤则用户只装到角标外挂、审查插件本体没装。
+if [ -f "$SRC/plugin/.claude-plugin/marketplace.json" ] && [ -f "$SRC/auto-enable.cjs" ]; then
+  "$SUPPORT/bin/node" "$SRC/auto-enable.cjs" 2>/dev/null || echo "[提示] 插件自动启用未完成，可在 ZCode 内手动添加插件市场：$SRC/plugin"
+else
+  echo "[提示] 包内未找到插件 payload，审查功能需手动安装插件（见 README）"
 fi
 
 # Node 运行时：优先用包内内嵌，其次回退系统 node（并明确告知）。

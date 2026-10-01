@@ -72,8 +72,12 @@ function stageDir(p) { fs.mkdirSync(p, { recursive: true }); return p; }
 // 这是「双击安装包后自动开启」的载体：没有这份 payload，安装器无从安装插件本体。
 function stagePluginPayload(dest) {
   const payloadRoot = path.join(dest, 'plugin');
+  // **必须与 .zcode-plugin/plugin.json 的声明一致**：mcpServers 声明 config-bridge 从
+  // ${CLAUDE_PLUGIN_ROOT}/tools/config-bridge.js 启动，缺 tools/ 则设置表单桥接失效
+  // （仓库内副本已修，payload 这一份曾漏修——同一 bug 的第二份拷贝）。
   const items = [
-    '.zcode-plugin', '.claude-plugin', 'hooks', 'commands', 'package.json', 'README.md'
+    '.zcode-plugin', '.claude-plugin', 'hooks', 'commands', 'tools',
+    'package.json', 'README.md', 'advisor.config.example.json'
   ];
   for (const item of items) {
     const src = path.join(ROOT, item);
@@ -196,6 +200,15 @@ async function buildWin(opts) {
   }
   // README 需在确定是否内嵌之后生成（未内嵌时包含补救说明）
   entries.push({ path: 'README-install.txt', data: Buffer.from(T.winReadme(embedded), 'utf8'), mode });
+
+  // **插件 payload + auto-enable 必须打进 Windows 包**：
+  // NSIS 安装脚本会 ExecWait 调 $INSTDIR\auto-enable.cjs，
+  // 缺它则安装后自动启用静默失效（Windows 全形态都无法启用插件）。
+  const pluginRootWin = stagePluginPayload(path.join(DIST, '.stage-win-payload'));
+  entries.push(...collectEntries(pluginRootWin, 'plugin', 0o644));
+  entries.push({ path: 'auto-enable.cjs', data: fs.readFileSync(path.join(COMPANION_DIR, 'auto-enable.cjs')), mode });
+  entries.push({ path: 'tools/sync-plugin-dir.cjs', data: fs.readFileSync(path.join(ROOT, 'tools', 'sync-plugin-dir.cjs')), mode });
+  entries.push(...collectEntries(path.join(ROOT, 'hooks'), 'hooks', 0o644));
 
   const zip = buildZip(entries);
   const out = path.join(DIST, `ZCodeAdvisor-${VERSION}-win-x64.zip`);
@@ -326,7 +339,8 @@ async function buildMac(arch, opts) {
           companionDir: COMPANION_DIR,
           nodeBinPath,
           icnsBuf: makeIcns(),
-          pluginDir: path.join(DIST, '.stage-mac-payload-x64')   // plugin payload（含 auto-enable）
+          // 必须跟随当前 arch——硬编码 x64 会让 arm64 DMG 缺插件（且 verifyDmg 不校验）
+          pluginDir: path.join(DIST, `.stage-mac-payload-${arch}`)
         });
         const dmgPath = path.join(DIST, `ZCodeAdvisor-${VERSION}-macos-${arch}.dmg`);
         const r = P.buildDmg({
@@ -454,6 +468,16 @@ function verifyDmg(name, filePath) {
       const resources = path.join(appDir, 'Contents', 'Resources');
       const launcher = path.join(appDir, 'Contents', 'MacOS', 'ZCodeAdvisor');
       if (!fs.existsSync(launcher)) throw new Error(`${name}: .app 缺少可执行启动器`);
+      // **必须校验插件 payload**：曾因 pluginDir 硬编码 x64，arm64 DMG 缺插件本体而
+      // 此处不校验 → CI 绿灯放行、用户装完只有角标没有审查功能。
+      const pluginManifest = path.join(resources, 'app', 'plugin', '.claude-plugin', 'marketplace.json');
+      if (!fs.existsSync(pluginManifest)) {
+        throw new Error(`${name}: .app 缺少插件 payload（${pluginManifest}）——该包无法自动启用审查插件`);
+      }
+      const bridge = path.join(resources, 'app', 'plugin', 'tools', 'config-bridge.js');
+      if (!fs.existsSync(bridge)) {
+        throw new Error(`${name}: 插件 payload 缺少 tools/config-bridge.js（MCP 将无法启动）`);
+      }
 
       const missing = COMPANION_FILES.filter((f) => !fs.existsSync(path.join(resources, 'app', f)));
       if (missing.length > 0) {

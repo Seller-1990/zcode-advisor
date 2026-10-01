@@ -216,6 +216,10 @@
         if (c.baseUrl) f.baseUrl.value = c.baseUrl;
         if (c.reviewMode) f.reviewMode.value = c.reviewMode;
         if (c.maxTokens) f.maxTokens.value = c.maxTokens;
+        // 回填顾问总开关：**必须回填**——checkbox 默认未勾选，
+        // 若不回填，用户打开面板看到"未启用"、一点保存就把顾问静默关掉。
+        const enEl = document.getElementById('zca-enabled');
+        if (enEl) enEl.checked = c.enabled !== false;
       }
     } catch (err) {
       // 网络层失败才可能是"外挂未运行"；此时把原因也带上，便于排查

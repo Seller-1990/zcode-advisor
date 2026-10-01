@@ -585,12 +585,8 @@ test('inject.js：面板含顾问开关，且随保存载荷提交 startEnabled'
 
   const en = dom.byId.get('zca-enabled');
   assert.ok(en, '面板应有顾问开关 #zca-enabled');
-  console.error('[dbg] en.tagName=', en.tagName, '| en.checked 初值=', en.checked, '| 身份稳定=', dom.document.getElementById('zca-enabled') === en);
   en.checked = false;   // 关闭
-  console.error('[dbg] 设置后 en.checked=', en.checked);
   await panel.querySelector('#zca-save')._listeners.click[0]();
-
-  console.error('[dbg] saved=', JSON.stringify(saved));
   // /api/config 会被多次调用（refreshStatus 与 save 都走它），
   // 带非空 body 的那次才是保存请求——不能断言 saved[0]。
   const savePayloads = saved.filter((p) => Object.keys(p).length > 0);

@@ -2,6 +2,9 @@
 
 ZCode（z.ai CLI）插件：**每轮被动审查对话增量的独立审查副模型**。本插件是 [dsh-advisor](https://github.com/omdsh-dev/dsh-advisor)（omp "advisor" 子系统的 DeepSeek Harness 移植）在 zcode 端的对应实现：一个独立配置的审查模型观察主会话转录，在每轮结束时评审"继续做下去是否明显有问题"，并把 nit / concern / blocker 三级建议注回会话。
 
+> **AI 协作者 / 新维护者**：先读 [ARCHITECTURE.md](./ARCHITECTURE.md)——三形态职责边界、
+> 事件生命周期、状态归属、部署链路与已知局限都在那里，能避免"只看片段就下判断"。
+
 **advisory-only 纪律**（与上游一致）：审查副模型从不批准/否决主模型的动作，从不代行操作；每条送达的意见都带 `[advisor:*]` 前缀并以"仅供参考"框架自述。故障有界：错误分类计入 `Dropped` 统计并安静退出，绝不拖垮主会话（被宿主强杀的进程无法自行计数，见"局限"）。
 
 ```
