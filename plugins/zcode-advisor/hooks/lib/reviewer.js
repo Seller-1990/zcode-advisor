@@ -198,10 +198,14 @@ function normalizeChatEndpoint(baseUrl) {
 // 重试只使用剩余预算，否则 sync 模式下"首次响应慢 + 重试全额"会突破 Stop hook 的 320s 硬限，
 // 复活"强杀→指针不推进→每轮重审"的停滞循环。
 async function callReviewer(params) {
-  const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, signal } = params;
+  const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, signal, deadline: deadlineParam } = params;
   const endpoint = normalizeChatEndpoint(baseUrl);
 
-  const deadline = Date.now() + timeoutMs;
+  // 截止时间可由调用方传入：一轮审查内的多次调用（尤其"空响应重试"）必须共享同一预算。
+  // 不传时各自起算——那样"首次慢 + 重试全额"可达 2×timeoutMs，突破 Stop hook 的 320s 硬限，
+  // 复活"强杀→指针不推进→每轮重审"的停滞循环（审计报告 A2）。与本函数内 429/5xx 重试
+  // 共享 deadline 的纪律保持一致。
+  const deadline = Number.isFinite(deadlineParam) ? deadlineParam : Date.now() + timeoutMs;
   const remaining = () => deadline - Date.now();
   const RETRY_BACKOFF_MS = 1500;
 
@@ -235,6 +239,8 @@ async function callReviewer(params) {
 
   let resp = null;
   for (let tries = 0; tries < 2; tries++) {
+    // 预算已被上一轮（或调用方传进来的 deadline）耗尽：不再发起注定超时的请求。
+    if (remaining() < 1000) return { error: 'llm_timeout' };
     try {
       resp = await attempt(remaining());
     } catch (err) {

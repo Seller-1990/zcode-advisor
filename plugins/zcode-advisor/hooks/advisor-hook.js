@@ -122,6 +122,22 @@ function mockFrame(cfg) {
   return parseFrame(JSON.stringify(frame), cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
 }
 
+// 结构化审查日志（默认关闭）：ZCODE_ADVISOR_DEBUG=1 时按行追加到 <stateDir>/review.log。
+// 目的：把"审查失败只能通过 /advisor-status 的计数间接观察"变成可回溯单次失败原因
+// （error 分类 + requestId + 耗时 + 模型）。默认零常驻 IO（审计报告 B10）。
+function logReview(cfg, entry) {
+  if (process.env.ZCODE_ADVISOR_DEBUG !== '1') return;
+  try {
+    const dir = resolveStateDir(cfg);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.appendFileSync(
+      path.join(dir, 'review.log'),
+      JSON.stringify(Object.assign({ ts: new Date().toISOString() }, entry)) + '\n',
+      { encoding: 'utf8', mode: 0o600 }
+    );
+  } catch (_) { /* 日志是辅助功能，失败不影响审查 */ }
+}
+
 async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock) {
   if (process.env.ZCODE_ADVISOR_MOCK === '1' && allowMock) {
     const frame = mockFrame(cfg);
@@ -129,6 +145,11 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
     return { frame };
   }
   const systemPrompt = cfg.systemPrompt && cfg.systemPrompt.trim() ? cfg.systemPrompt : DEFAULT_SYSTEM_PROMPT;
+  // **整轮共享同一截止时间**：空响应重试也复用它，保证单轮审查总耗时 ≤ reviewTimeoutMs
+  // （早期实现每次重试各自起算 → 最坏 2×reviewTimeoutMs，sync 模式下会突破 Stop hook
+  // 的 320s 硬超时。审计报告 A2）。
+  const deadline = Date.now() + cfg.reviewTimeoutMs;
+  const t0 = Date.now();
   const reviewParams = {
     baseUrl: cfg.baseUrl,
     model: modelOverride || cfg.model,
@@ -137,7 +158,8 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
     userContent,
     maxTokens: cfg.maxTokens,
     temperature: cfg.temperature,
-    timeoutMs: cfg.reviewTimeoutMs
+    timeoutMs: cfg.reviewTimeoutMs,
+    deadline
   };
   let res = await callReviewer(reviewParams);
 
@@ -150,18 +172,29 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
   // content 为 null 且推理文本里也没有 JSON 帧。单纯重复请求成功率低；
   // 回灌上一步推理并明确要求"只输出 JSON"后显著改善（实测 2/3 → 3/4）。
   for (let attempt = 0; attempt < 2 && res.error === 'llm_empty_response'; attempt++) {
+    // 剩余预算不足以完成一次重试：直接放弃（避免发起注定超时的请求）。
+    if (deadline - Date.now() < 10000) break;
     const carry = res.reasoningText
       ? `\n\n【你上一步的分析（供参考，不要重复）】\n${res.reasoningText.slice(0, 3000)}\n\n请基于以上分析，只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}。不要输出任何其他文字。`
       : '\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）';
+    // 复用同一 deadline（见上）：重试只花剩余预算，不重新起算
     res = await callReviewer(Object.assign({}, reviewParams, {
       userContent: `${userContent}${carry}`,
       // 重试时温度归零，减少发散
       temperature: 0
     }));
   }
-  if (res.error) return { error: res.error, usage: res.usage, hint: res.hint };
+  const meta = { model: reviewParams.model, ms: Date.now() - t0, requestId: hashId(userContent) };
+  if (res.error) {
+    logReview(cfg, Object.assign({ kind: 'error', error: res.error, hint: res.hint || '' }, meta));
+    return { error: res.error, usage: res.usage, hint: res.hint };
+  }
   const frame = parseFrame(res.text, cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
-  if (!frame) return { error: 'unparsed', usage: res.usage };
+  if (!frame) {
+    logReview(cfg, Object.assign({ kind: 'unparsed' }, meta));
+    return { error: 'unparsed', usage: res.usage };
+  }
+  logReview(cfg, Object.assign({ kind: 'frame', severity: frame.severity }, meta));
   return { frame, usage: res.usage };
 }
 

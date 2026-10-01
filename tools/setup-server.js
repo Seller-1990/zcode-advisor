@@ -36,6 +36,13 @@ function saveUserConfig(patch) {
     const v = String(patch[k] || '').trim();
     if (v && !isPlaceholderKey(v)) allowed[k] = v;
   }
+  // maxTokens 必须与其余字段走**同一次** read-modify-write：早期实现把它当作补丁，
+  // 在 writeUserConfig 之后再读一次文件、再写一次（两次独立 RMW + 两处重复校验），
+  // 既与 config-bridge 的合并语义分叉，也留下「后写覆盖先写」的窗口（审计报告 A1）。
+  if (patch.maxTokens != null) {
+    const mt = parseInt(patch.maxTokens, 10);
+    if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) allowed.maxTokens = mt;
+  }
   return writeUserConfig(allowed);
 }
 
@@ -168,20 +175,7 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       try {
         const patch = JSON.parse(body || '{}');
-        if (patch.maxTokens != null) {
-          const mt = parseInt(patch.maxTokens, 10);
-          if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) patch.maxTokens = mt;
-          else delete patch.maxTokens;
-        }
         const r = saveUserConfig(patch);
-        // maxTokens 保存到 maxTokens 键（用户级配置与 hook 配置同名同义）
-        if (patch.maxTokens != null) {
-          const cur = readUserConfig();
-          cur.maxTokens = patch.maxTokens;
-          const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
-          fs.writeFileSync(tmp, JSON.stringify(cur, null, 2), 'utf8');
-          fs.renameSync(tmp, USER_CONFIG);
-        }
         send(200, { ok: true, file: r.file });
       } catch (err) {
         send(500, { ok: false, error: String(err).slice(0, 200) });

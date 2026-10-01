@@ -56,12 +56,33 @@ function check() {
   return diffs;
 }
 
+// 只复制**内容不同**的文件，内容相同则保留目标文件的 mtime。
+//
+// 为什么不用 fs.cpSync(force)：Windows 上 core.autocrlf=true 时，内容与索引完全一致、
+// 只是被重新写过的文件会让 `git status` 伪报 " M"（w/lf 与检出预期不符），
+// 表现为"同步后出现零内容差异的 modified"（审计报告 A5）。
+// 跳过相同内容即可从根上消除这类噪音，同时让同步保持真正的幂等。
+function copyIfChanged(src, dest) {
+  let st;
+  try { st = fs.statSync(src); } catch (_) { return; }
+  if (st.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const name of fs.readdirSync(src)) copyIfChanged(path.join(src, name), path.join(dest, name));
+    return;
+  }
+  try {
+    if (fs.readFileSync(dest).equals(fs.readFileSync(src))) return;   // 内容一致：不动目标文件
+  } catch (_) { /* 目标缺失/不可读：走复制分支 */ }
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.copyFileSync(src, dest);
+}
+
 function sync() {
   fs.mkdirSync(DEST, { recursive: true });
   for (const item of ITEMS) {
     const src = path.join(ROOT, item);
     if (!fs.existsSync(src)) continue;
-    fs.cpSync(src, path.join(DEST, item), { recursive: true, force: true });
+    copyIfChanged(src, path.join(DEST, item));
   }
 }
 
