@@ -100,6 +100,9 @@ function main() {
 
   const steps = [
     ['plugins', 'marketplace', 'add', payload],
+    // 必须 update：宿主把市场内容快照到自己的缓存目录，install 从快照拷贝。
+    // 不 update 会装出旧代码（实测踩过：修复未进入宿主 cache，顾问仍空转）。
+    ['plugins', 'marketplace', 'update', 'zcode-advisor-local'],
     ['plugins', 'install', 'zcode-advisor'],
     ['plugins', 'enable', 'zcode-advisor']
   ];

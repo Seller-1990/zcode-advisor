@@ -54,11 +54,20 @@ run_cli() {
 echo "✓ ZCode CLI: $ZC"
 echo "✓ Node:      $($NODE_BIN -v)（$NODE_BIN）"
 
+# 同步 plugins/<name>/（宿主市场布局要求的子目录）——避免"改了根目录却装出旧代码"
+"$NODE_BIN" "$ROOT/tools/sync-plugin-dir.cjs" 2>&1 | sed 's/^/  /'
+
 # 3) 注册本地市场（幂等：重复 add 会被 CLI 以同名提示）
 echo "── 注册本地插件市场 ──"
 run_cli plugins marketplace add "$ROOT" 2>&1 | grep -vE "^$" | head -3
 
-# 4) 安装插件（从本目录内容安装，更新场景重复运行即可）
+# 4) 刷新市场缓存（**必须**）——宿主会把市场内容快照到自己的缓存目录，
+#    install 从该快照拷贝，因此不 update 就会装出旧代码（实测踩过：
+#    no_transcript 修复未进入宿主 cache，顾问仍空转）。
+echo "── 刷新市场缓存 ──"
+run_cli plugins marketplace update zcode-advisor-local 2>&1 | tail -1
+
+# 5) 安装插件（从刷新后的市场缓存安装）
 echo "── 安装插件 ──"
 if ! run_cli plugins install zcode-advisor 2>&1 | tail -2; then
   echo "错误：插件安装失败（见上方输出）" >&2
@@ -70,6 +79,7 @@ echo "── 启用插件 ──"
 run_cli plugins enable zcode-advisor 2>&1 | tail -1
 
 # 6) 验证：宿主应报告 hooks(3)/mcp(config-bridge)/commands 已加载
+#    （若 cache 与源目录 md5 不一致，说明市场缓存未刷新成功）
 echo "── 验证 ──"
 run_cli plugins list 2>&1 | grep -A2 "zcode-advisor@" | head -3 || \
   echo "警告：未能从 plugins list 确认（请手动运行 plugins list 核对）" >&2

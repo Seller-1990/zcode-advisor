@@ -24,7 +24,7 @@ const {
 } = require('./lib/config');
 const {
   ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, loadState, mutateStateExclusive,
-  createLock, clearLock, clearLockIfOwner, lockPathFor, countLocks
+  createLock, clearLock, clearLockIfOwner, lockPathFor, countLocks, sanitizeSessionId
 } = require('./lib/state');
 const {
   readDelta, renderDelta
@@ -276,10 +276,48 @@ function onStopAsync(ctx) {
     s.lastActivity = new Date().toISOString();
   });
 
+  // —— 转录快照（ZCode 宿主契约适配）——
+  // ZCode 给 hook 的 transcript_path 是**每轮临时快照**（/var/folders/.../T/zcode-*-hook-*/），
+  // Stop 返回后即被清理。async 的 worker 在 hook 退出后才读 → 必然 no_transcript
+  // （实测：reviews=0 全部丢弃于此）。因此 Stop 侧在 spawn 之前**同步读增量并快照**，
+  // worker 改读快照文件。
+  let snapshotPath = '';
+  try {
+    const cur = loadState(file);
+    if (cur && cur.transcriptPath && fs.existsSync(cur.transcriptPath)) {
+      const snapDir = path.join(stateDir, 'snapshots');
+      // 权限 0o700：快照含完整转录（可能有源码/密钥），仅属主可读
+      fs.mkdirSync(snapDir, { recursive: true, mode: 0o700 });
+      // 文件名净化：sessionId 来自 hook stdin，未净化可被 "../../x" 路径穿越
+      const snapFile = path.join(snapDir, `${sanitizeSessionId(sessionId)}.jsonl`);
+      fs.copyFileSync(cur.transcriptPath, snapFile);
+      // **复制成功后才赋值**：若后续清理抛错，不能让 worker 拿到"已赋值但可能不完整"的路径
+      snapshotPath = snapFile;
+      fs.chmodSync(snapFile, 0o600);
+
+      // 防堆积：保留最近 N 个（N 至少容纳在飞 worker 数，避免删掉正在被读的快照）
+      // worker 是 detached 异步读取，保留窗口必须大于并发上限
+      const keep = Math.max(10, (cfg.maxGlobalWorkers || 4) + 6);
+      const snaps = fs.readdirSync(snapDir).map((n) => {
+        try { return { n, t: fs.statSync(path.join(snapDir, n)).mtimeMs }; } catch (_) { return null; }
+      }).filter(Boolean).sort((a, b) => b.t - a.t);
+      for (const oldSnap of snaps.slice(keep)) {
+        // 绝不删除本轮刚写的快照
+        if (path.join(snapDir, oldSnap.n) === snapFile) continue;
+        try { fs.unlinkSync(path.join(snapDir, oldSnap.n)); } catch (_) {}
+      }
+    }
+  } catch (_) {
+    // 快照失败：清空路径，让 worker 退回原路径（会记 no_transcript，但不会拿到坏路径）
+    snapshotPath = '';
+  }
+
   // 测试/调试钩子：跳过真实派生，由外部直接调 review-worker。
   if (process.env.ZCODE_ADVISOR_NO_SPAWN === '1') return;
 
-  const child = spawn(process.execPath, [__filename, 'review-worker', '--state', file], {
+  const workerArgs = ['review-worker', '--state', file];
+  if (snapshotPath) workerArgs.push('--transcript', snapshotPath);
+  const child = spawn(process.execPath, [__filename, ...workerArgs], {
     detached: true,
     stdio: 'ignore',
     cwd: PLUGIN_ROOT,
@@ -465,6 +503,12 @@ async function handleReviewWorker(args) {
   const file = idx !== -1 ? args[idx + 1] : '';
   if (!file) return;
 
+  // --transcript：Stop 侧把转录快照到持久目录后传来的路径。
+  // ZCode 的原 transcript_path 是每轮临时快照（Stop 返回即删），
+  // worker 延后读取必然 no_transcript——快照优先。
+  const snapIdx = args.indexOf('--transcript');
+  const transcriptOverride = snapIdx !== -1 ? args[snapIdx + 1] : '';
+
   const cfg = loadConfig(PLUGIN_ROOT, process.env);
   const apiKeyInfo = resolveApiKey(cfg, process.env);
   const myPid = String(process.pid);
@@ -491,10 +535,21 @@ async function handleReviewWorker(args) {
     }
     state.disabledReason = '';
 
-    const delta = readDelta(state.transcriptPath, state.byteOffset, {
-      expectedHeadHash: state.lastHeadHash,
-      backfillLimitBytes: cfg.backfillLimitBytes
-    });
+    // 快照模式：ZCode 每轮给 hook 的转录是**本轮完整快照**且每轮重写，
+    // 因此用快照时从 0 全量读（byteOffset 是针对持续追加文件的指针，跨轮不适用）。
+    // 代价：与上游 dsh-advisor 的"只审增量"不同，这里每轮审整轮——
+    // 换取的是 no_transcript 完全消失（该取舍已在 README 局限节声明）。
+    const usingSnapshot = Boolean(transcriptOverride);
+    const delta = readDelta(transcriptOverride || state.transcriptPath,
+      usingSnapshot ? 0 : state.byteOffset,
+      // 快照模式也应用 backfillLimitBytes：超长会话（数 MB 转录）不应整文件载入内存；
+      // 超出上限时 readDelta 从尾部回读并丢弃首个残行，语义与持续文件路径一致。
+      usingSnapshot
+        ? { backfillLimitBytes: cfg.backfillLimitBytes }
+        : {
+            expectedHeadHash: state.lastHeadHash,
+            backfillLimitBytes: cfg.backfillLimitBytes
+          });
     if (delta.missing) {
       mutateStateExclusive(file, (s) => {
         bumpDrop(s, 'no_transcript');
@@ -535,8 +590,12 @@ async function handleReviewWorker(args) {
     // 最终落盘：短临界区内重读最新状态、只写自己拥有的字段——
     // 审查期间 UPS/ctl 的修改（清队列、off、model set）不会被旧快照覆盖。
     mutateStateExclusive(file, (s) => {
-      s.byteOffset = delta.nextOffset;
-      s.lastHeadHash = delta.headHash;
+      if (!usingSnapshot) {
+        // 持续文件路径（Claude Code 同构宿主）：正常推进增量指针
+        s.byteOffset = delta.nextOffset;
+        s.lastHeadHash = delta.headHash;
+      }
+      // 快照模式：不推进指针、不改 transcriptPath——每轮快照独立全量审。
       s.reviews = (s.reviews || 0) + 1;
       s.lastActivity = new Date().toISOString();
       accumulateUsage(s, result);

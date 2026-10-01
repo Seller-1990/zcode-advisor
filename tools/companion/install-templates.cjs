@@ -98,6 +98,11 @@ mkdir -p "$SUPPORT/bin" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ${runtimeFiles.map((f) => `[ -f "$SRC/${f}" ] || { echo "[错误] 发行包缺少 ${f}" >&2; exit 1; }`).join('\n')}
 ${runtimeFiles.map((f) => `cp -f "$SRC/${f}" "$SUPPORT/"`).join('\n')}
 
+# 同步插件子目录并自动启用插件（通过 ZCode 官方 CLI）
+if [ -f "$SRC/tools/sync-plugin-dir.cjs" ]; then
+  "$SUPPORT/bin/node" "$SRC/tools/sync-plugin-dir.cjs" 2>/dev/null || true
+fi
+
 # Node 运行时：优先用包内内嵌，其次回退系统 node（并明确告知）。
 # 注意：set -e 对 cp 在命令替换赋值位置并不总是生效，故显式校验结果，
 # 避免复制失败却仍写出指向缺失文件的启动器、最后打印"安装成功"。
