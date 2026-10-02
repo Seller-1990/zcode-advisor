@@ -1,8 +1,10 @@
 'use strict';
 
-// 图标生成（零依赖）：盾牌图形 → PNG/ICO/ICNS。
-// 从 build-installer.cjs 抽出，便于单测与复用；颜色与形状保持不变。
+// 图标生成（零依赖）：优先用 assets/icon.png（用户自定义源图）缩放出各档位；
+// 源图不存在或格式不支持时回退到程序化盾牌。ICO/ICNS 的拼装结构保持不变。
 
+const fs = require('fs');
+const path = require('path');
 const zlib = require('zlib');
 
 // ---------------- 像素绘制 ----------------
@@ -95,10 +97,124 @@ function encodePng(size, rgba) {
   ]);
 }
 
+// ---------------- 外部源图（assets/icon.png）----------------
+
+// 极简 PNG 解码（8-bit、非隔行、灰度 0 / RGB 2 / RGBA 6），够图标源图用；
+// 其余格式抛错由调用方回退程序化盾牌，不在零依赖包里养完整 PNG 库。
+function decodePng(buf) {
+  const SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (buf.length < 8 || !buf.subarray(0, 8).equals(SIG)) throw new Error('not a PNG');
+  let off = 8;
+  let width = 0; let height = 0; let colorType = -1; let bitDepth = -1;
+  const idat = [];
+  while (off + 8 <= buf.length) {
+    const len = buf.readUInt32BE(off);
+    const type = buf.toString('ascii', off + 4, off + 8);
+    const data = buf.subarray(off + 8, off + 8 + len);
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0); height = data.readUInt32BE(4);
+      bitDepth = data[8]; colorType = data[9];
+      if (data[12] !== 0) throw new Error('interlaced PNG unsupported');
+    } else if (type === 'IDAT') {
+      idat.push(data);
+    } else if (type === 'IEND') {
+      break;
+    }
+    off += 12 + len;
+  }
+  if (bitDepth !== 8) throw new Error(`unsupported bit depth ${bitDepth}`);
+  const channels = { 0: 1, 2: 3, 6: 4 }[colorType];
+  if (!channels) throw new Error(`unsupported color type ${colorType}`);
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  // 每行首字节的滤波还原（0 None / 1 Sub / 2 Up / 3 Average / 4 Paeth）
+  const bpp = channels;
+  const paeth = (a, b, c) => {
+    const p = a + b - c; const pa = Math.abs(p - a); const pb = Math.abs(p - b); const pc = Math.abs(p - c);
+    return pa <= pb && pa <= pc ? a : (pb <= pc ? b : c);
+  };
+  const out = Buffer.alloc(width * height * 4);
+  const prev = Buffer.alloc(stride);
+  const line = Buffer.alloc(stride);
+  for (let y = 0; y < height; y++) {
+    const f = raw[y * (stride + 1)];
+    raw.copy(line, 0, y * (stride + 1) + 1, (y + 1) * (stride + 1));
+    for (let x = 0; x < stride; x++) {
+      const a = x >= bpp ? line[x - bpp] : 0;
+      const b = prev[x];
+      const c = x >= bpp ? prev[x - bpp] : 0;
+      if (f === 1) line[x] = (line[x] + a) & 0xff;
+      else if (f === 2) line[x] = (line[x] + b) & 0xff;
+      else if (f === 3) line[x] = (line[x] + ((a + b) >> 1)) & 0xff;
+      else if (f === 4) line[x] = (line[x] + paeth(a, b, c)) & 0xff;
+      else if (f > 4) throw new Error(`bad filter ${f}`);
+    }
+    line.copy(prev);
+    for (let x = 0; x < width; x++) {
+      const s = x * channels;
+      const d = (y * width + x) * 4;
+      if (colorType === 2) { out[d] = line[s]; out[d + 1] = line[s + 1]; out[d + 2] = line[s + 2]; out[d + 3] = 255; }
+      else if (colorType === 6) { out[d] = line[s]; out[d + 1] = line[s + 1]; out[d + 2] = line[s + 2]; out[d + 3] = line[s + 3]; }
+      else { out[d] = out[d + 1] = out[d + 2] = line[s]; out[d + 3] = 255; } // 灰度
+    }
+  }
+  return { width, height, rgba: out };
+}
+
+// 双线性缩放到正方形（图标档位），边缘 clamp。
+function resampleSquare(src, size) {
+  const { width: w, height: h, rgba } = src;
+  const out = Buffer.alloc(size * size * 4);
+  const px = (x, y) => {
+    const cx = Math.max(0, Math.min(w - 1, x));
+    const cy = Math.max(0, Math.min(h - 1, y));
+    return (cy * w + cx) * 4;
+  };
+  for (let y = 0; y < size; y++) {
+    const gy = ((y + 0.5) * h) / size - 0.5;
+    const y0 = Math.floor(gy); const fy = gy - y0;
+    for (let x = 0; x < size; x++) {
+      const gx = ((x + 0.5) * w) / size - 0.5;
+      const x0 = Math.floor(gx); const fx = gx - x0;
+      const d = (y * size + x) * 4;
+      for (let ch = 0; ch < 4; ch++) {
+        const p00 = rgba[px(x0, y0) + ch];
+        const p10 = rgba[px(x0 + 1, y0) + ch];
+        const p01 = rgba[px(x0, y0 + 1) + ch];
+        const p11 = rgba[px(x0 + 1, y0 + 1) + ch];
+        out[d + ch] = Math.round(
+          p00 * (1 - fx) * (1 - fy) + p10 * fx * (1 - fy) + p01 * (1 - fx) * fy + p11 * fx * fy
+        );
+      }
+    }
+  }
+  return out;
+}
+
+// 读 assets/icon.png（相对仓库根，icon.cjs 位于 tools/companion/ 下）。
+// 不存在或解码失败返回 null——调用方回退程序化盾牌，构建绝不因图标中断。
+let sourceIconCache = null;
+function loadSourceIcon() {
+  if (sourceIconCache !== null) return sourceIconCache;
+  try {
+    const file = path.resolve(__dirname, '..', '..', 'assets', 'icon.png');
+    sourceIconCache = decodePng(fs.readFileSync(file));
+  } catch (_) {
+    sourceIconCache = false;
+  }
+  return sourceIconCache;
+}
+
+// 各档位像素：有源图用源图缩放，否则画盾牌。
+function iconPixels(size) {
+  const src = loadSourceIcon();
+  return src ? resampleSquare(src, size) : drawShield(size);
+}
+
 // ---------------- ICO / ICNS ----------------
 
 function makeIco() {
-  const s32 = drawShield(32);
+  const s32 = iconPixels(32);
   // 32bpp BMP 的像素通道顺序是 **BGRA**（不是 RGBA）——写反会使红色/蓝色互换。
   // 早期实现直接拷贝 RGBA 缓冲区，Windows 取 32×32 档时会显示成红色盾牌
   // （macOS sips 同样按 BGRA 解读，可复现该错误）。
@@ -121,7 +237,7 @@ function makeIco() {
   bmpHeader.writeUInt16LE(1, 12); bmpHeader.writeUInt16LE(32, 14);
   bmpHeader.writeUInt32LE(xor.length + and.length, 20);
   const bmp = Buffer.concat([bmpHeader, xor, and]);
-  const png256 = encodePng(256, drawShield(256));
+  const png256 = encodePng(256, iconPixels(256));
 
   const entries = [];
   entries.push({ size: 32, data: bmp });
@@ -159,7 +275,7 @@ const ICNS_SIZES = [
 function makeIcns() {
   const chunks = [];
   for (const [type, size] of ICNS_SIZES) {
-    const png = encodePng(size, drawShield(size));
+    const png = encodePng(size, iconPixels(size));
     const typeBuf = Buffer.from(type, 'ascii');
     const len = Buffer.alloc(4); len.writeUInt32BE(png.length + 8);
     chunks.push(Buffer.concat([typeBuf, len, png]));
@@ -170,4 +286,4 @@ function makeIcns() {
   return Buffer.concat([head, total, body]);
 }
 
-module.exports = { drawShield, encodePng, makeIco, makeIcns, crc32, ICNS_SIZES };
+module.exports = { drawShield, encodePng, makeIco, makeIcns, crc32, ICNS_SIZES, decodePng, resampleSquare, loadSourceIcon, iconPixels };
