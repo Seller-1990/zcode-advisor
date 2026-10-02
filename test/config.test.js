@@ -5,7 +5,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { loadConfig, resolveApiKey, gate, configWarnings, isPlaceholderKey, SYNC_TIMEOUT_CAP_MS } = require('../hooks/lib/config');
+const { loadConfig, resolveApiKey, gate, configWarnings, isPlaceholderKey, listZcodeProviders, SYNC_TIMEOUT_CAP_MS } = require('../hooks/lib/config');
 
 function tmpRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-cfg-'));
@@ -114,4 +114,115 @@ test('配置警告：非本机 http 端点、共享 env key 发往非签发方',
     { baseUrl: 'https://open.bigmodel.cn/api/paas/v4/chat/completions' },
     { key: 'k', source: 'env:ZAI_API_KEY' }
   ).length, 0);
+});
+
+// —— apiSource=zcode：读取 ZCode 已维护的第三方 API ——
+
+// 造一个 ZCode v2 config 形状的 fixture（provider.<id> = { name, kind, options, models }）
+function zcodeFixtureFile(dir) {
+  const file = path.join(dir, 'v2-config.json');
+  fs.writeFileSync(file, JSON.stringify({
+    provider: {
+      'prov-3p': {
+        name: '第三方网关',
+        kind: 'openai-compatible',
+        options: { baseURL: 'http://192.168.50.139:8088/v1', apiKey: 'sk-3p-key' },
+        models: { 'glm-5.3-flash': {}, 'kimi-k3': {} }
+      },
+      'prov-anthropic': {
+        name: 'Anthropic 中转',
+        kind: 'anthropic',
+        options: { baseURL: 'https://relay.example.com', apiKey: 'sk-ant' },
+        models: { 'claude-opus-5': {} }
+      }
+    }
+  }));
+  return file;
+}
+
+test('apiSource=zcode：provider 解析覆盖 baseUrl/apiKey/model，模型留空取列表首项', () => {
+  const root = tmpRoot();
+  const dir = tmpRoot();
+  const file = zcodeFixtureFile(dir);
+  fs.writeFileSync(path.join(root, 'advisor.config.json'), JSON.stringify({
+    apiSource: 'zcode',
+    zcodeProvider: 'prov-3p',
+    baseUrl: 'http://manual.example/v1',
+    apiKey: 'manual-key'
+  }));
+  const cfg = loadConfig(root, hermeticEnv({ ZCODE_ADVISOR_ZCODE_CONFIG: file }));
+  assert.strictEqual(cfg.baseUrl, 'http://192.168.50.139:8088/v1');
+  assert.strictEqual(cfg.apiKey, 'sk-3p-key');
+  assert.strictEqual(cfg.model, 'glm-5.3-flash'); // zcodeModel 留空 → 列表首项
+  assert.strictEqual(cfg.apiSource, 'zcode');
+  assert.match(cfg.apiSourceLabel, /ZCode 已维护（第三方网关）/);
+  assert.ok(cfg.configSources.includes('zcode-provider:第三方网关'));
+  const keyInfo = resolveApiKey(cfg, {});
+  assert.strictEqual(keyInfo.key, 'sk-3p-key');
+  assert.strictEqual(keyInfo.source, 'config');
+});
+
+test('apiSource=zcode：显式 zcodeModel 即使不在列表也尊重（列表可能滞后）', () => {
+  const root = tmpRoot();
+  const file = zcodeFixtureFile(tmpRoot());
+  fs.writeFileSync(path.join(root, 'advisor.config.json'), JSON.stringify({
+    apiSource: 'zcode', zcodeProvider: 'prov-3p', zcodeModel: 'deepseek-v4-pro-0813'
+  }));
+  const cfg = loadConfig(root, hermeticEnv({ ZCODE_ADVISOR_ZCODE_CONFIG: file }));
+  assert.strictEqual(cfg.model, 'deepseek-v4-pro-0813');
+});
+
+test('apiSource=zcode：环境变量仍优先于 zcode 解析（env 是显式覆盖）', () => {
+  const root = tmpRoot();
+  const file = zcodeFixtureFile(tmpRoot());
+  fs.writeFileSync(path.join(root, 'advisor.config.json'), JSON.stringify({
+    apiSource: 'zcode', zcodeProvider: 'prov-3p'
+  }));
+  const cfg = loadConfig(root, hermeticEnv({ ZCODE_ADVISOR_ZCODE_CONFIG: file, ZCODE_ADVISOR_MODEL: 'env-model' }));
+  assert.strictEqual(cfg.model, 'env-model');
+  assert.strictEqual(cfg.baseUrl, 'http://192.168.50.139:8088/v1');
+});
+
+test('apiSource=zcode：provider 缺失/协议不兼容时沿用手动值并挂 problems（降级不静默）', () => {
+  const root = tmpRoot();
+  const file = zcodeFixtureFile(tmpRoot());
+  fs.writeFileSync(path.join(root, 'advisor.config.json'), JSON.stringify({
+    apiSource: 'zcode', zcodeProvider: 'prov-anthropic',
+    baseUrl: 'http://manual.example/v1', model: 'manual-model', apiKey: 'manual-key'
+  }));
+  const cfg = loadConfig(root, hermeticEnv({ ZCODE_ADVISOR_ZCODE_CONFIG: file }));
+  assert.strictEqual(cfg.baseUrl, 'http://manual.example/v1');
+  assert.strictEqual(cfg.model, 'manual-model');
+  assert.ok(cfg.problems.some((p) => p.startsWith('zcode_provider_ineligible')));
+
+  // zcodeProvider 未指定：找不到 → 登记 missing（换干净的插件目录，避免上层配置残留 provider）
+  const userCfg = path.join(tmpRoot(), 'user-zcode.json');
+  fs.writeFileSync(userCfg, JSON.stringify({ apiSource: 'zcode' }));
+  const cfg2 = loadConfig(tmpRoot(), hermeticEnv({
+    ZCODE_ADVISOR_ZCODE_CONFIG: file,
+    ZCODE_ADVISOR_USER_CONFIG: userCfg
+  }));
+  assert.ok(cfg2.problems.some((p) => p.startsWith('zcode_provider_missing')));
+});
+
+test('apiSource 脏值归一为 manual 并登记', () => {
+  const root = tmpRoot();
+  fs.writeFileSync(path.join(root, 'advisor.config.json'), JSON.stringify({ apiSource: 'ZCODE2' }));
+  const cfg = loadConfig(root, hermeticEnv());
+  assert.strictEqual(cfg.apiSource, 'manual');
+  assert.strictEqual(cfg.apiSourceLabel, '手动维护');
+  assert.ok(cfg.problems.some((p) => p.startsWith('config_normalized')));
+});
+
+test('listZcodeProviders：剔除 apiKey 明文并给出 eligible/hasApiKey 标记', () => {
+  const file = zcodeFixtureFile(tmpRoot());
+  const list = listZcodeProviders({ ZCODE_ADVISOR_ZCODE_CONFIG: file });
+  assert.strictEqual(list.length, 2);
+  const p3p = list.find((p) => p.id === 'prov-3p');
+  assert.strictEqual(p3p.eligible, true);
+  assert.strictEqual(p3p.hasApiKey, true);
+  assert.strictEqual('apiKey' in p3p, false, '列表不得携带 apiKey 明文');
+  assert.deepStrictEqual(p3p.models, ['glm-5.3-flash', 'kimi-k3']);
+  const pant = list.find((p) => p.id === 'prov-anthropic');
+  assert.strictEqual(pant.eligible, false);
 });

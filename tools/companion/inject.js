@@ -42,29 +42,52 @@
 .zca-badge.zca-topbar-badge{width:auto;height:28px;padding:0 10px;border-radius:8px;gap:6px;
  border:1px solid rgba(127,127,127,.28);background:rgba(127,127,127,.10);opacity:.9;font-size:12px}
 .zca-badge.zca-topbar-badge .zca-label-text{font-weight:500;letter-spacing:.2px}
-.zca-panel{position:fixed;width:360px;max-height:76vh;overflow:auto;z-index:2147483001;
+.zca-panel{position:fixed;width:320px;max-height:76vh;overflow:auto;z-index:2147483001;
  right:16px;bottom:140px;
- background:#1c1f26;color:#e6e8ec;border:1px solid #333842;border-radius:14px;padding:14px 16px 16px;
- box-shadow:0 14px 40px rgba(0,0,0,.45);font:13px/1.55 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
-.zca-panel h3{margin:0 0 10px;font-size:14px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+ background:#1c1f26;color:#e6e8ec;border:1px solid #333842;border-radius:14px;padding:12px 14px 14px;
+ box-shadow:0 14px 40px rgba(0,0,0,.45);font:12.5px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.zca-panel h3{margin:0 0 8px;font-size:13.5px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
 .zca-close{cursor:pointer;color:#8b94a3;font-size:15px;line-height:1;padding:4px 6px;border-radius:6px}
 .zca-close:hover{background:rgba(127,127,127,.16);color:#e6e8ec}
-.zca-label{display:block;margin:10px 0 4px;color:#8b94a3;font-size:12px}
-.zca-panel input,.zca-panel select{width:100%;box-sizing:border-box;padding:7px 9px;border-radius:8px;
- border:1px solid #333842;background:#242833;color:#e6e8ec;font-size:13px;outline:none}
+.zca-label{display:block;margin:8px 0 3px;color:#8b94a3;font-size:12px}
+.zca-panel input,.zca-panel select{width:100%;box-sizing:border-box;padding:6px 8px;border-radius:8px;
+ border:1px solid #333842;background:#242833;color:#e6e8ec;font-size:12.5px;outline:none}
 .zca-panel input:focus,.zca-panel select:focus{border-color:#3b82f6}
 .zca-panel select option{background:#242833;color:#e6e8ec}
-.zca-row{display:flex;gap:8px;margin-top:14px}
-.zca-btn{flex:1;padding:8px 0;border:1px solid transparent;border-radius:8px;cursor:pointer;font-size:13px;
+.zca-row{display:flex;gap:8px;margin-top:12px}
+.zca-btn{flex:1;padding:7px 0;border:1px solid transparent;border-radius:8px;cursor:pointer;font-size:12.5px;
  background:#2563eb;color:#fff;transition:filter .15s}
 .zca-btn:hover{filter:brightness(1.08)}
 .zca-btn.alt{background:#2c313c;color:#e6e8ec;border-color:#3a4049}
-.zca-msg{margin-top:10px;padding:8px 10px;border-radius:8px;display:none;white-space:pre-wrap;font-size:12px}
+.zca-msg{margin-top:8px;padding:7px 9px;border-radius:8px;display:none;white-space:pre-wrap;font-size:12px}
 .zca-ok{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.35);color:#6ee7b7}
 .zca-bad{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:#fca5a5}
-.zca-status{margin:0 0 4px;padding:7px 9px;background:#242833;border-radius:8px;color:#8b94a3;font-size:12px;word-break:break-all}
+.zca-status{margin:0 0 8px;padding:6px 9px;background:#242833;border-radius:8px;color:#8b94a3;font-size:12px;word-break:break-all}
+/* 启用开关：面板正文第一行的独立控件。曾在标题栏里挤着——难点中、又像关闭按钮的邻居（位置不对的来源） */
+.zca-toggle-row{display:flex;align-items:center;justify-content:space-between;
+ padding:7px 10px;background:#242833;border-radius:8px}
+.zca-switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
+.zca-switch input{position:absolute;opacity:0;width:0;height:0}
+.zca-track{width:30px;height:17px;border-radius:9px;background:#4a5160;position:relative;transition:background .15s;flex:0 0 auto}
+.zca-thumb{position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:#e6e8ec;transition:left .15s}
+.zca-switch input:checked ~ .zca-track{background:#2563eb}
+.zca-switch input:checked ~ .zca-track .zca-thumb{left:15px}
+.zca-switch-text{font-size:12.5px;font-weight:500;color:#e6e8ec}
+/* API 来源分段切换：ZCode 已维护 / 手动维护 */
+.zca-seg{display:flex;background:#242833;border-radius:8px;padding:2px;gap:2px;margin-top:2px}
+.zca-seg button{flex:1;padding:6px 0;border:0;border-radius:6px;background:transparent;color:#8b94a3;
+ font-size:12px;cursor:pointer;transition:background .12s,color .12s}
+.zca-seg button.on{background:#2563eb;color:#fff}
+.zca-seg button:not(.on):hover{color:#e6e8ec;background:rgba(127,127,127,.12)}
+/* 高级区折叠：审查模式/max_tokens 低频项，折起以压缩默认占地 */
+.zca-adv{margin-top:10px;border-top:1px solid #333842;padding-top:6px}
+.zca-adv summary{cursor:pointer;color:#8b94a3;font-size:12px;user-select:none;list-style:none}
+.zca-adv summary::-webkit-details-marker{display:none}
+.zca-adv summary::before{content:'▸ ';}
+.zca-adv[open] summary::before{content:'▾ ';}
+.zca-adv summary:hover{color:#e6e8ec}
 /* 历史记录区：折叠展示，展开后只读最近若干条 */
-.zca-history{margin-top:12px;border-top:1px solid #333842;padding-top:8px}
+.zca-history{margin-top:10px;border-top:1px solid #333842;padding-top:8px}
 .zca-history-head{display:flex;justify-content:space-between;align-items:center;cursor:pointer;color:#8b94a3;font-size:12px;user-select:none}
 .zca-history-head:hover{color:#e6e8ec}
 .zca-history-body{margin-top:6px;display:none;max-height:200px;overflow:auto}
@@ -180,6 +203,102 @@
     }
   }
 
+  // 面板运行期状态：
+  // curCfg — refreshStatus 拉到的已存配置（zcode 模式下服务商/模型预选的依据）
+  // zcodeProviders — /api/zcode-providers 缓存；null = 尚未拉取
+  // apiSource — 当前「API 来源」分段选择（manual | zcode）
+  let curCfg = null;
+  let zcodeProviders = null;
+  let apiSource = 'manual';
+
+  function setApiSource(mode) {
+    apiSource = mode === 'zcode' ? 'zcode' : 'manual';
+    const segZ = document.getElementById('zca-src-zcode');
+    const segM = document.getElementById('zca-src-manual');
+    if (segZ) segZ.className = apiSource === 'zcode' ? 'on' : '';
+    if (segM) segM.className = apiSource === 'manual' ? 'on' : '';
+    const zsec = document.getElementById('zca-zcode-sec');
+    const msec = document.getElementById('zca-manual-sec');
+    if (zsec) zsec.style.display = apiSource === 'zcode' ? 'block' : 'none';
+    if (msec) msec.style.display = apiSource === 'manual' ? 'block' : 'none';
+    const modelsBtn = document.getElementById('zca-models');
+    if (modelsBtn) modelsBtn.style.display = apiSource === 'manual' ? '' : 'none';
+    // zcode 模式首次进入才拉服务商列表（之后用缓存；切回再进也不重复请求）
+    if (apiSource === 'zcode' && !zcodeProviders) loadProviders();
+  }
+
+  async function loadProviders() {
+    const sel = document.getElementById('zca-zcode-provider');
+    if (!sel) return;
+    try {
+      const r = await api('/api/zcode-providers');
+      const list = (r && r.ok && Array.isArray(r.providers)) ? r.providers : [];
+      zcodeProviders = list;
+      const eligible = list.filter((p) => p.eligible);
+      sel.innerHTML = '';
+      if (eligible.length === 0) {
+        const o = document.createElement('option');
+        o.value = '';
+        o.textContent = '（ZCode 里暂无 OpenAI 兼容服务商）';
+        sel.appendChild(o);
+      } else {
+        for (const p of eligible) {
+          const o = document.createElement('option');
+          o.value = p.id;
+          o.textContent = p.name ? `${p.name}（${p.models.length} 模型）` : p.id;
+          sel.appendChild(o);
+        }
+      }
+      const want = curCfg && curCfg.zcodeProvider;
+      if (want && eligible.some((p) => p.id === want)) {
+        sel.value = want;
+      } else if (want) {
+        // 已存 provider 不在 eligible 列表（被改成非兼容协议/已删除/仅 name 命中）：
+        // 保留空选项并提示，绝不静默改选别的服务商——否则用户只想改个模式，
+        // 保存时 formValues() 就会把新 provider 写回覆盖原选择。审查侧此时
+        // 会按 applyZcodeSource 回退手动配置，两边口径一致。
+        sel.value = '';
+        msg('已存服务商在 ZCode 里不可用（非 OpenAI 兼容或已删除）。未替你改选；'
+          + '请手动选择服务商，或切回「手动维护」。', false);
+      } else {
+        sel.value = eligible.length > 0 ? eligible[0].id : '';
+      }
+      fillZcodeModels();
+    } catch (e) {
+      msg(`服务商列表载入失败：${e && e.message ? e.message : e}`, false);
+    }
+  }
+
+  function selectedProvider() {
+    const sel = document.getElementById('zca-zcode-provider');
+    const id = sel ? String(sel.value || '').trim() : '';
+    return (zcodeProviders || []).find((p) => p.id === id) || null;
+  }
+
+  function fillZcodeModels() {
+    const msel = document.getElementById('zca-zcode-model');
+    const hint = document.getElementById('zca-zcode-endpoint');
+    if (!msel) return;
+    const p = selectedProvider();
+    msel.innerHTML = '';
+    for (const id of (p ? p.models : [])) {
+      const o = document.createElement('option');
+      o.value = id;
+      o.textContent = id;
+      msel.appendChild(o);
+    }
+    if (!p || p.models.length === 0) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = '（该服务商未配置模型）';
+      msel.appendChild(o);
+    }
+    const want = curCfg && curCfg.zcodeModel;
+    if (want && p && p.models.includes(want)) msel.value = want;
+    else if (p && p.models.length > 0) msel.value = p.models[0]; // 显式设首项：真实 DOM 会自动选中，但显式赋值让行为不依赖该默认
+    if (hint) hint.textContent = p ? `端点：${p.baseURL || '（该服务商未配置 baseURL）'}` : '先在 ZCode 设置里添加 OpenAI 兼容服务商';
+  }
+
   async function refreshStatus() {
     try {
       const r = await api('/api/config');
@@ -197,8 +316,16 @@
         return;
       }
       const c = r.config;
+      curCfg = c;
       const st = document.getElementById('zca-status');
-      if (st) st.textContent = `模型 ${c.model || '（默认）'} ｜ key ${c.keyMasked} ｜ 模式 ${c.reviewMode || 'async'}`;
+      // zcode 模式下实际生效的是服务商端点/模型/key（审查通道按 apiSource 解析），
+      // 展示手动字段会误导（手动 key 常为「未设置」，但审查照样能用服务商 key）。
+      if (st) {
+        const zcode = c.apiSource === 'zcode';
+        const modelShown = zcode ? (c.zcodeModel || '（服务商默认）') : (c.model || '（默认）');
+        const keyShown = zcode ? '服务商 key' : c.keyMasked;
+        st.textContent = `模型 ${modelShown} ｜ key ${keyShown} ｜ 模式 ${c.reviewMode || 'async'} ｜ 来源 ${zcode ? 'ZCode' : '手动'}`;
+      }
       const f = fill();
       if (f) {
         // 模型值回填到下拉框：若 select 里没有该 id（尚未拉取或列表不含它），
@@ -221,6 +348,8 @@
         const enEl = document.getElementById('zca-enabled');
         if (enEl) enEl.checked = c.enabled !== false;
       }
+      // API 来源分段 + zcode 服务商/模型预选（loadProviders 异步取 curCfg，先赋值再切换）
+      setApiSource(c.apiSource === 'zcode' ? 'zcode' : 'manual');
     } catch (err) {
       // 网络层失败才可能是"外挂未运行"；此时把原因也带上，便于排查
       msg(`无法连接本机 controller（外挂未运行？）：${err && err.message ? err.message : err}`, false);
@@ -246,20 +375,32 @@
   }
 
   function formValues() {
+    const out = { apiSource };
     const f = fill();
-    const out = {};
-    if (!f) return out;
-    for (const k of ['baseUrl', 'reviewMode']) {
-      const v = f[k].value.trim();
-      if (v) out[k] = v;
+    // 审查模式 / max_tokens 与 API 来源无关：两个模式下都保存
+    if (f) {
+      const mt = parseInt(f.maxTokens.value, 10);
+      if (Number.isFinite(mt)) out.maxTokens = mt;
+      const rm = String(f.reviewMode.value || '').trim();
+      if (rm) out.reviewMode = rm;
     }
-    // 模型取自 select（或手动输入兜底）
-    const model = currentModelId();
-    if (model) out.model = model;
-    const mt = parseInt(f.maxTokens.value, 10);
-    if (Number.isFinite(mt)) out.maxTokens = mt;
-    const key = f.apiKey.value.trim();
-    if (key) out.apiKey = key;
+    if (apiSource === 'manual') {
+      if (f) {
+        const baseUrl = f.baseUrl.value.trim();
+        if (baseUrl) out.baseUrl = baseUrl;
+        const key = f.apiKey.value.trim();
+        if (key) out.apiKey = key;
+        // 模型取自 select（或手动输入兜底）
+        const model = currentModelId();
+        if (model) out.model = model;
+      }
+    } else {
+      // zcode 模式：不回传手动字段（保留既有手动配置，回切时仍可用）
+      const pv = document.getElementById('zca-zcode-provider');
+      const mv = document.getElementById('zca-zcode-model');
+      if (pv && String(pv.value || '').trim()) out.zcodeProvider = String(pv.value).trim();
+      if (mv && String(mv.value || '').trim()) out.zcodeModel = String(mv.value).trim();
+    }
     const en = document.getElementById('zca-enabled');
     if (en) out.startEnabled = en.checked;
     return out;
@@ -282,6 +423,8 @@
   }
 
   async function fetchModels() {
+    // zcode 模式的模型清单来自服务商数据（打开分段时已填充），不请求端点 /models
+    if (apiSource === 'zcode') return;
     try {
       msg('拉取模型列表…', true);
       const f = fill();
@@ -344,33 +487,53 @@
     p.id = 'zca-panel';
     p.style.display = 'none';
     p.innerHTML = `
-      <h3><span>🛡️ 顾问设置
-        <label class="zca-switch" title="新会话是否自动启用审查">
-          <input type="checkbox" id="zca-enabled"> <span class="zca-switch-text">启用</span>
-        </label></span>
-        <span class="zca-close" id="zca-close">✕</span></h3>
+      <h3><span>🛡️ 顾问设置</span><span class="zca-close" id="zca-close">✕</span></h3>
       <div class="zca-status" id="zca-status">读取中…</div>
-      <label class="zca-label">端点（OpenAI 兼容，支持第三方）</label>
-      <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">
-      <label class="zca-label">API key</label>
-      <input id="zca-apiKey" type="password" placeholder="留空 = 不修改已保存的 key">
-      <div class="zca-hint">清除已保存的 key 不在本面板：请到 zcode-advisor 源码目录打开本地配置面板（Windows 双击「配置面板.cmd」，macOS 运行 node tools/setup-server.js），再点「清除 API key」</div>
-      <label class="zca-label">审查模型（先点「拉取模型」填充列表，或直接手动输入）</label>
-      <select id="zca-model">
-        <option value="">（尚未拉取，请在下方手动输入）</option>
-      </select>
-      <input id="zca-model-manual" placeholder="或手动输入模型 id（拉取不到时用）" style="margin-top:6px">
-      <label class="zca-label">审查模式</label>
-      <select id="zca-reviewMode">
-        <option value="async">async（默认：零体感延迟，意见随下一条消息送达）</option>
-        <option value="sync">sync（当轮打断：concern/blocker 立即送达）</option>
-      </select>
-      <label class="zca-label">max_tokens（思考型模型建议 4096）</label>
-      <input id="zca-maxTokens" type="number" min="64" max="16384">
+      <div class="zca-toggle-row">
+        <label class="zca-switch" title="新会话是否自动启用审查">
+          <input type="checkbox" id="zca-enabled">
+          <span class="zca-track"><span class="zca-thumb"></span></span>
+          <span class="zca-switch-text">启用顾问</span>
+        </label>
+      </div>
+      <label class="zca-label">API 来源</label>
+      <div class="zca-seg" id="zca-apiSource">
+        <button type="button" id="zca-src-zcode" title="读取并使用 ZCode 设置里已维护的第三方 API，一处维护两处生效">ZCode 已维护</button>
+        <button type="button" id="zca-src-manual" title="在本面板手动维护端点 / key / 模型">手动维护</button>
+      </div>
+      <div id="zca-zcode-sec" style="display:none">
+        <label class="zca-label">服务商（来自 ZCode 设置）</label>
+        <select id="zca-zcode-provider"><option value="">（载入中…）</option></select>
+        <label class="zca-label">模型</label>
+        <select id="zca-zcode-model"><option value="">（选择服务商后填充）</option></select>
+        <div class="zca-hint" id="zca-zcode-endpoint"></div>
+      </div>
+      <div id="zca-manual-sec">
+        <label class="zca-label">端点（OpenAI 兼容，支持第三方）</label>
+        <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">
+        <label class="zca-label">API key</label>
+        <input id="zca-apiKey" type="password" placeholder="留空 = 不修改已保存的 key">
+        <div class="zca-hint">清除已保存的 key 不在本面板：请到 zcode-advisor 源码目录打开本地配置面板（Windows 双击「配置面板.cmd」，macOS 运行 node tools/setup-server.js），再点「清除 API key」</div>
+        <label class="zca-label">审查模型（先点「拉取模型」，或直接手动输入）</label>
+        <select id="zca-model">
+          <option value="">（尚未拉取，请在下方手动输入）</option>
+        </select>
+        <input id="zca-model-manual" placeholder="或手动输入模型 id（拉取不到时用）" style="margin-top:6px">
+      </div>
+      <details class="zca-adv" id="zca-adv">
+        <summary>高级（审查模式 · max_tokens）</summary>
+        <label class="zca-label">审查模式</label>
+        <select id="zca-reviewMode">
+          <option value="async">async（默认：意见随下一条消息送达）</option>
+          <option value="sync">sync（当轮打断：concern/blocker 立即送达）</option>
+        </select>
+        <label class="zca-label">max_tokens（思考型模型建议 4096）</label>
+        <input id="zca-maxTokens" type="number" min="64" max="16384">
+      </details>
       <div class="zca-row">
         <button class="zca-btn" id="zca-save">保存</button>
-        <button class="zca-btn alt" id="zca-models">拉取模型</button>
         <button class="zca-btn alt" id="zca-ping">Ping</button>
+        <button class="zca-btn alt" id="zca-models">拉取模型</button>
       </div>
       <div class="zca-msg" id="zca-msg"></div>
       <div class="zca-history" id="zca-history">
@@ -379,13 +542,16 @@
         </div>
         <div class="zca-history-body" id="zca-history-body"></div>
       </div>
-      <div class="zca-status" style="margin-top:10px">保存后下一轮审查即生效；意见以 [advisor:*] 前缀随下一条消息送达。</div>
+      <div class="zca-hint" style="margin-top:8px">保存后下一轮审查即生效；意见以 [advisor:*] 前缀随下一条消息送达。</div>
     `;
     document.body.appendChild(p);
     p.querySelector('#zca-close').addEventListener('click', () => { p.style.display = 'none'; });
     p.querySelector('#zca-save').addEventListener('click', save);
     p.querySelector('#zca-ping').addEventListener('click', ping);
     p.querySelector('#zca-models').addEventListener('click', fetchModels);
+    p.querySelector('#zca-src-zcode').addEventListener('click', () => setApiSource('zcode'));
+    p.querySelector('#zca-src-manual').addEventListener('click', () => setApiSource('manual'));
+    p.querySelector('#zca-zcode-provider').addEventListener('change', fillZcodeModels);
 
     // 历史区：默认折叠；首次展开才拉取（后续展开用缓存，点头部可强制刷新）
     const head = p.querySelector('#zca-history-head');

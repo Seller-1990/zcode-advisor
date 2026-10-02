@@ -1,6 +1,6 @@
 {
   "name": "zcode-advisor",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "dsh-advisor 的 zcode 移植：独立审查副模型在每轮结束后被动审查对话增量，以 nit/concern/blocker 三级建议注回会话（advisory-only，绝不阻塞主流程）。",
   "author": {
     "name": "local"
@@ -27,18 +27,18 @@
     },
     "model": {
       "type": "string",
-      "default": "glm-5.3-flash",
-      "description": "审查模型 id。建议与主对话模型形成能力差；思考型模型建议把 max_tokens 提到 4096"
+      "default": "",
+      "description": "审查模型 id（引擎默认 glm-5.3-flash）。留空 = 不经本表单写入配置；建议与主对话模型形成能力差，思考型模型建议把 max_tokens 提到 4096"
     },
     "base_url": {
       "type": "string",
-      "default": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-      "description": "OpenAI 兼容端点。非官方端点会在 /advisor-status 中给出明文/key 配对警告"
+      "default": "",
+      "description": "OpenAI 兼容端点（引擎默认智谱官方端点）。留空 = 不经本表单写入配置；第三方端点推荐用本地配置面板维护，或在面板里把 API 来源切到「ZCode 已维护」"
     },
     "review_mode": {
       "type": "string",
-      "default": "async",
-      "description": "审查模式：async（默认，零体感延迟，意见随下一条消息送达）或 sync（当轮打断，每轮收尾等待审查）"
+      "default": "",
+      "description": "审查模式：async（引擎默认，零体感延迟）或 sync（当轮打断）。留空 = 不经本表单写入配置"
     }
   }
 }

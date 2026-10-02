@@ -608,3 +608,92 @@ test('inject.js：发行包 payload 与 auto-enable 脚本就位（自动启用�
   const pk = fs2.readFileSync(path2.join(root, 'tools/companion/packagers.cjs'), 'utf8');
   assert.match(pk, /ExecWait/, 'NSIS 应在安装后执行自动启用');
 });
+
+// ---------------- API 来源（zcode / manual）与面板结构重构 ----------------
+
+test('inject.js：启用开关在面板正文首行（不在 h3 标题栏内），API 来源分段与高级折叠区齐备', () => {
+  const dom = runInject();
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  const html = dom.byId.get('zca-panel').innerHTML;
+  // 回归：旧版把启用 checkbox 嵌在 h3 里，紧挨关闭按钮——难点中、位置不对
+  const h3 = html.slice(html.indexOf('<h3'), html.indexOf('</h3>'));
+  assert.ok(!h3.includes('zca-enabled'), 'h3 标题栏不应包含启用开关');
+  assert.ok(html.includes('zca-toggle-row'), '启用开关应有独立行容器');
+  assert.ok(html.indexOf('zca-toggle-row') < html.indexOf('zca-apiSource'), '开关行应位于 API 来源分段之前');
+  for (const id of ['zca-apiSource', 'zca-src-zcode', 'zca-src-manual', 'zca-zcode-provider',
+    'zca-zcode-model', 'zca-zcode-sec', 'zca-manual-sec', 'zca-zcode-endpoint', 'zca-adv']) {
+    assert.ok(html.includes(id), `面板应包含 #${id}`);
+  }
+});
+
+test('inject.js：zcode 模式保存载荷带服务商/模型，不回传手动端点字段', async () => {
+  const saved = [];
+  const providers = [{
+    id: 'p1', name: '内网网关', kind: 'openai-compatible',
+    baseURL: 'http://10.0.0.8:8088/v1', models: ['m-a', 'm-b'], eligible: true, hasApiKey: true
+  }];
+  const fetchStub = async (url, opt) => {
+    const u = String(url);
+    if (u.includes('/api/config')) {
+      saved.push(JSON.parse(opt.body));
+      return { json: async () => ({ ok: true, file: '/tmp/x.json' }) };
+    }
+    if (u.includes('/api/zcode-providers')) return { json: async () => ({ ok: true, providers }) };
+    return { json: async () => ({ ok: false }) };
+  };
+  const dom = runInject({ fetch: fetchStub });
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  // 切到 zcode 模式 → loadProviders 异步拉取 → 服务商/模型下拉被填充
+  dom.byId.get('zca-src-zcode')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  const psel = dom.byId.get('zca-zcode-provider');
+  assert.strictEqual(psel.value, 'p1', '唯一合格服务商应被选中');
+  const msel = dom.byId.get('zca-zcode-model');
+  assert.strictEqual(msel.value, 'm-a', '模型默认取列表首项');
+  msel.value = 'm-b';
+  await dom.byId.get('zca-save')._listeners.click[0]();
+  const payload = saved[saved.length - 1];
+  assert.strictEqual(payload.apiSource, 'zcode');
+  assert.strictEqual(payload.zcodeProvider, 'p1');
+  assert.strictEqual(payload.zcodeModel, 'm-b');
+  assert.strictEqual(payload.baseUrl, undefined, 'zcode 模式不回传手动端点（保留既有手动配置）');
+  assert.strictEqual(payload.model, undefined, 'zcode 模式不回传手动模型字段');
+});
+
+test('inject.js：手动模式保存载荷与旧行为一致（apiSource=manual）', async () => {
+  const saved = [];
+  const fetchStub = async (url, opt) => {
+    if (String(url).includes('/api/config')) {
+      saved.push(JSON.parse(opt.body));
+      return { json: async () => ({ ok: true, file: '/tmp/x.json' }) };
+    }
+    return { json: async () => ({ ok: false }) };
+  };
+  const dom = runInject({ fetch: fetchStub });
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  dom.byId.get('zca-baseUrl').value = 'http://manual.example/v1';
+  dom.byId.get('zca-model-manual').value = 'm-manual';
+  await dom.byId.get('zca-save')._listeners.click[0]();
+  const payload = saved[saved.length - 1];
+  assert.strictEqual(payload.apiSource, 'manual');
+  assert.strictEqual(payload.baseUrl, 'http://manual.example/v1');
+  assert.strictEqual(payload.model, 'm-manual');
+  assert.strictEqual(payload.zcodeProvider, undefined);
+});
+
+test('inject.js：zcode 服务商列表不含合格项时给出占位提示（不静默空白）', async () => {
+  const fetchStub = async (url) => ({
+    json: async () => (String(url).includes('/api/zcode-providers')
+      ? { ok: true, providers: [{ id: 'ant', name: 'Anthropic 中转', kind: 'anthropic', baseURL: 'https://r', models: ['c'], eligible: false }] }
+      : { ok: false })
+  });
+  const dom = runInject({ fetch: fetchStub });
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  dom.byId.get('zca-src-zcode')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  const psel = dom.byId.get('zca-zcode-provider');
+  assert.match(psel.children[0].textContent, /暂无 OpenAI 兼容服务商/);
+  assert.strictEqual(psel.value, '');
+});

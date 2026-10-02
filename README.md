@@ -128,9 +128,11 @@ ZCode 桌面版没有官方 UI 扩展机制，因此在界面内提供设置入�
 - **双击 `启动-Advisor-ZCode.cmd`**（Windows）或运行 `node tools/companion/controller.cjs`：
   以调试模式拉起 ZCode（或在已有调试实例时直接附着），保持一个控制台窗口（使用期间别关）；
 - ZCode 输入框区域右下角出现 **🛡️ 顾问角标**，点开即设置面板：
-  - **第三方 API**：端点随便填（任何 OpenAI 兼容服务）；
-  - **拉取模型**：填好端点与 key 后点「拉取模型」，自动请求 `{端点}/models` 列出可选模型；
+  - **API 来源（二选一）**：`ZCode 已维护` = 直接选用 ZCode 设置里配置的第三方 API（下拉选服务商 + 模型，key 留在 ZCode 配置里不出进程）；`手动维护` = 在面板里单独填端点 / key / 模型；
+  - **启用顾问**：面板首行的独立开关（新会话是否自动启用审查）；
+  - **拉取模型**（手动维护模式）：填好端点与 key 后点「拉取模型」，自动请求 `{端点}/models` 列出可选模型；
   - **Ping 测试** / **保存**：保存写入用户级配置，下一轮审查即生效，无需重启；
+  - 审查模式 / max_tokens 收在「高级」折叠区，面板默认占地更小。
 - 注入采用 `Page.addScriptToEvaluateOnNewDocument` + 当前文档补注入双通道，
   页面刷新/导航后角标自动恢复；原版方式启动的 ZCode 不会有角标（无调试通道）。
 
@@ -193,6 +195,8 @@ dsh 端教训（`ADVISOR-GUARD-REPORT.md`，[issue #102](https://github.com/omds
 | `baseUrl` | `https://open.bigmodel.cn/api/paas/v4/chat/completions` | OpenAI 兼容端点。`http://` 非本机地址会在状态中给出明文传输警告 |
 | `model` | `glm-5.3-flash` | 审查模型；建议与主模型形成能力差。思考型模型配 `maxTokens: 4096` |
 | `apiKey` / `apiKeyEnv` | 空 / 见文件 | key 解析链：`apiKey` → 依次尝试 `apiKeyEnv`；占位符样式值（`REPLACE_*`、`test*`、含中文的模板文案等）视为未配置。共享 env key 发往非签发方端点会触发警告 |
+| `apiSource` | `manual` | **API 获取方式**：`manual` 用本配置里的 key/端点/模型；`zcode` 直接读取 ZCode 已维护的第三方 API（`~/.zcode/v2/config.json` 的 provider），改 ZCode 设置无需再同步本插件。配置面板里是「ZCode 已维护 / 手动维护」二选一 |
+| `zcodeProvider` / `zcodeModel` | 空 / 空 | `apiSource=zcode` 时选中的服务商（provider id，容忍写名称）与模型 id；模型留空取该服务商列表首项。provider 缺失或协议非 OpenAI 兼容（`anthropic` 类）时沿用手动值并在「配置问题」行登记 |
 | `reviewMode` | `async` | `async`（亚秒级固定税，意见下条消息送达）或 `sync`（立即打断，超时自动钳制 ≤300s） |
 | `immuneTurns` | 3 | steer 后的冷却轮数；冷却期内 concern 降级顺延（blocker 不受限） |
 | `maxDeltaMessages` / `maxContextChars` | 60 / 48000 | 送审窗口（条数 / 总字符）。两者同时生效，长消息下字符帽先到 |
