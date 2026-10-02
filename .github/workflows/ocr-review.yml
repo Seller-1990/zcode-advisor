@@ -18,7 +18,8 @@
 name: OpenCodeReview PR Review
 
 concurrency:
-  group: ocr-review-${{ github.event.pull_request.number || github.ref }}
+  # dispatch 时 pull_request 上下文为空：用 inputs.pr_number 隔离，两个手动补跑不互踩
+  group: ocr-review-${{ github.event.inputs.pr_number || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 on:
@@ -85,4 +86,4 @@ jobs:
           # 提高单请求超时、开进度流（日志可观测）、并发 4 提速。
           llm_timeout: '600'
           stream_progress: 'true'
-          review_concurrency: '4'
+          review_concurrency: '2'
