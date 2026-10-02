@@ -125,8 +125,8 @@ function saveState(file, state) {
       // state 可能含会话级 API key（sessionApi.apiKey）：0600 落盘，不依赖 umask。
       fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(tmp, file);
-      // POSIX rename 覆盖已存在文件时保留目标原权限：升级前遗留的 0644 state
-      // 写入会话明文 key 后仍是 0644，rename 后补一次 chmod 才真正收紧。
+      // rename 后文件 inode 来自 tmp（恒 0600）；此 chmod 是针对异常文件系统的
+      // 纵深防御（正常 POSIX 下为 no-op，失败静默不影响主流程）。
       try { fs.chmodSync(file, 0o600); } catch (_) {}
       return;
     } catch (err) {

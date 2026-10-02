@@ -97,9 +97,19 @@ function effectiveApi(cfg, apiKeyInfo, state) {
     source: sessionKey ? 'session-override' : ((apiKeyInfo && apiKeyInfo.source) || ''),
     model: effModel.model,
     modelSource: effModel.source,
-    hasOverride: Boolean(baseUrl || apiKey),
-    overrides: [baseUrl && 'baseUrl', apiKey && 'apiKey'].filter(Boolean)
+    // hasOverride/overrides 按**实际生效**的键算：apiKey 被占位符过滤后不算覆盖，
+    // 否则 status 显示「已覆盖 apiKey」而实际回落全局，排查时自相矛盾。
+    hasOverride: Boolean(baseUrl || sessionKey),
+    overrides: [baseUrl && 'baseUrl', sessionKey && 'apiKey'].filter(Boolean)
   };
+}
+
+// 门禁按会话生效值评估的统一入口：gate(cfg, ...) 检查第一参的 baseUrl/model 字段，
+// 传全局 cfg 会在「全局配空 + 会话已 set 端点/模型」时误报 missing。所有 gate
+// 调用点（stop/sync/worker/status/on）必须走这里，防止逐点手搓漏改。
+function gateWithSession(cfg, apiKeyInfo, state) {
+  const eff = effectiveApi(cfg, apiKeyInfo, state);
+  return { eff, reasons: gate({ baseUrl: eff.baseUrl, model: eff.model }, eff) };
 }
 
 function isStopHookActive(input) {
@@ -328,11 +338,8 @@ function onStopAsync(ctx) {
   }
 
   const current = loadState(file);
-  // 门禁按会话级生效值评估：全局 key 缺失但本会话已 /advisor-api set 过 key 时照常审查。
-  // gate 的 baseUrl/model 也必须取生效值——gate(cfg, ...) 检查的是第一参的字段，
-  // 传全局 cfg 会在「全局配空 + 会话已 set 端点/模型」时误报 missing 并跳过审查。
-  const effForGate = effectiveApi(cfg, apiKeyInfo, current);
-  const gateReasons = gate({ baseUrl: effForGate.baseUrl, model: effForGate.model }, effForGate);
+  // 门禁按会话级生效值评估：全局 key/端点/模型任一缺失但本会话已覆盖时照常审查。
+  const { reasons: gateReasons } = gateWithSession(cfg, apiKeyInfo, current);
   if (!current || !current.enabled || gateReasons.length > 0) {
     mutateStateExclusive(file, (s) => {
       s.lastActivity = new Date().toISOString();
@@ -448,7 +455,7 @@ async function onStopSync(ctx) {
   if (!current || !current.enabled) return;
 
   // 门禁按会话级生效值评估（与 async 路径同一口径）。
-  const gateReasons = gate(cfg, effectiveApi(cfg, apiKeyInfo, current));
+  const gateReasons = gateWithSession(cfg, apiKeyInfo, current).reasons;
   if (gateReasons.length > 0) {
     mutateStateExclusive(file, (s) => {
       s.disabledReason = gateReasons.join(',');
@@ -619,7 +626,7 @@ async function handleReviewWorker(args) {
 
     if (!state.enabled) return;
     // 门禁按会话级生效值评估：全局 key 缺失但本会话已覆盖 key 时照常审查。
-    const gateReasons = gate(cfg, effectiveApi(cfg, apiKeyInfo, state));
+    const gateReasons = gateWithSession(cfg, apiKeyInfo, state).reasons;
     if (gateReasons.length > 0) {
       mutateStateExclusive(file, (s) => {
         s.disabledReason = gateReasons.join(',');
@@ -781,8 +788,7 @@ async function handleCtl(args) {
   if (sub === 'status') {
     const state = loadState(file);
     const apiKeyInfo = resolveApiKey(cfg, process.env);
-    const eff = effectiveApi(cfg, apiKeyInfo, state);
-    const gateReasons = gate(cfg, eff);
+    const { eff, reasons: gateReasons } = gateWithSession(cfg, apiKeyInfo, state);
     const lines = [];
     lines.push('advisor 状态');
     lines.push(`  会话: ${state.sessionId || '(未知)'}`);
@@ -848,10 +854,10 @@ async function handleCtl(args) {
     let enabledModel = '';
     mutateStateExclusive(file, (s) => {
       s.enabled = true;
-      const eff = effectiveApi(cfg, resolveApiKey(cfg, process.env), s);
-      reasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, eff);
+      const r = gateWithSession(cfg, resolveApiKey(cfg, process.env), s);
+      reasons = r.reasons;
+      enabledModel = r.eff.model;
       s.disabledReason = reasons.length > 0 ? reasons.join(',') : '';
-      enabledModel = eff.model;
     });
     if (reasons.length > 0) {
       process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 advisor.config.json、环境变量，或用 /advisor-api set 为本会话单独配置。\n`);
@@ -935,7 +941,12 @@ async function handleCtl(args) {
       if (normalized) parts.push(`端点=${normalized}`);
       if (apiKey) parts.push(`key=${maskKey(apiKey)}`);
       if (model) parts.push(`模型=${model}`);
-      process.stdout.write(`advisor: 本会话已覆盖 ${parts.join('，')}（下一轮审查起生效；/advisor-api reset 恢复全局）。\n`);
+      // 占位符照单全收会让"回显成功"与"实际不生效"分叉：effectiveApi 会把
+      // test-*/your-api-key 一类值过滤回落全局 key，这里必须当场点破。
+      const placeholderHint = apiKey && isPlaceholderKey(apiKey)
+        ? `。注意：该 key 形似占位符，审查时会回落全局 key（与 resolveApiKey 同一纪律）`
+        : '';
+      process.stdout.write(`advisor: 本会话已覆盖 ${parts.join('，')}（下一轮审查起生效；/advisor-api reset 恢复全局）${placeholderHint}。\n`);
       return;
     }
     if (action === 'reset') {

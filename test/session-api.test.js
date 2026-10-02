@@ -130,3 +130,40 @@ test('worker 传参：review-worker 收到覆盖端点（--transcript 快照路�
   assert.match(src, /const eff = effectiveApi\(cfg, apiKeyInfo, (current|state)\);/);
   assert.ok(!src.includes('reviewTurn(cfg, apiKeyInfo,'), 'reviewTurn 不得再直接吃 apiKeyInfo（旧签名）');
 });
+
+test('门禁放行：全局显式配空 baseUrl/model + 会话覆盖三键 → async worker 用生效值审查', async (t) => {
+  // 顾问复核抓出的场景：全局 baseUrl/model 显式配空（内置默认被覆盖）时，
+  // worker 侧 gate 若传全局 cfg 会误报 missing 并拒绝——统一 gateWithSession 后必须放行。
+  const { transcript, stateDir } = setup(t);
+  const uc = path.join(stateDir, 'user.json');
+  fs.writeFileSync(uc, JSON.stringify({ baseUrl: '', model: '' }));
+  const env = makeEnv(stateDir, {
+    ZCODE_ADVISOR_MOCK: '1',
+    ZCODE_ADVISOR_USER_CONFIG: uc,
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"nit","note":"async worker 生效值场景"}'
+  });
+  runHook(['session-start'], { session_id: 'a7', transcript_path: transcript }, env);
+  const r = runHook(['ctl', 'api', 'set', 'http://e7.example/v1', 'sk-async-key-31', 'model:m7',
+    '--state', stateFile(stateDir, 'a7')], null, env);
+  assert.strictEqual(r.status, 0);
+  // 直接走真实 worker 入口（async 模式下 Stop 只负责 spawn，门禁在 worker 内）
+  const w = runHook(['review-worker', '--state', stateFile(stateDir, 'a7')], null, env);
+  assert.strictEqual(w.status, 0, `worker 应成功：${w.stderr}`);
+  const st = readState(stateDir, 'a7');
+  assert.strictEqual(st.reviews, 1, `worker 应完成审查，disabledReason=${st.disabledReason}`);
+  assert.strictEqual(st.disabledReason || '', '', 'worker 放行后不得残留 disabledReason');
+});
+
+test('占位符会话 key 回落：无全局 key 时 worker 门禁不放行（不拿占位符打真实请求）', async (t) => {
+  const { transcript, stateDir } = setup(t);
+  const env = makeEnv(stateDir, { ZCODE_ADVISOR_MOCK: '1' });
+  runHook(['session-start'], { session_id: 'a8', transcript_path: transcript }, env);
+  // test- 开头的 key 是 README 登记的有意误杀范围（安全默认）
+  const r = runHook(['ctl', 'api', 'set', 'http://e8.example/v1', 'test-not-a-real-key',
+    '--state', stateFile(stateDir, 'a8')], null, env);
+  assert.match(r.stdout, /形似占位符/, 'set 应当场提示占位符回落');
+  const w = runHook(['review-worker', '--state', stateFile(stateDir, 'a8')], null, env);
+  const st = readState(stateDir, 'a8');
+  assert.strictEqual(st.reviews || 0, 0, '占位符 key 回落后无全局 key，门禁必须拦下');
+  assert.match(st.disabledReason || '', /missing:apiKey/);
+});
