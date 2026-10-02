@@ -332,7 +332,9 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
     if (left < 5000) {
       fallbackSkipped = 'fallback_skipped:insufficient_budget'; // 如实记录，不假装降级过
     } else {
-      const fbAttempt = await runAttempt(overallDeadline, fb.model, 0);
+      // 备用模型首调同样用 cfg.temperature（与主模型口径一致）；其空响应重试由
+      // runAttempt 内部降到 0，与主模型重试同规则——不在降级路径上另立一套温度语义。
+      const fbAttempt = await runAttempt(overallDeadline, fb.model, cfg.temperature);
       if (!fbAttempt.error) {
         attempt = fbAttempt;
         usedFallback = true;
