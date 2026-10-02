@@ -354,7 +354,7 @@
       <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">
       <label class="zca-label">API key</label>
       <input id="zca-apiKey" type="password" placeholder="留空 = 不修改已保存的 key">
-      <div class="zca-hint" style="margin-top:2px">清除已保存的 key 请用本地配置面板：双击项目里的「配置面板.cmd」→「清除 API key」</div>
+      <div class="zca-hint">清除已保存的 key 不在本面板：请到 zcode-advisor 源码目录打开本地配置面板（Windows 双击「配置面板.cmd」，macOS 运行 node tools/setup-server.js），再点「清除 API key」</div>
       <label class="zca-label">审查模型（先点「拉取模型」填充列表，或直接手动输入）</label>
       <select id="zca-model">
         <option value="">（尚未拉取，请在下方手动输入）</option>

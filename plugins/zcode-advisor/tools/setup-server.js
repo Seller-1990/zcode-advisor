@@ -231,9 +231,19 @@ const server = http.createServer((req, res) => {
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
       try {
-        // 与 /api/save 同构：先验 JSON 再动配置。端点不接收参数，但垃圾 body
-        // 也 400 拒掉——不把"动作未定义的请求"静默当成功执行。
-        JSON.parse(body || '{}');
+        // 解析与落盘分开包 try：文件系统错误（权限/磁盘/rename）不能伪装成
+        // 「请求体不是合法 JSON」的 400——那是两个不同性质的失败。
+        let parsed;
+        try {
+          parsed = JSON.parse(body || '{}');
+        } catch (err) {
+          send(400, { ok: false, error: '请求体不是合法 JSON：' + String(err).slice(0, 160) });
+          return;
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          send(400, { ok: false, error: '请求体必须是 JSON 对象' });
+          return;
+        }
         const r = removeUserConfigKeys(['apiKey'], USER_CONFIG);
         if (r.error) { send(400, { ok: false, error: r.error }); return; }
         if (r.lockTimeout) {
@@ -242,7 +252,7 @@ const server = http.createServer((req, res) => {
         }
         send(200, { ok: true, removed: r.removed });
       } catch (err) {
-        send(400, { ok: false, error: '请求体不是合法 JSON：' + String(err).slice(0, 160) });
+        send(500, { ok: false, error: String(err).slice(0, 200) });
       }
     });
     return;
