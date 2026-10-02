@@ -489,7 +489,6 @@
     p.innerHTML = `
       <h3><span>🛡️ 顾问设置</span><span class="zca-close" id="zca-close">✕</span></h3>
       <div class="zca-status" id="zca-status">读取中…</div>
-<<<<<<< HEAD
       <div class="zca-toggle-row">
         <label class="zca-switch" title="新会话是否自动启用审查">
           <input type="checkbox" id="zca-enabled">
@@ -514,6 +513,7 @@
         <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">
         <label class="zca-label">API key</label>
         <input id="zca-apiKey" type="password" placeholder="留空 = 不修改已保存的 key">
+        <div class="zca-hint">清除已保存的 key 不在本面板：请到 zcode-advisor 源码目录打开本地配置面板（Windows 双击「配置面板.cmd」，macOS 运行 node tools/setup-server.js），再点「清除 API key」</div>
         <label class="zca-label">审查模型（先点「拉取模型」，或直接手动输入）</label>
         <select id="zca-model">
           <option value="">（尚未拉取，请在下方手动输入）</option>
@@ -530,25 +530,6 @@
         <label class="zca-label">max_tokens（思考型模型建议 4096）</label>
         <input id="zca-maxTokens" type="number" min="64" max="16384">
       </details>
-=======
-      <label class="zca-label">端点（OpenAI 兼容，支持第三方）</label>
-      <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">
-      <label class="zca-label">API key</label>
-      <input id="zca-apiKey" type="password" placeholder="留空 = 不修改已保存的 key">
-      <div class="zca-hint">清除已保存的 key 不在本面板：请到 zcode-advisor 源码目录打开本地配置面板（Windows 双击「配置面板.cmd」，macOS 运行 node tools/setup-server.js），再点「清除 API key」</div>
-      <label class="zca-label">审查模型（先点「拉取模型」填充列表，或直接手动输入）</label>
-      <select id="zca-model">
-        <option value="">（尚未拉取，请在下方手动输入）</option>
-      </select>
-      <input id="zca-model-manual" placeholder="或手动输入模型 id（拉取不到时用）" style="margin-top:6px">
-      <label class="zca-label">审查模式</label>
-      <select id="zca-reviewMode">
-        <option value="async">async（默认：零体感延迟，意见随下一条消息送达）</option>
-        <option value="sync">sync（当轮打断：concern/blocker 立即送达）</option>
-      </select>
-      <label class="zca-label">max_tokens（思考型模型建议 4096）</label>
-      <input id="zca-maxTokens" type="number" min="64" max="16384">
->>>>>>> origin/main
       <div class="zca-row">
         <button class="zca-btn" id="zca-save">保存</button>
         <button class="zca-btn alt" id="zca-ping">Ping</button>

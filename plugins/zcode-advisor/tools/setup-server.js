@@ -10,13 +10,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-<<<<<<< HEAD
-const { writeUserConfig, USER_CONFIG } = require('./config-bridge');
-const { loadConfig, resolveApiKey, gate, configWarnings, maskKey, isPlaceholderKey, readZcodeProviders, findZcodeProvider } = require('../hooks/lib/config');
-=======
 const { writeUserConfig, removeUserConfigKeys, USER_CONFIG } = require('./config-bridge');
-const { loadConfig, resolveApiKey, gate, configWarnings, maskKey, isPlaceholderKey } = require('../hooks/lib/config');
->>>>>>> origin/main
+const { loadConfig, resolveApiKey, gate, configWarnings, maskKey, isPlaceholderKey, readZcodeProviders, findZcodeProvider } = require('../hooks/lib/config');
 const { callReviewer } = require('../hooks/lib/reviewer');
 const { readHistory } = require('../hooks/lib/history');
 
@@ -93,7 +88,6 @@ function page() {
 <html lang="zh"><head><meta charset="utf-8">
 <title>zcode-advisor 配置面板</title>
 <style>
-<<<<<<< HEAD
  body{font-family:"Microsoft YaHei",system-ui,sans-serif;max-width:640px;margin:24px auto;padding:0 16px 40px;color:#222;background:#f6f7f9}
  h1{font-size:18px;margin:18px 0 12px}
  .card{background:#fff;border:1px solid #e4e7ec;border-radius:10px;padding:14px 16px;margin-bottom:12px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
@@ -108,6 +102,8 @@ function page() {
  .btnrow{margin-top:12px;display:flex;gap:8px}
  button.act{padding:8px 18px;border:0;border-radius:7px;background:#2563eb;color:#fff;font-size:13px;cursor:pointer}
  button.act.alt{background:#fff;color:#344054;border:1px solid #d0d5dd}
+ button.act.danger{background:#fff;color:#b91c1c;border:1px solid #fda29b}
+ button.act:disabled{opacity:.55;cursor:default}
  #msg{margin-top:10px;padding:9px 11px;border-radius:7px;display:none;white-space:pre-wrap;font-size:13px}
  .ok{background:#ecfdf3;border:1px solid #abefc6;color:#067647} .bad{background:#fef3f2;border:1px solid #fecdca;color:#b42318}
  .hintline{color:#667085;font-size:12px;margin-top:4px;word-break:break-all}
@@ -117,22 +113,7 @@ function page() {
 <h1>🛡️ zcode-advisor 配置面板</h1>
 <div class="card"><h2>当前状态</h2>
 <div style="font-size:13px">配置文件：<code>${esc(USER_CONFIG)}</code></div>
-<div style="font-size:13px;margin-top:4px">API key：<code>${esc(statusKey)}</code> ｜ 模型：<code>${esc(statusModel)}</code> ｜ 模式：<code>${esc(cfg.reviewMode || 'async')}</code> ｜ 来源：<code>${src === 'zcode' ? 'ZCode 已维护' : '手动维护'}</code></div>
-=======
- body{font-family:"Microsoft YaHei",system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px;color:#222}
- h1{font-size:20px} fieldset{border:1px solid #ddd;border-radius:8px;margin-bottom:16px;padding:12px 16px}
- label{display:block;margin:10px 0 4px;font-weight:600} input,select{width:100%;box-sizing:border-box;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px}
- button{padding:8px 18px;margin:12px 8px 0 0;border:0;border-radius:6px;background:#2563eb;color:#fff;font-size:14px;cursor:pointer}
- button.alt{background:#64748b} button.danger{background:#fff;color:#b91c1c;box-shadow:inset 0 0 0 1px #fca5a5}
- #msg{margin-top:12px;padding:10px;border-radius:6px;display:none;white-space:pre-wrap}
- .ok{background:#ecfdf5;border:1px solid #a7f3d0} .bad{background:#fef2f2;border:1px solid #fecaca}
- small{color:#666} code{background:#f1f5f9;padding:1px 5px;border-radius:4px}
-</style></head><body>
-<h1>zcode-advisor 配置面板</h1>
-<fieldset><legend>当前状态</legend>
-<div>配置文件：<code>${USER_CONFIG}</code></div>
-<div>API key：<code id="st-key">${keyMasked}</code> ｜ 模型：<code>${cfg.model || '（默认 glm-5.3-flash）'}</code> ｜ 模式：<code>${cfg.reviewMode || 'async'}</code></div>
->>>>>>> origin/main
+<div style="font-size:13px;margin-top:4px">API key：<code id="st-key">${esc(statusKey)}</code> ｜ 模型：<code>${esc(statusModel)}</code> ｜ 模式：<code>${esc(cfg.reviewMode || 'async')}</code> ｜ 来源：<code>${src === 'zcode' ? 'ZCode 已维护' : '手动维护'}</code></div>
 <small>保存后**下一轮审查即生效**，无需重启 ZCode；新建会话后斜杠命令（/advisor-status 等）可用。</small>
 </div>
 <div class="card"><h2>审查副模型</h2>
@@ -171,17 +152,12 @@ function page() {
 </select>
 <label>max_tokens（引擎默认 4096；越界会被钳到 64–16384）</label>
 <input id="maxTokens" type="number" min="64" max="16384" value="${cfg.maxTokens || 4096}">
-<<<<<<< HEAD
 <div class="btnrow">
  <button class="act" onclick="save()">保存配置</button>
  <button class="act alt" onclick="ping()">Ping 测试（验证 key 与模型）</button>
+ <button class="act danger" id="clearBtn" onclick="clearKey()">清除 API key</button>
 </div>
-=======
-<button onclick="save()">保存配置</button>
-<button class="alt" onclick="ping()">Ping 测试（验证 key 与模型）</button>
-<button class="danger" id="clearBtn" onclick="clearKey()">清除 API key</button>
-<small>清除只移除本机配置文件里的 key；要作废已泄露的 key 请到智谱/Z.ai 控制台吊销。</small>
->>>>>>> origin/main
+<small class="hintline">清除只移除本机配置文件里的 key（环境变量 key 不受影响）；要作废已泄露的 key 请到智谱/Z.ai 控制台吊销。</small>
 <div id="msg"></div>
 </div>
 <div class="card"><h2>📜 顾问意见记录（最近 50 条）</h2>
