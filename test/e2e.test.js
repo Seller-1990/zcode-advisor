@@ -742,3 +742,41 @@ test('4a 恢复信号：从未告警过的会话不发恢复消息', (t) => {
   const r = runHook(['user-prompt-submit'], { session_id: 'h7', transcript_path: transcript, prompt: '继续' }, envOk);
   assert.strictEqual(r.stdout.trim(), '');
 });
+
+test('4a 恢复信号作废：告警后恢复置标志、再次连败到阈值 → 发告警不发恢复行', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const envFail = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"catastrophic","note":"非法级别"}'
+  });
+  runHook(['user-prompt-submit'], { session_id: 'h8', transcript_path: transcript, prompt: '开始' }, envFail);
+  for (let i = 0; i < 3; i++) {
+    appendTurn(transcript, `停摆轮 ${i + 1}`);
+    runHook(['stop'], { session_id: 'h8', transcript_path: transcript }, envFail);
+  }
+  // 第 1 次告警（healthNotifiedAt 非空）
+  const r1 = runHook(['user-prompt-submit'], { session_id: 'h8', transcript_path: transcript, prompt: '继续' }, envFail);
+  assert.ok(JSON.parse(r1.stdout).hookSpecificOutput.additionalContext.includes('健康告警'));
+
+  // 恢复一轮 → 置恢复标志
+  const envOk = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"none","note":"没有问题"}'
+  });
+  appendTurn(transcript, '短暂恢复轮');
+  runHook(['stop'], { session_id: 'h8', transcript_path: transcript }, envOk);
+  assert.strictEqual(readState(stateDir, 'h8').healthRecoveryPending, true);
+
+  // 再次连败到阈值：恢复标志必须作废（不发「已恢复」），立即重新告警（第 1 次提醒，不走旧阶梯）
+  for (let i = 0; i < 3; i++) {
+    appendTurn(transcript, `二次停摆轮 ${i + 1}`);
+    runHook(['stop'], { session_id: 'h8', transcript_path: transcript }, envFail);
+  }
+  const r2 = runHook(['user-prompt-submit'], { session_id: 'h8', transcript_path: transcript, prompt: '继续' }, envFail);
+  const line = JSON.parse(r2.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(!line.includes('监督已恢复'), '再次停摆达阈值时不得注入恢复行（状态说反）');
+  assert.ok(line.includes('健康告警'), '应重新注入告警');
+  assert.ok(line.includes('第 1 次提醒'), `作废重置后应从第 1 次提醒开始（旧阶梯被清）：${line}`);
+  const st = readState(stateDir, 'h8');
+  assert.strictEqual(st.healthRecoveryPending, false, '过期恢复标志应被作废');
+});

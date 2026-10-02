@@ -253,7 +253,9 @@ function onUserPromptSubmit(ctx) {
     // enabled 门控：用户主动停用的会话不再喊。
     // 恢复信号有前提：当前失败连击未再次达阈值。成功置上恢复标志后又连续失败到
     // 阈值时，注入「已恢复」会把实际仍不可用的状态说反——此时作废恢复标志并重置
-    // 告警计数，走告警分支（新一轮从第 1 次提醒开始）。
+    // 告警计数，走告警分支（prevCount=0 令新一轮从第 1 次提醒开始，旧时间戳
+    // 因 prevCount<=0 短路不参与间隔压制）。低于阈值（1~2 次）的短暂失败仍播恢复行：
+    // 告警只对「达阈值停摆」负责，短暂抖动不打扰。
     const outageActive = s.enabled === true && s.failStreak && (s.failStreak.count || 0) >= FAIL_STREAK_ALERT_THRESHOLD;
     if (s.enabled === true && s.healthRecoveryPending === true && !outageActive) {
       parts.unshift(HEALTH_RECOVERY_LINE);
@@ -261,13 +263,13 @@ function onUserPromptSubmit(ctx) {
       s.healthRecoveryPending = false;
       s.healthNotifiedAt = '';
       s.healthAlertCount = 0;
-    } else {
-      if (outageActive && s.healthRecoveryPending === true) {
-        // 过期的恢复标志：审查已再次停摆，恢复行作废
+    }
+    if (outageActive) {
+      if (s.healthRecoveryPending === true) {
+        // 过期的恢复标志：审查已再次停摆，恢复行作废、告警计数重置
         s.healthRecoveryPending = false;
         s.healthAlertCount = 0;
       }
-    if (s.enabled === true && s.failStreak && (s.failStreak.count || 0) >= FAIL_STREAK_ALERT_THRESHOLD) {
       const prevCount = s.healthAlertCount || 0;
       const lastNotified = Date.parse(s.healthNotifiedAt || '') || 0;
       // 首次告警立即发；重复提醒按升级阶梯拉长间隔（1h→3h→6h→24h）
@@ -278,7 +280,6 @@ function onUserPromptSubmit(ctx) {
         s.healthAlertCount = n;
         s.healthNotifiedAt = new Date().toISOString();
       }
-    }
     }
     if (parts.length > 0) deliver = parts.join('\n\n');
   });

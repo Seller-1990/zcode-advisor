@@ -10,7 +10,9 @@
   "mcpServers": {
     "config-bridge": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/tools/config-bridge.js"],
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/tools/config-bridge.js"
+      ],
       "env": {
         "ZCODE_ADVISOR_CFG_API_KEY": "${user_config.api_key}",
         "ZCODE_ADVISOR_CFG_MODEL": "${user_config.model}",
@@ -32,8 +34,8 @@
     },
     "base_url": {
       "type": "string",
-      "default": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-      "description": "OpenAI 兼容端点。非官方端点会在 /advisor-status 中给出明文/key 配对警告"
+      "default": "",
+      "description": "OpenAI 兼容端点。留空则使用用户级配置 ~/.zcode/advisor.config.json 中的 baseUrl（推荐做法：key/端点只存本地 600 权限文件，不进 GUI 表单与仓库）"
     },
     "review_mode": {
       "type": "string",

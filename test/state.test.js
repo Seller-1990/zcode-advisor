@@ -145,13 +145,22 @@ test('4a failStreak：同因累加到 3，sinceTs 保持连击起点不变', () 
 
 test('4a failStreak：白名单异因切换重置为 1（sinceTs 重新起算）', () => {
   const s = freshState('x', '', true);
+  // 先建立 llm_http_401 连击并模拟已提醒 2 次（告警路径写入的计数/时间）
   bumpDrop(s, 'llm_http_401');
+  s.healthAlertCount = 2;
+  s.healthNotifiedAt = '2000-01-01T00:00:00.000Z';
   bumpDrop(s, 'llm_http_401');
+  assert.strictEqual(s.healthAlertCount, 2, '同因累加不动告警计数');
+  assert.strictEqual(s.healthNotifiedAt, '2000-01-01T00:00:00.000Z', '同因累加不动提醒时间');
   // 固定旧起点（避免同毫秒内 ISO 字符串相同导致断言失真），异因切换必须换新
   s.failStreak.sinceTs = '2000-01-01T00:00:00.000Z';
   bumpDrop(s, 'unparsed');
   assert.strictEqual(s.failStreak.reason, 'unparsed');
   assert.strictEqual(s.failStreak.count, 1);
+  // 异因切换清告警计数：新故障达阈值后从第 1 次提醒开始，不被旧故障阶梯压制
+  //（healthNotifiedAt 保留，供本轮故障恢复后补发恢复信号）
+  assert.strictEqual(s.healthAlertCount, 0, '异因切换应清 healthAlertCount');
+  assert.strictEqual(s.healthNotifiedAt, '2000-01-01T00:00:00.000Z', '异因切换保留 healthNotifiedAt');
   assert.ok(s.failStreak.sinceTs !== '2000-01-01T00:00:00.000Z', '异因重置应更新连击起点');
   // llm_* 家族内部切换同样重置
   s.failStreak.sinceTs = '2000-01-01T00:00:00.000Z';
