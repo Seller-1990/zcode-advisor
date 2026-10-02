@@ -167,6 +167,7 @@ test('配置面板 HTTP：一次保存恰好一次原子落盘（单次 RMW，�
   assert.strictEqual(configRenames, 1, '一次 /api/save 应恰好一次 tmp→目标 rename');
 });
 
+<<<<<<< HEAD
 test('guiValuesFromEnv：旧版默认的智谱端点视为未配置（防「第三方端点被改回智谱」复发）', () => {
   // 回归：≤0.2.7 的 plugin.json 把官方端点写成 userConfig default，宿主展开进 env 后
   // 桥接落盘，覆盖用户的第三方端点。默认值已改空串，这里挡住旧宿主/旧缓存展开出的值。
@@ -232,4 +233,64 @@ test('配置面板页面：API 来源分段与 zcode 服务商区渲染', async 
   for (const marker of ['src-zcode', 'src-manual', 'zcodeProvider', 'zcodeModel', 'manualSec', 'API 来源', '启用']) {
     assert.ok(html.includes(marker), `页面应包含 ${marker}`);
   }
+=======
+// —— 延期项 D1：/api/clear-key ——
+
+async function postJson(url, body) {
+  return fetch('http://127.0.0.1:8799' + url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {})
+  });
+}
+
+test('配置面板 HTTP：清除 API key（成功分支，页面元素齐备）', async () => {
+  try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
+  const post = (url, body, origin) => fetch('http://127.0.0.1:8799' + url, {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, origin ? { Origin: origin } : {}),
+    body: JSON.stringify(body || {})
+  });
+
+  const html = await (await fetch('http://127.0.0.1:8799/')).text();
+  assert.ok(html.includes('清除 API key'), '页面应有清除按钮');
+  assert.ok(html.includes('/api/clear-key'), '页面应接清除接口');
+  assert.ok(html.includes('吊销'), '页面应提示清除≠作废');
+
+  const r1 = await (await post('/api/clear-key', {})).json();
+  assert.strictEqual(r1.ok, true, '配置不存在时也应 ok（幂等）');
+
+  await (await post('/api/save', { apiKey: 'to-be-cleared', model: 'glm-5.3' })).json();
+  const r2 = await (await post('/api/clear-key', {})).json();
+  assert.strictEqual(r2.ok, true);
+  assert.deepStrictEqual(r2.removed, ['apiKey']);
+  const saved = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
+  assert.strictEqual(saved.apiKey, undefined);
+  assert.strictEqual(saved.model, 'glm-5.3', '兄弟键必须保留');
+});
+
+test('配置面板 HTTP：clear-key 拒绝非本机来源（403 JSON）', async () => {
+  const r = await fetch('http://127.0.0.1:8799/api/clear-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
+    body: '{}'
+  });
+  assert.strictEqual(r.status, 403);
+  const body = await r.json();
+  assert.strictEqual(body.ok, false);
+  assert.ok(body.error, '错误必须是 JSON（前端按 ok 分红绿条）');
+});
+
+test('配置面板 HTTP：clear-key 拒绝非 JSON body（400，不执行删除）', async () => {
+  await (await postJson('/api/save', { apiKey: 'keep-me' })).json();
+  const r = await fetch('http://127.0.0.1:8799/api/clear-key', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: 'not-json{{'
+  });
+  assert.strictEqual(r.status, 400);
+  assert.strictEqual((await r.json()).ok, false);
+  assert.strictEqual(JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8')).apiKey, 'keep-me',
+    '非法 body 不得触发删除');
+>>>>>>> origin/main
 });

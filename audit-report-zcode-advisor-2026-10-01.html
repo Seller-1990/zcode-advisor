@@ -1025,7 +1025,7 @@ fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf8');  // 0644</div>
     </div>
     <div class="finding-meta"><span>📍 test/log-review.test.js（新）/ panel.test.js / auto-enable-lock.test.js / hooks/lib/config.js</span><span>🎯 回归保护</span></div>
     <div class="problem"><strong>内容：</strong>① advisor-hook.js 加 require.main 守卫并导出 reviewTurn/logReview/reviewBudgetMs（宿主仍以文件路径执行，CLI 行为不变）；② 新增 log-review.test.js：DEBUG=1 落盘 JSONL 字段断言 / 默认零落盘 / 预算 helper / sync、async 预算集成计时；③ panel.test.js 断言一次保存恰好一次原子落盘（锁 A1 修复）；④ auto-enable-lock 恢复 EPERM 分支的判别性用例（平台门：类 Unix 非 root + pid 1）；⑤ config.js reviewMode 归一化（手写 "SYNC" 曾同时绕过 sync 钳制与预算分支）、reviewTimeoutMs &lt;1000 回退 + async &gt;600000 钳制；⑥ copyIfChanged 等值分支补权限修复（仅类 Unix）、复制分支 tmp+rename 原子替换；⑦ mergeUserConfig 跳过 <code>__proto__</code> 键（等值跳过保证曾被自有键击穿）；⑧ reviewer.js finish_reason 截断 40 字符（防被劫持端点借 hint 无界注入日志）；⑨ hashId 注明非匿名化。</div>
-    <div class="problem"><strong>延期（登记）：</strong>key 删除路径（GUI 范围）；桥接 fillMissingOnly 跳过键的 VERBOSE stderr 信号；「插件与 companion 需同时更新」的版本倾斜提示（README 已有升级说明，暂不加运行时提示）。</div>
+    <div class="problem"><strong>延期项后续（2026-10-01 第二轮）：</strong>① key 删除路径<strong>已实现</strong>——面板「清除 API key」按钮 + <code>POST /api/clear-key</code>（本机来源校验、跨进程锁、原子写、0600、损坏文件报失败不假装成功、兄弟键保留、清除≠吊销文案）；② fillMissingOnly 冲突信号<strong>已实现</strong>——跳过且值不同的键收集进 <code>conflicts</code>（等值跳过不算冲突，防稳态误报），仅 apiKey 冲突时 stderr 一行指路，<code>advisor_config_status</code> tools/call 从固定文案改为返回真实状态 JSON；③ 版本倾斜提示<strong>已文档化（不做运行时检测）</strong>——通常无症状、安装器同时更新两半、重跑安装器自愈，理由登记于 README。</div>
   </div>
 
   </div>

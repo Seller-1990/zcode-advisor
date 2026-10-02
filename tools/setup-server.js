@@ -10,7 +10,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { writeUserConfig, USER_CONFIG } = require('./config-bridge');
+const { writeUserConfig, removeUserConfigKeys, USER_CONFIG } = require('./config-bridge');
 const { loadConfig, resolveApiKey, gate, configWarnings, maskKey, isPlaceholderKey, readZcodeProviders, findZcodeProvider } = require('../hooks/lib/config');
 const { callReviewer } = require('../hooks/lib/reviewer');
 const { readHistory } = require('../hooks/lib/history');
@@ -102,6 +102,8 @@ function page() {
  .btnrow{margin-top:12px;display:flex;gap:8px}
  button.act{padding:8px 18px;border:0;border-radius:7px;background:#2563eb;color:#fff;font-size:13px;cursor:pointer}
  button.act.alt{background:#fff;color:#344054;border:1px solid #d0d5dd}
+ button.act.danger{background:#fff;color:#b91c1c;border:1px solid #fda29b}
+ button.act:disabled{opacity:.55;cursor:default}
  #msg{margin-top:10px;padding:9px 11px;border-radius:7px;display:none;white-space:pre-wrap;font-size:13px}
  .ok{background:#ecfdf3;border:1px solid #abefc6;color:#067647} .bad{background:#fef3f2;border:1px solid #fecdca;color:#b42318}
  .hintline{color:#667085;font-size:12px;margin-top:4px;word-break:break-all}
@@ -111,7 +113,7 @@ function page() {
 <h1>🛡️ zcode-advisor 配置面板</h1>
 <div class="card"><h2>当前状态</h2>
 <div style="font-size:13px">配置文件：<code>${esc(USER_CONFIG)}</code></div>
-<div style="font-size:13px;margin-top:4px">API key：<code>${esc(statusKey)}</code> ｜ 模型：<code>${esc(statusModel)}</code> ｜ 模式：<code>${esc(cfg.reviewMode || 'async')}</code> ｜ 来源：<code>${src === 'zcode' ? 'ZCode 已维护' : '手动维护'}</code></div>
+<div style="font-size:13px;margin-top:4px">API key：<code id="st-key">${esc(statusKey)}</code> ｜ 模型：<code>${esc(statusModel)}</code> ｜ 模式：<code>${esc(cfg.reviewMode || 'async')}</code> ｜ 来源：<code>${src === 'zcode' ? 'ZCode 已维护' : '手动维护'}</code></div>
 <small>保存后**下一轮审查即生效**，无需重启 ZCode；新建会话后斜杠命令（/advisor-status 等）可用。</small>
 </div>
 <div class="card"><h2>审查副模型</h2>
@@ -153,7 +155,9 @@ function page() {
 <div class="btnrow">
  <button class="act" onclick="save()">保存配置</button>
  <button class="act alt" onclick="ping()">Ping 测试（验证 key 与模型）</button>
+ <button class="act danger" id="clearBtn" onclick="clearKey()">清除 API key</button>
 </div>
+<small class="hintline">清除只移除本机配置文件里的 key（环境变量 key 不受影响）；要作废已泄露的 key 请到智谱/Z.ai 控制台吊销。</small>
 <div id="msg"></div>
 </div>
 <div class="card"><h2>📜 顾问意见记录（最近 50 条）</h2>
@@ -227,6 +231,18 @@ async function ping(){
  msg('Ping 中…',true);
  const r=await post('/api/ping',formBody());
  msg(r.ok?('Ping OK（'+r.ms+'ms）— 端点可达、认证与模型有效'+(r.note||'')):('Ping 失败 → '+r.error+(r.hint?('：'+r.hint):'')),r.ok);
+}
+async function clearKey(){
+ if(!confirm('确定清除已保存的 API key？\\n清除后顾问将无 key 可用（状态显示 missing:apiKey，静默跳过审查）。\\n如 key 已泄露，清除本地副本不等于作废——请到智谱/Z.ai 控制台吊销。'))return;
+ const btn=$('clearBtn');btn.disabled=true;
+ try{
+  const r=await post('/api/clear-key',{});
+  const cleared=r.ok&&r.removed&&r.removed.length;
+  // 只有真删了才把状态行置为未设置：env key（ZCODE_ADVISOR_API_KEY 等）不在配置文件里，
+  // 清除不影响它——无差别写「未设置」会让用户以为 env key 也没了，而审查/Ping 其实照常。
+  msg(r.ok?(cleared?('已清除 API key（'+r.removed.join('、')+'）；若环境变量仍配了 key，审查与 Ping 仍会成功'):'配置里没有已保存的 API key（环境变量 key 不受影响）'):(r.lockTimeout?'清除失败：配置文件正被其他进程写入，请稍后重试':('清除失败：'+r.error)),r.ok);
+  if(cleared)$('st-key').textContent='（未设置）';
+ }catch(e){msg('清除失败：'+e,false);}finally{btn.disabled=false;}
 }
 </script></body></html>`;
 }
@@ -328,6 +344,40 @@ const server = http.createServer((req, res) => {
           return;
         }
         send(200, { ok: true, file: r.file });
+      } catch (err) {
+        send(500, { ok: false, error: String(err).slice(0, 200) });
+      }
+    });
+    return;
+  }
+  // 清除已保存的 apiKey：与保存同源防护、同一把锁。错误一律 JSON（前端按 ok 分红绿条），
+  // 非 JSON 错误体会让 clearKey 的 r.error 变成 undefined，用户只看到"清除失败：undefined"。
+  if (req.method === 'POST' && req.url === '/api/clear-key') {
+    if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
+    req.on('end', () => {
+      try {
+        // 解析与落盘分开包 try：文件系统错误（权限/磁盘/rename）不能伪装成
+        // 「请求体不是合法 JSON」的 400——那是两个不同性质的失败。
+        let parsed;
+        try {
+          parsed = JSON.parse(body || '{}');
+        } catch (err) {
+          send(400, { ok: false, error: '请求体不是合法 JSON：' + String(err).slice(0, 160) });
+          return;
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          send(400, { ok: false, error: '请求体必须是 JSON 对象' });
+          return;
+        }
+        const r = removeUserConfigKeys(['apiKey'], USER_CONFIG);
+        if (r.error) { send(400, { ok: false, error: r.error }); return; }
+        if (r.lockTimeout) {
+          send(503, { ok: false, lockTimeout: true, error: '配置文件正被其他进程写入，请等几秒重试' });
+          return;
+        }
+        send(200, { ok: true, removed: r.removed });
       } catch (err) {
         send(500, { ok: false, error: String(err).slice(0, 200) });
       }

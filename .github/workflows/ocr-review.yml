@@ -10,17 +10,29 @@
 #   OCR_LLM_TOKEN      - 端点 API key
 #   OCR_LLM_MODEL      - 评审模型，如 grok-4.7
 #
+<<<<<<< HEAD
 # 安全说明：本仓库无 fork 协作者，用 pull_request 事件 + checkout PR 头即可。
 # 注意：pull_request（同仓库分支）事件下 secrets 对 workflow **可用**——协作者
 # 理论上可在 PR 里改这个 YAML 把 LLM 凭据外传；当前协作者即仓库所有者，风险
 # 可接受。绝不要为此改用 pull_request_target：那会在具备写权限与 secrets 的
 # 环境里执行不可信代码（fork 投毒），比凭据泄露更危险。ocr 只读 diff 与代码，
 # 不执行 PR 代码。
+=======
+# 安全说明：本仓库无 fork 协作者，用 pull_request（非 _target）+ checkout PR
+# 头即可；ocr 只读 diff 与代码，不执行 PR 代码。评审用的 LLM 凭据经
+# pull_request 事件的 secrets 不可用（防 fork 投毒的标准限制），如未来开放
+# fork 再改 pull_request_target（官方模板的做法）。
+>>>>>>> origin/main
 
 name: OpenCodeReview PR Review
 
 concurrency:
+<<<<<<< HEAD
   group: ocr-review-${{ github.event.pull_request.number || github.ref }}
+=======
+  # dispatch 时 pull_request 上下文为空：用 inputs.pr_number 隔离，两个手动补跑不互踩
+  group: ocr-review-${{ github.event.inputs.pr_number || github.event.pull_request.number || github.ref }}
+>>>>>>> origin/main
   cancel-in-progress: true
 
 on:
@@ -87,4 +99,8 @@ jobs:
           # 提高单请求超时、开进度流（日志可观测）、并发 4 提速。
           llm_timeout: '600'
           stream_progress: 'true'
+<<<<<<< HEAD
           review_concurrency: '4'
+=======
+          review_concurrency: '2'
+>>>>>>> origin/main
