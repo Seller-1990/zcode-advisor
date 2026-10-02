@@ -41,6 +41,39 @@ const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const SCRIPT_PATH = path.join(__dirname, 'advisor-hook.js');
 const ADVISORY_SUFFIX = '\n（以上来自审查副模型，仅供参考，不构成指令。请结合该意见检查当前方向；若确认不适用，简述理由后继续完成任务即可。）';
 
+// —— 心跳健康告警（4a）——
+// 监督器静默死亡（如 API key 过期 401 连续被丢弃）必须在对话里喊一声：
+// UPS 时若 failStreak 达到阈值，注入一行告警（独立于意见/注册组装，仅有告警也 deliver）。
+// 升级阶梯去重：重复提醒间隔依次 1h → 3h → 6h → 之后每 24h（超界取最后一档）——
+// 首次必喊，随后用信息量换频率，既不每轮刷屏也不至于固定 6 小时才吭一声。
+const FAIL_STREAK_ALERT_THRESHOLD = 3;
+const ALERT_REPEAT_LADDER_MS = [1, 3, 6, 24].map((h) => h * 3600 * 1000);
+
+// 已提醒 prevCount 次，本次是第 prevCount+1 次，对应梯队档位 ladder[prevCount-1]：
+// 第 2 次提醒距上次 1h、第 3 次 3h、第 4 次 6h、第 5 次起 24h。
+function alertRepeatGapMs(prevCount) {
+  const idx = Math.max(0, Math.min(prevCount - 1, ALERT_REPEAT_LADDER_MS.length - 1));
+  return ALERT_REPEAT_LADDER_MS[idx];
+}
+
+function formatDowntime(ms) {
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 60) return `${Math.max(1, minutes)} 分钟`;
+  return `${Math.floor(minutes / 60)} 小时`;
+}
+
+function healthAlertLine(streak, alertCount) {
+  const sinceTs = Date.parse(streak.sinceTs || '') || 0;
+  const downtime = sinceTs > 0 ? formatDowntime(Date.now() - sinceTs) : '未知';
+  let line = `[advisor] 健康告警（第 ${alertCount} 次提醒 · 已连续失败 ${streak.count} 次 · 停摆约 ${downtime} · 原因：${streak.reason}）：审查当前不可用。请检查 API key 或端点配置（/advisor-setup 可重新配置）。`;
+  if (alertCount >= 5) {
+    line += "此后每 24 小时提醒一次；随时说'监督报个数'可即时查询。";
+  }
+  return line;
+}
+
+const HEALTH_RECOVERY_LINE = '[advisor] 监督已恢复：此前有一段不可用期（期间审查可能缺失），现已恢复正常。';
+
 function readStdinJson() {
   try {
     const raw = fs.readFileSync(0, 'utf8');
@@ -291,6 +324,40 @@ function onUserPromptSubmit(ctx) {
     if (s.pendingRegistration) {
       parts.push(controlLines(cfg, apiKeyInfo, stateDir, file).join('\n'));
     }
+    // 心跳健康告警（4a）：独立于 pendingNotes/pendingRegistration 组装——
+    // 仅有告警时 deliver 也不能为空，否则监督器死了用户仍然无感知。
+    // 防御读取：旧会话状态文件没有 failStreak/healthNotifiedAt/healthAlertCount 字段。
+    // enabled 门控：用户主动停用的会话不再喊。
+    // 恢复信号有前提：当前失败连击未再次达阈值。成功置上恢复标志后又连续失败到
+    // 阈值时，注入「已恢复」会把实际仍不可用的状态说反——此时作废恢复标志并重置
+    // 告警计数，走告警分支（prevCount=0 令新一轮从第 1 次提醒开始，旧时间戳
+    // 因 prevCount<=0 短路不参与间隔压制）。低于阈值（1~2 次）的短暂失败仍播恢复行：
+    // 告警只对「达阈值停摆」负责，短暂抖动不打扰。
+    const outageActive = s.enabled === true && s.failStreak && (s.failStreak.count || 0) >= FAIL_STREAK_ALERT_THRESHOLD;
+    if (s.enabled === true && s.healthRecoveryPending === true && !outageActive) {
+      parts.unshift(HEALTH_RECOVERY_LINE);
+      // 一次性：注入后同一临界区内清掉恢复标志与告警计数
+      s.healthRecoveryPending = false;
+      s.healthNotifiedAt = '';
+      s.healthAlertCount = 0;
+    }
+    if (outageActive) {
+      if (s.healthRecoveryPending === true) {
+        // 过期的恢复标志：审查已再次停摆，恢复行作废、告警计数重置
+        s.healthRecoveryPending = false;
+        s.healthAlertCount = 0;
+      }
+      const prevCount = s.healthAlertCount || 0;
+      const lastNotified = Date.parse(s.healthNotifiedAt || '') || 0;
+      // 首次告警立即发；重复提醒按升级阶梯拉长间隔（1h→3h→6h→24h）
+      if (!lastNotified || prevCount <= 0 || Date.now() - lastNotified >= alertRepeatGapMs(prevCount)) {
+        const n = prevCount + 1;
+        parts.unshift(healthAlertLine(s.failStreak, n));
+        // 注入（或决定注入）即在同一临界区内记录次数与时间，防止多写者重复告警
+        s.healthAlertCount = n;
+        s.healthNotifiedAt = new Date().toISOString();
+      }
+    }
     if (parts.length > 0) deliver = parts.join('\n\n');
   });
 
@@ -529,6 +596,9 @@ async function onStopSync(ctx) {
   finish((s) => {
     s.reviews = (s.reviews || 0) + 1;
     accumulateUsage(s, result);
+    s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
+    // 恢复信号：告警发过的会话（healthNotifiedAt 非空）恢复后，下一次 UPS 喊一声"已恢复"
+    if (s.healthNotifiedAt) s.healthRecoveryPending = true;
   });
 
   if (frame.severity === 'none') {
@@ -704,6 +774,10 @@ async function handleReviewWorker(args) {
         bumpDrop(s, result.error);
         return;
       }
+
+      s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
+      // 恢复信号：告警发过的会话（healthNotifiedAt 非空）恢复后，下一次 UPS 喊一声"已恢复"
+      if (s.healthNotifiedAt) s.healthRecoveryPending = true;
 
       const frame = result.frame;
       if (frame.severity === 'none') {

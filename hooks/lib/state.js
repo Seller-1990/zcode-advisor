@@ -39,6 +39,10 @@ function freshState(sessionId, transcriptPath, startEnabled) {
     steers: 0,
     deferred: 0,
     dropped: {},
+    failStreak: null,
+    healthNotifiedAt: '',
+    healthAlertCount: 0,
+    healthRecoveryPending: false,
     tokensIn: 0,
     tokensOut: 0,
     sessionModel: '',
@@ -249,6 +253,18 @@ function pruneStates(stateDir, maxAgeDays, keep) {
   }
 }
 
+// —— 心跳健康告警（4a）：失败连击 failStreak ——
+// 白名单语义：只有「审查本身失败」的原因计入 failStreak（llm_* 前缀统一匹配
+// HTTP/超时/空响应等模型侧失败；解析、转录、台账写失败按精确名单）。
+// busy/global_busy/queue_overflow/worker_error/spawn_failed 等表示「审查没跑成」
+// 而非「审查失败」——冻结不改写 failStreak，避免并发堆积被误报为健康问题。
+const FAIL_STREAK_REASONS_EXACT = ['unparsed', 'parse_empty', 'no_transcript', 'ledger_write_failed'];
+
+function isFailStreakReason(reason) {
+  const r = String(reason || '');
+  return r.startsWith('llm_') || FAIL_STREAK_REASONS_EXACT.includes(r);
+}
+
 // 丢弃分类计数 + **最近一次发生时间**。
 //
 // 对齐上游 dsh-advisor v0.5.4 的 KD-I3 可见性语义（issue #102）：
@@ -256,6 +272,9 @@ function pruneStates(stateDir, maxAgeDays, keep) {
 // "advisor 在跑但从不说话" 可被发现，而不是只能开 debug 才看见。
 // 这里用最小侵入的方式实现同等能力：保留原有 dropped[reason] 计数形状不变
 // （既有 status 输出与测试依赖它），时间戳记入同级的 droppedAt[reason]。
+// 同时维护 failStreak（4a）：同因连击累加，白名单异因切换重置，
+// 非白名单原因冻结——UPS 侧据此在连续失败达到阈值时注入健康告警。
+// failStreak.sinceTs 记录本轮连击的起点，告警消息据此显示"停摆约 X 小时"。
 function bumpDrop(state, reason) {
   if (!reason) reason = 'unknown';
   state.dropped = state.dropped || {};
@@ -263,6 +282,19 @@ function bumpDrop(state, reason) {
   // 最近一次该类别丢弃的时间（用于回答"最后一次空回复/解析失败是多久前"）
   state.droppedAt = state.droppedAt || {};
   state.droppedAt[reason] = new Date().toISOString();
+  if (isFailStreakReason(reason)) {
+    if (state.failStreak && state.failStreak.reason === reason) {
+      state.failStreak.count = (state.failStreak.count || 0) + 1;
+      // 防御：旧版本写入的 streak 无 sinceTs（升级横跨一次连击），补当前时间为停摆起点
+      if (!state.failStreak.sinceTs) state.failStreak.sinceTs = new Date().toISOString();
+    } else {
+      state.failStreak = { reason, count: 1, sinceTs: new Date().toISOString() };
+      // 连击身份已切换（新故障类型）：旧故障积累的告警计数一并清零——
+      // 否则新故障达阈值后沿用旧阶梯（1h→3h→…）被压住，用户看不到新停摆。
+      // healthNotifiedAt 保留：本轮故障恢复后仍能补一声"已恢复"。
+      state.healthAlertCount = 0;
+    }
+  }
 }
 
 // —— 审查互斥锁（防同一会话并行审查堆积）——
@@ -322,6 +354,6 @@ function countLocks(stateDir, staleMs) {
 
 module.exports = {
   ensureState, loadState, loadStateDetailed, saveState, mutateStateExclusive, latestStatePath, listStatePaths, stateFilePath,
-  sanitizeSessionId, pruneStates, bumpDrop, freshState, createLock, clearLock, clearLockIfOwner,
+  sanitizeSessionId, pruneStates, bumpDrop, isFailStreakReason, freshState, createLock, clearLock, clearLockIfOwner,
   lockPathFor, countLocks, sleepSync
 };

@@ -10,7 +10,9 @@
   "mcpServers": {
     "config-bridge": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/tools/config-bridge.js"],
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/tools/config-bridge.js"
+      ],
       "env": {
         "ZCODE_ADVISOR_CFG_API_KEY": "${user_config.api_key}",
         "ZCODE_ADVISOR_CFG_MODEL": "${user_config.model}",

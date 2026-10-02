@@ -458,3 +458,325 @@ test('快照清理：保留窗口不小于并发 worker 数（不删在飞快照
   const nowSnap = path.join(snapDir, 'keepme.jsonl');
   assert.ok(fs.existsSync(nowSnap), '本轮快照必须存在（绝不能被自己触发的清理删掉）');
 });
+
+// ---------------- 4a 心跳健康告警：失败连击在对话内喊一声 ----------------
+// 监督器静默死亡问题：审查连续失败（如 API key 过期 401）此前只进 dropped 计数，
+// 用户完全无感知。failStreak 达阈值后 UPS 注入告警，重复提醒按升级阶梯
+// （1h→3h→6h→24h）拉长间隔；恢复成功后下一次 UPS 喊一声"已恢复"（一次性）。
+
+// 每轮审查之间必须追加转录增量：sync 与手动 worker（持续文件路径）都只审增量，
+// 无增量则不发起审查、也就不 bumpDrop。
+function appendTurn(transcript, text) {
+  fs.appendFileSync(transcript, JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } }) + '\n');
+}
+
+test('4a 健康告警：升级阶梯——1h 内不重发，1h/3h/6h/24h 档依次放行', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const env = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    // severity 非法 → parseFrame 返回 null → unparsed（mock 与生产同口径）
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"catastrophic","note":"非法级别"}'
+  });
+  const stateFile = path.join(stateDir, 'sess-h1.json');
+  // 把 healthNotifiedAt 拨回到 ms 毫秒前（模拟距上次提醒已过 ms），可选补丁改写其他字段
+  const backdate = (ms, patch) => {
+    const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    raw.healthNotifiedAt = new Date(Date.now() - ms).toISOString();
+    if (patch) patch(raw);
+    fs.writeFileSync(stateFile, JSON.stringify(raw, null, 2), 'utf8');
+  };
+  // 先消费注册行（此时 failStreak 未满，UPS 只发注册行）
+  runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '开始' }, env);
+
+  for (let i = 0; i < 3; i++) {
+    appendTurn(transcript, `第 ${i + 1} 轮失败内容`);
+    runHook(['stop'], { session_id: 'h1', transcript_path: transcript }, env);
+  }
+  let state = readState(stateDir, 'h1');
+  assert.strictEqual(state.failStreak.count, 3);
+  assert.strictEqual(state.failStreak.reason, 'unparsed');
+  assert.ok(state.failStreak.sinceTs, 'failStreak 应带连击起点 sinceTs');
+
+  // 第 1 次提醒：count=3、pendingNotes 为空，仅有告警也必须 emit
+  // （回归关键：旧逻辑 parts 为空就 return，告警会被吞掉）
+  const r = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
+  assert.strictEqual(r.status, 0);
+  const line1 = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(line1.includes('健康告警'), '应注入健康告警行');
+  assert.ok(line1.includes('第 1 次提醒'), '应标注第 1 次提醒');
+  assert.ok(line1.includes('已连续失败 3 次'));
+  assert.ok(line1.includes('原因：unparsed'), '应含失败原因');
+  assert.ok(line1.includes('停摆约'), '应含停摆时长');
+  assert.ok(line1.includes('/advisor-setup'), '应含可操作提示');
+  assert.ok(!line1.includes('监督报个数'), '第 1 次提醒不附 24h 节奏说明');
+  state = readState(stateDir, 'h1');
+  assert.strictEqual(state.healthAlertCount, 1);
+  assert.ok(state.healthNotifiedAt, '注入时应写入 healthNotifiedAt');
+  assert.ok(!Number.isNaN(Date.parse(state.healthNotifiedAt)), 'healthNotifiedAt 应为合法 ISO 时间');
+
+  // 1h 档拒绝：刚刚提醒过 → 无输出（注册行已消费、无意见、阶梯未到）
+  const r2 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
+  assert.strictEqual(r2.stdout.trim(), '');
+
+  // 1h 档通过：距上次 2h ≥ 1h → 第 2 次提醒
+  backdate(2 * 3600 * 1000);
+  const r3 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
+  assert.ok(JSON.parse(r3.stdout).hookSpecificOutput.additionalContext.includes('第 2 次提醒'));
+  assert.strictEqual(readState(stateDir, 'h1').healthAlertCount, 2);
+
+  // 3h 档拒绝：距上次 2h < 3h → 不重发
+  backdate(2 * 3600 * 1000);
+  const r4 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
+  assert.strictEqual(r4.stdout.trim(), '');
+
+  // 3h 档通过：距上次 3.5h → 第 3 次提醒；同时把停摆起点拨回 5h 前验证"停摆约 X 小时"
+  backdate(3.5 * 3600 * 1000, (raw) => {
+    raw.failStreak.sinceTs = new Date(Date.now() - 5 * 3600 * 1000).toISOString();
+  });
+  const r5 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
+  const line5 = JSON.parse(r5.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(line5.includes('第 3 次提醒'));
+  assert.ok(line5.includes('停摆约 5 小时'), '停摆超 1 小时应以小时显示');
+
+  // 6h 档拒绝：距上次 4h < 6h → 不重发
+  backdate(4 * 3600 * 1000);
+  const r6 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
+  assert.strictEqual(r6.stdout.trim(), '');
+
+  // 6h 档通过：距上次 7h → 第 4 次提醒
+  backdate(7 * 3600 * 1000);
+  const r7 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
+  assert.ok(JSON.parse(r7.stdout).hookSpecificOutput.additionalContext.includes('第 4 次提醒'));
+
+  // 24h 档（最后一档，超界取 24h）：距上次 30h → 第 5 次提醒，附提醒节奏说明
+  backdate(30 * 3600 * 1000);
+  const r8 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
+  const line8 = JSON.parse(r8.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(line8.includes('第 5 次提醒'));
+  assert.ok(line8.includes('此后每 24 小时提醒一次'), '第 5 次起应附提醒节奏说明');
+  assert.ok(line8.includes('监督报个数'), '节奏说明应含即时查询入口');
+});
+
+test('4a 健康告警：count=2 不发；enabled=false 不发', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const env = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"catastrophic","note":"非法级别"}'
+  });
+  runHook(['user-prompt-submit'], { session_id: 'h2', transcript_path: transcript, prompt: '开始' }, env);
+  appendTurn(transcript, '第一轮失败内容');
+  runHook(['stop'], { session_id: 'h2', transcript_path: transcript }, env);
+  appendTurn(transcript, '第二轮失败内容');
+  runHook(['stop'], { session_id: 'h2', transcript_path: transcript }, env);
+  assert.strictEqual(readState(stateDir, 'h2').failStreak.count, 2);
+  assert.strictEqual(readState(stateDir, 'h2').failStreak.reason, 'unparsed');
+
+  // count=2 低于阈值：不告警（注册行已消费、无意见 → 无输出）
+  const r = runHook(['user-prompt-submit'], { session_id: 'h2', transcript_path: transcript, prompt: '继续' }, env);
+  assert.strictEqual(r.stdout.trim(), '');
+  assert.strictEqual(readState(stateDir, 'h2').healthNotifiedAt, '');
+
+  // enabled=false：不告警（先凑满 3 次失败，再停用）
+  appendTurn(transcript, '第三轮失败内容');
+  runHook(['stop'], { session_id: 'h2', transcript_path: transcript }, env);
+  const off = runHook(['ctl', 'off', '--state', path.join(stateDir, 'sess-h2.json')], null, env);
+  assert.ok(off.stdout.includes('已停用'));
+  const r2 = runHook(['user-prompt-submit'], { session_id: 'h2', transcript_path: transcript, prompt: '继续' }, env);
+  assert.strictEqual(r2.stdout.trim(), '');
+  assert.strictEqual(readState(stateDir, 'h2').healthNotifiedAt, '');
+});
+
+test('4a 健康告警：sync 成功审查后 failStreak 重置为 null，不再告警', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const envFail = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"catastrophic","note":"非法级别"}'
+  });
+  runHook(['user-prompt-submit'], { session_id: 'h3', transcript_path: transcript, prompt: '开始' }, envFail);
+  for (let i = 0; i < 3; i++) {
+    appendTurn(transcript, `第 ${i + 1} 轮失败内容`);
+    runHook(['stop'], { session_id: 'h3', transcript_path: transcript }, envFail);
+  }
+  assert.strictEqual(readState(stateDir, 'h3').failStreak.count, 3);
+  assert.strictEqual(readState(stateDir, 'h3').failStreak.reason, 'unparsed');
+
+  // 成功审查（合法 none 帧，不入队不打扰）→ failStreak 清零
+  const envOk = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"none","note":"没有问题"}'
+  });
+  appendTurn(transcript, '恢复后的新一轮内容');
+  runHook(['stop'], { session_id: 'h3', transcript_path: transcript }, envOk);
+  assert.strictEqual(readState(stateDir, 'h3').failStreak, null);
+
+  const r = runHook(['user-prompt-submit'], { session_id: 'h3', transcript_path: transcript, prompt: '继续' }, envOk);
+  assert.strictEqual(r.stdout.trim(), '');
+});
+
+test('4a 健康告警：async worker 成功审查后 failStreak 同样清零', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const stateFile = path.join(stateDir, 'sess-h4.json');
+  const envFail = makeEnv(stateDir, {
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"catastrophic","note":"非法级别"}'
+  });
+  runHook(['user-prompt-submit'], { session_id: 'h4', transcript_path: transcript, prompt: '开始' }, envFail);
+  for (let i = 0; i < 3; i++) {
+    appendTurn(transcript, `第 ${i + 1} 轮失败内容`);
+    runHook(['stop'], { session_id: 'h4', transcript_path: transcript }, envFail);
+    runHook(['review-worker', '--state', stateFile], null, envFail);
+  }
+  assert.strictEqual(readState(stateDir, 'h4').failStreak.count, 3);
+  assert.strictEqual(readState(stateDir, 'h4').failStreak.reason, 'unparsed');
+
+  const envOk = makeEnv(stateDir, {
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"none","note":"没有问题"}'
+  });
+  appendTurn(transcript, '恢复后的新一轮内容');
+  runHook(['stop'], { session_id: 'h4', transcript_path: transcript }, envOk);
+  runHook(['review-worker', '--state', stateFile], null, envOk);
+  assert.strictEqual(readState(stateDir, 'h4').failStreak, null);
+});
+
+test('4a 健康告警：旧形状 state 文件（无新字段）升级后不炸', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const env = makeEnv(stateDir);
+  runHook(['session-start'], { session_id: 'h5', transcript_path: transcript }, env);
+  // 手工抹掉新字段，模拟旧版本写入的会话状态
+  const stateFile = path.join(stateDir, 'sess-h5.json');
+  const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  delete raw.failStreak;
+  delete raw.healthNotifiedAt;
+  delete raw.healthAlertCount;
+  delete raw.healthRecoveryPending;
+  fs.writeFileSync(stateFile, JSON.stringify(raw, null, 2), 'utf8');
+
+  // UPS：failStreak 缺失时防御读取，不得抛错
+  const r = runHook(['user-prompt-submit'], { session_id: 'h5', transcript_path: transcript, prompt: 'x' }, env);
+  assert.strictEqual(r.status, 0);
+
+  // stop（审查失败）：bumpDrop 应在缺失字段上正常建立 failStreak（新版形状带 sinceTs）
+  const envFail = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"catastrophic","note":"非法级别"}'
+  });
+  const r2 = runHook(['stop'], { session_id: 'h5', transcript_path: transcript }, envFail);
+  assert.strictEqual(r2.status, 0);
+  const streak = readState(stateDir, 'h5').failStreak;
+  assert.strictEqual(streak.reason, 'unparsed');
+  assert.strictEqual(streak.count, 1);
+  assert.ok(streak.sinceTs, '新建连击应带 sinceTs');
+
+  // 旧版本形状的 failStreak（无 sinceTs）达阈值：告警照发，停摆时长防御显示"未知"
+  const raw2 = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  raw2.failStreak = { reason: 'unparsed', count: 3 };
+  delete raw2.healthNotifiedAt;
+  delete raw2.healthAlertCount;
+  delete raw2.healthRecoveryPending;
+  fs.writeFileSync(stateFile, JSON.stringify(raw2, null, 2), 'utf8');
+  const r3 = runHook(['user-prompt-submit'], { session_id: 'h5', transcript_path: transcript, prompt: 'x' }, envFail);
+  assert.strictEqual(r3.status, 0);
+  const line = JSON.parse(r3.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(line.includes('健康告警'), '旧形状 state 上告警应照常触发');
+  assert.ok(line.includes('第 1 次提醒'), '缺 healthAlertCount 时按第 1 次提醒计');
+  assert.ok(line.includes('停摆约 未知'), '缺 sinceTs 时停摆时长防御显示未知');
+});
+
+test('4a 恢复信号：告警过的会话恢复后下一次 UPS 喊一声（一次性）', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const envFail = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"catastrophic","note":"非法级别"}'
+  });
+  runHook(['user-prompt-submit'], { session_id: 'h6', transcript_path: transcript, prompt: '开始' }, envFail);
+  for (let i = 0; i < 3; i++) {
+    appendTurn(transcript, `第 ${i + 1} 轮失败内容`);
+    runHook(['stop'], { session_id: 'h6', transcript_path: transcript }, envFail);
+  }
+  // 触发第 1 次告警（此后 healthNotifiedAt 非空）
+  const r = runHook(['user-prompt-submit'], { session_id: 'h6', transcript_path: transcript, prompt: '继续' }, envFail);
+  assert.ok(JSON.parse(r.stdout).hookSpecificOutput.additionalContext.includes('健康告警'));
+
+  // 恢复成功（拿到合法 frame）→ 置恢复标志但不立即注入
+  const envOk = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"none","note":"没有问题"}'
+  });
+  appendTurn(transcript, '恢复后的新一轮内容');
+  runHook(['stop'], { session_id: 'h6', transcript_path: transcript }, envOk);
+  const state = readState(stateDir, 'h6');
+  assert.strictEqual(state.healthRecoveryPending, true, '告警过的会话恢复后应置恢复标志');
+  assert.strictEqual(state.failStreak, null);
+
+  // 下一次 UPS：注入恢复行，同一临界区内清掉恢复标志/告警时间/告警计数
+  const r2 = runHook(['user-prompt-submit'], { session_id: 'h6', transcript_path: transcript, prompt: '继续' }, envOk);
+  const line = JSON.parse(r2.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(line.includes('监督已恢复'), '应注入恢复信号');
+  assert.ok(!line.includes('健康告警'), '恢复轮不应同屏再注入告警');
+  const state2 = readState(stateDir, 'h6');
+  assert.strictEqual(state2.healthRecoveryPending, false);
+  assert.strictEqual(state2.healthNotifiedAt, '');
+  assert.strictEqual(state2.healthAlertCount, 0);
+
+  // 一次性：再一轮 UPS 不再发恢复消息
+  const r3 = runHook(['user-prompt-submit'], { session_id: 'h6', transcript_path: transcript, prompt: '继续' }, envOk);
+  assert.strictEqual(r3.stdout.trim(), '');
+});
+
+test('4a 恢复信号：从未告警过的会话不发恢复消息', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const envFail = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"catastrophic","note":"非法级别"}'
+  });
+  runHook(['user-prompt-submit'], { session_id: 'h7', transcript_path: transcript, prompt: '开始' }, envFail);
+  appendTurn(transcript, '失败一轮（未达告警阈值）');
+  runHook(['stop'], { session_id: 'h7', transcript_path: transcript }, envFail);
+  // 从未告警（healthNotifiedAt 为空）：成功后不得置恢复标志
+  const envOk = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"none","note":"没有问题"}'
+  });
+  appendTurn(transcript, '恢复后的新一轮内容');
+  runHook(['stop'], { session_id: 'h7', transcript_path: transcript }, envOk);
+  assert.strictEqual(readState(stateDir, 'h7').healthRecoveryPending, false);
+  const r = runHook(['user-prompt-submit'], { session_id: 'h7', transcript_path: transcript, prompt: '继续' }, envOk);
+  assert.strictEqual(r.stdout.trim(), '');
+});
+
+test('4a 恢复信号作废：告警后恢复置标志、再次连败到阈值 → 发告警不发恢复行', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const envFail = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"catastrophic","note":"非法级别"}'
+  });
+  runHook(['user-prompt-submit'], { session_id: 'h8', transcript_path: transcript, prompt: '开始' }, envFail);
+  for (let i = 0; i < 3; i++) {
+    appendTurn(transcript, `停摆轮 ${i + 1}`);
+    runHook(['stop'], { session_id: 'h8', transcript_path: transcript }, envFail);
+  }
+  // 第 1 次告警（healthNotifiedAt 非空）
+  const r1 = runHook(['user-prompt-submit'], { session_id: 'h8', transcript_path: transcript, prompt: '继续' }, envFail);
+  assert.ok(JSON.parse(r1.stdout).hookSpecificOutput.additionalContext.includes('健康告警'));
+
+  // 恢复一轮 → 置恢复标志
+  const envOk = makeEnv(stateDir, {
+    ZCODE_ADVISOR_REVIEW_MODE: 'sync',
+    ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"none","note":"没有问题"}'
+  });
+  appendTurn(transcript, '短暂恢复轮');
+  runHook(['stop'], { session_id: 'h8', transcript_path: transcript }, envOk);
+  assert.strictEqual(readState(stateDir, 'h8').healthRecoveryPending, true);
+
+  // 再次连败到阈值：恢复标志必须作废（不发「已恢复」），立即重新告警（第 1 次提醒，不走旧阶梯）
+  for (let i = 0; i < 3; i++) {
+    appendTurn(transcript, `二次停摆轮 ${i + 1}`);
+    runHook(['stop'], { session_id: 'h8', transcript_path: transcript }, envFail);
+  }
+  const r2 = runHook(['user-prompt-submit'], { session_id: 'h8', transcript_path: transcript, prompt: '继续' }, envFail);
+  const line = JSON.parse(r2.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(!line.includes('监督已恢复'), '再次停摆达阈值时不得注入恢复行（状态说反）');
+  assert.ok(line.includes('健康告警'), '应重新注入告警');
+  assert.ok(line.includes('第 1 次提醒'), `作废重置后应从第 1 次提醒开始（旧阶梯被清）：${line}`);
+  const st = readState(stateDir, 'h8');
+  assert.strictEqual(st.healthRecoveryPending, false, '过期恢复标志应被作废');
+});
