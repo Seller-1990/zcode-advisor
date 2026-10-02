@@ -275,6 +275,10 @@ function bumpDrop(state, reason) {
       if (!state.failStreak.sinceTs) state.failStreak.sinceTs = new Date().toISOString();
     } else {
       state.failStreak = { reason, count: 1, sinceTs: new Date().toISOString() };
+      // 连击身份已切换（新故障类型）：旧故障积累的告警计数一并清零——
+      // 否则新故障达阈值后沿用旧阶梯（1h→3h→…）被压住，用户看不到新停摆。
+      // healthNotifiedAt 保留：本轮故障恢复后仍能补一声"已恢复"。
+      state.healthAlertCount = 0;
     }
   }
 }
