@@ -320,9 +320,59 @@ function readUserConfig() {
   try { return JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8')) || {}; } catch (_) { return {}; }
 }
 
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch (_) {}
+}
+
+// 配置文件跨进程 RMW 临界区。
+// **锁协议的 vendored 双副本必须逐字一致**：本文件与 tools/config-bridge.js（本发行包
+// 不含 hooks/，无法 require 共享，只能复制；test/static-guards.test.js 锁两副本的协议
+// 标记防漂移）。写方全景：config-bridge writeUserConfig（桥接启动 + setup-server 面板
+// 保存）、本文件 saveUserConfig（controller 面板保存）；auto-enable 仅「不存在则创建」。
+//   协议：锁文件 <target>.lock，内容=持有者 pid，wx 抢建；持有者 pid 已死或锁 mtime>10s
+//   → 接管；进入与写入前双查属主，仅属主清除；EEXIST 重试 40×25ms≈1s，EACCES/EROFS
+//   等永久性失败立即放弃。
+function withConfigLock(target, fn) {
+  const lock = `${target}.lock`;
+  const myPid = String(process.pid);
+  let got = false;
+  for (let i = 0; i < 40 && !got; i++) {
+    try {
+      fs.writeFileSync(lock, myPid, { flag: 'wx' });
+      got = true;
+    } catch (err) {
+      if (!err || err.code !== 'EEXIST') return false;
+      let holder = '';
+      try { holder = fs.readFileSync(lock, 'utf8').trim(); } catch (_) {}
+      let stale = true;
+      try { stale = Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch (_) {}
+      const pid = parseInt(holder, 10);
+      let alive = false;
+      if (pid > 0) {
+        try { process.kill(pid, 0); alive = true; } catch (e) { alive = !!(e && e.code === 'EPERM'); }
+      }
+      if (!alive || stale) { try { fs.unlinkSync(lock); } catch (_) {} }
+      sleepSync(25);
+    }
+  }
+  if (!got) return false;
+  const ownLock = () => {
+    try { return fs.readFileSync(lock, 'utf8').trim() === myPid; } catch (_) { return false; }
+  };
+  try {
+    if (!ownLock()) return false;
+    return fn();
+  } finally {
+    try { if (fs.readFileSync(lock, 'utf8').trim() === myPid) fs.unlinkSync(lock); } catch (_) {}
+  }
+}
+
 function saveUserConfig(patch) {
   const allowed = {};
-  for (const k of ['apiKey', 'model', 'baseUrl', 'reviewMode', 'maxTokens', 'startEnabled']) {
+  for (const k of ['apiKey', 'model', 'baseUrl', 'reviewMode', 'maxTokens', 'startEnabled',
+    'apiSource', 'zcodeProvider', 'zcodeModel']) {
     // 注意：v 必须在所有分支之前声明——曾把 startEnabled 分支写在 const v 之前，
     // 触发 TDZ（Cannot access 'v' before initialization），使**所有保存请求** 500。
     const v = patch[k];
@@ -336,18 +386,113 @@ function saveUserConfig(patch) {
     if (k === 'maxTokens') {
       const mt = parseInt(v, 10);
       if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) allowed[k] = mt;
+    } else if (k === 'apiSource') {
+      // API 获取方式只认 manual/zcode；切换到 zcode 时清掉手动字段由「只合并非空」语义自然保留，
+      // 用户回切 manual 时原手动配置仍在。
+      const s = String(v || '').trim().toLowerCase();
+      if (s === 'manual' || s === 'zcode') allowed[k] = s;
     } else if (typeof v === 'string' && v.trim() && !/^\$\{/.test(v)) {
       allowed[k] = v.trim();
     }
   }
-  const merged = Object.assign({}, readUserConfig(), allowed);
-  // 配置含明文 apiKey：目录 0700、文件 0600（与转录快照/意见历史同级）。
+  // 读-合-写全程在跨进程临界区内：与 config-bridge 桥接启动写、setup-server 面板保存
+  // 并发时不再互相覆盖（丢更新）。锁协议见上方 withConfigLock 注释。
+  // 抢锁前先建目录：wx 建锁需要父目录存在（否则 ENOENT 被误判为永久性失败立即放弃）。
   fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true, mode: 0o700 });
-  const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, USER_CONFIG);
-  try { fs.chmodSync(USER_CONFIG, 0o600); } catch (_) {}
-  return merged;
+  const outcome = withConfigLock(USER_CONFIG, () => {
+    const merged = Object.assign({}, readUserConfig(), allowed);
+    // 配置含明文 apiKey：目录 0700、文件 0600（与转录快照/意见历史同级）。
+    const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { encoding: 'utf8', mode: 0o600 });
+    try {
+      for (let i = 0; ; i++) {
+        try { fs.renameSync(tmp, USER_CONFIG); break; } catch (err) {
+          if (i >= 2 || !err || (err.code !== 'EPERM' && err.code !== 'EACCES')) throw err;
+          sleepSync(30 * (i + 1)); // Windows 杀毒持有目标句柄时 rename EPERM（state.js 同款实证）
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+    }
+    try { fs.chmodSync(USER_CONFIG, 0o600); } catch (_) {}
+    return merged;
+  });
+  if (outcome === false) return { lockTimeout: true };
+  return outcome;
+}
+
+// —— ZCode 已维护的第三方 API（apiSource=zcode 的数据源）——
+// 解析规则与 hooks/lib/config.js 的 readZcodeProviders 同源：provider.<id> =
+// { name, kind, options: { baseURL, apiKey }, models: {...} }。独立实现是刻意的：
+// companion 发行包只有本目录四个文件（无 hooks/），跨目录 require 会静默失效
+// （与上方 readHistory 的先例同一理由）；规则若变更需两侧同步（测试锁住字段名）。
+function zcodeConfigFile() {
+  return process.env.ZCODE_ADVISOR_ZCODE_CONFIG
+    || path.join(HOME, '.zcode', 'v2', 'config.json');
+}
+
+function readZcodeProviders() {
+  let raw = null;
+  try { raw = JSON.parse(fs.readFileSync(zcodeConfigFile(), 'utf8')); } catch (_) { return []; }
+  const map = raw && raw.provider && typeof raw.provider === 'object' ? raw.provider : {};
+  const out = [];
+  for (const [id, p] of Object.entries(map)) {
+    if (!p || typeof p !== 'object') continue;
+    const opts = p.options && typeof p.options === 'object' ? p.options : {};
+    out.push({
+      id,
+      name: String(p.name || ''),
+      kind: String(p.kind || ''),
+      baseURL: String(opts.baseURL || '').trim(),
+      apiKey: String(opts.apiKey || '').trim(),
+      models: p.models && typeof p.models === 'object' ? Object.keys(p.models) : [],
+      eligible: p.kind === 'openai' || p.kind === 'openai-compatible'
+    });
+  }
+  return out;
+}
+
+function pickZcodeProvider(want) {
+  const w = String(want || '').trim();
+  if (!w) return null;
+  const all = readZcodeProviders();
+  return all.find((p) => p.id === w) || all.find((p) => p.name && p.name === w) || null;
+}
+
+// 把面板保存载荷/已存配置解析为一次真实调用的 {baseUrl, apiKey, model}。
+// manual：与旧逻辑一致，body 优先、已存配置兜底；zcode：从 ZCode provider 现读，
+// key 不出进程——页面只需要模型/端点展示，永远拿不到 apiKey 明文。
+function effectiveTarget(body) {
+  const cfg = readUserConfig();
+  const b = body || {};
+  const apiSource = String(b.apiSource || cfg.apiSource || 'manual').trim().toLowerCase();
+  if (apiSource !== 'zcode') {
+    return {
+      apiSource: 'manual',
+      baseUrl: String(b.baseUrl || cfg.baseUrl || '').trim(),
+      apiKey: String(b.apiKey || cfg.apiKey || '').trim(),
+      model: String(b.model || cfg.model || '').trim()
+    };
+  }
+  const prov = pickZcodeProvider(b.zcodeProvider || cfg.zcodeProvider || '');
+  const model = String(b.zcodeModel || cfg.zcodeModel || (prov && prov.models[0]) || '').trim();
+  // 与审查侧 applyZcodeSource 同一规则：provider 缺失/非 OpenAI 兼容/端点或 key
+  // 缺一 → 不产出任何凭据（调用方按 error 字段失败返回）。否则 Ping 用一组、
+  // 审查用另一组，或把手动 key 发往服务商端点（密钥交叉）。
+  const usable = Boolean(prov && prov.eligible && prov.baseURL && prov.apiKey);
+  const reason = !prov ? 'provider_missing'
+    : (!prov.eligible ? 'provider_ineligible'
+      : (!prov.baseURL || !prov.apiKey ? 'provider_incomplete' : ''));
+  return {
+    apiSource: 'zcode',
+    baseUrl: usable ? prov.baseURL : '',
+    apiKey: usable ? prov.apiKey : '',
+    model,
+    providerName: prov ? (prov.name || prov.id) : '',
+    providerFound: Boolean(prov),
+    providerUsable: usable,
+    providerError: reason || ''
+  };
 }
 
 // —— 本机 API ——
@@ -374,23 +519,35 @@ function normalizeChatEndpoint(baseUrl) {
 }
 
 async function ping(body) {
-  const cfg = readUserConfig();
-  const baseUrl = normalizeChatEndpoint(
-    body.baseUrl || cfg.baseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions'
-  );
-  const model = body.model || cfg.model || 'glm-5.3-flash';
-  const apiKey = body.apiKey || cfg.apiKey || '';
+  const t = effectiveTarget(body);
+  // zcode 模式 provider 不可用时按审查侧同一语义失败，绝不把空端点替换成
+  // 硬编码默认（那会把服务商 key 发到智谱官方端点）。
+  if (t.apiSource === 'zcode' && !t.providerUsable) {
+    const hints = {
+      provider_missing: 'ZCode 配置里找不到所选服务商，请重新选择',
+      provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+      provider_incomplete: 'provider 的 baseURL/apiKey 缺一，为避免密钥与端点交叉使用，Ping 已中止'
+    };
+    return { ok: false, error: t.providerError, hint: hints[t.providerError] || '' };
+  }
+  const baseUrl = normalizeChatEndpoint(t.baseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions');
+  const model = t.model || 'glm-5.3-flash';
+  const apiKey = t.apiKey || '';
   const t0 = Date.now();
   try {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 20000);
-    const r = await fetch(baseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, temperature: 0, stream: false }),
-      signal: ctl.signal
-    });
-    clearTimeout(t);
+    const timer = setTimeout(() => ctl.abort(), 20000);
+    let r;
+    try {
+      r = await fetch(baseUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, temperature: 0, stream: false }),
+        signal: ctl.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!r.ok) {
       const hint = r.status === 401 || r.status === 403 ? 'key 无效或无权限' : (r.status === 404 || r.status === 400 ? '模型 id 或端点路径不对' : '');
       return { ok: false, error: `llm_http_${r.status}`, hint, endpoint: baseUrl };
@@ -404,16 +561,35 @@ async function ping(body) {
 }
 
 async function fetchModels(body) {
-  const cfg = readUserConfig();
-  const baseUrl = body.baseUrl || cfg.baseUrl || '';
-  const apiKey = body.apiKey || cfg.apiKey || '';
-  const url = modelsUrl(baseUrl);
+  const t = effectiveTarget(body);
+  // zcode 模式：模型列表直接来自 ZCode provider 数据，无需请求端点 /models。
+  if (t.apiSource === 'zcode') {
+    if (!t.providerUsable) {
+      const hints = {
+        provider_missing: 'ZCode 配置里找不到所选服务商，请重新选择',
+        provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+        provider_incomplete: 'provider 的 baseURL/apiKey 缺一，已按审查侧同一规则中止'
+      };
+      return { ok: false, error: t.providerError, hint: hints[t.providerError] || '' };
+    }
+    if (!t.model) return { ok: false, error: 'no_models', hint: '该服务商未配置模型，请在 ZCode 设置里添加' };
+    // 整表返回（当前选中项排前）：多模型服务商不再只剩一项
+    const prov = pickZcodeProvider(body && (body.zcodeProvider || readUserConfig().zcodeProvider) || '');
+    const all = (prov && prov.models) || [];
+    const models = [t.model, ...all.filter((m) => m !== t.model)];
+    return { ok: true, models, source: 'zcode' };
+  }
+  const url = modelsUrl(t.baseUrl);
   if (!url) return { ok: false, error: 'baseUrl 为空' };
+  let r;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 12000);
   try {
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 12000);
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` }, signal: ctl.signal });
-    clearTimeout(t);
+    r = await fetch(url, { headers: { Authorization: `Bearer ${t.apiKey}` }, signal: ctl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+  try {
     if (!r.ok) {
       const hint = r.status === 401 || r.status === 403 ? 'key 无效' : '该端点可能不提供 /models，请手动输入模型 id';
       return { ok: false, error: `http_${r.status}`, hint };
@@ -449,15 +625,30 @@ function startApi(cdpPort, apiPort, token) {
           ok: true,
           config: {
             model: c.model || '', baseUrl: c.baseUrl || '', reviewMode: c.reviewMode || 'async',
-            maxTokens: c.maxTokens || 2048, keyMasked: c.apiKey ? maskKey(c.apiKey) : '（未设置）',
-            enabled: c.startEnabled !== false
+            maxTokens: c.maxTokens || 4096, keyMasked: c.apiKey ? maskKey(c.apiKey) : '（未设置）',
+            enabled: c.startEnabled !== false,
+            apiSource: c.apiSource === 'zcode' ? 'zcode' : 'manual',
+            zcodeProvider: c.zcodeProvider || '', zcodeModel: c.zcodeModel || ''
           },
           cdpPort
         });
       }
+      // ZCode 已维护的第三方 API 列表（apiSource=zcode 的选择数据源）。
+      // 只回传 id/名称/协议/端点/模型清单——apiKey 明文永不出进程。
+      if (req.method === 'GET' && req.url === '/api/zcode-providers') {
+        const providers = readZcodeProviders().map((p) => ({
+          id: p.id, name: p.name, kind: p.kind, baseURL: p.baseURL,
+          models: p.models, eligible: p.eligible, hasApiKey: Boolean(p.apiKey)
+        }));
+        return done(200, { ok: true, providers, file: zcodeConfigFile() });
+      }
       if (req.method === 'POST' && req.url === '/api/config') {
         const body = await readBody();
-        saveUserConfig(body);
+        const r = saveUserConfig(body);
+        // 锁超时必须以失败态呈现：保存不会「下次再补」，静默 ok:true 会让用户以为存上了。
+        if (r && r.lockTimeout) {
+          return done(503, { ok: false, error: '配置文件正被其他进程写入，请等几秒重试；若持续出现，删除 ~/.zcode/advisor.config.json.lock 后再试' });
+        }
         return done(200, { ok: true, file: USER_CONFIG });
       }
       if (req.method === 'POST' && req.url === '/api/models') {
@@ -564,4 +755,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile };
+module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, effectiveTarget };

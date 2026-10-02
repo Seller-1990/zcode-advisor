@@ -1,6 +1,6 @@
 {
   "name": "zcode-advisor",
-  "version": "0.2.6",
+  "version": "0.2.9",
   "description": "dsh-advisor 的 zcode 移植：独立审查副模型在每轮结束后被动审查对话增量，以 nit/concern/blocker 三级建议注回会话（advisory-only，绝不阻塞主流程）。",
   "author": {
     "name": "local"
@@ -25,22 +25,22 @@
     "api_key": {
       "type": "string",
       "default": "",
-      "description": "审查模型 API key（智谱 BigModel/Z.ai）。保存后由桥接进程写入用户级配置 ~/.zcode/advisor.config.json，下一轮审查即生效，无需重启"
+      "description": "审查模型 API key（智谱 BigModel/Z.ai）。桥接进程以「只兜底填补缺失项」语义写入 ~/.zcode/advisor.config.json：仅在该键缺失/为空时落盘，已有非空配置不被表单覆盖（修改已有配置请用本地配置面板），下一轮审查即生效，无需重启"
     },
     "model": {
       "type": "string",
-      "default": "glm-5.3-flash",
-      "description": "审查模型 id。建议与主对话模型形成能力差；思考型模型建议把 max_tokens 提到 4096"
+      "default": "",
+      "description": "审查模型 id（引擎默认 glm-5.3-flash）。留空 = 不经本表单写入配置；建议与主对话模型形成能力差，思考型模型建议把 max_tokens 提到 4096"
     },
     "base_url": {
       "type": "string",
       "default": "",
-      "description": "OpenAI 兼容端点。留空则使用用户级配置 ~/.zcode/advisor.config.json 中的 baseUrl（推荐做法：key/端点只存本地 600 权限文件，不进 GUI 表单与仓库）"
+      "description": "OpenAI 兼容端点（引擎默认智谱官方端点）。留空 = 不经本表单写入配置；第三方端点推荐用本地配置面板维护，或在面板里把 API 来源切到「ZCode 已维护」"
     },
     "review_mode": {
       "type": "string",
-      "default": "async",
-      "description": "审查模式：async（默认，零体感延迟，意见随下一条消息送达）或 sync（当轮打断，每轮收尾等待审查）"
+      "default": "",
+      "description": "审查模式：async（引擎默认，零体感延迟）或 sync（当轮打断）。留空 = 不经本表单写入配置"
     }
   }
 }

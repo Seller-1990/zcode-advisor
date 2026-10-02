@@ -56,12 +56,57 @@ function check() {
   return diffs;
 }
 
+// 只复制**内容不同**的文件，内容相同则保留目标文件的 mtime。
+//
+// 为什么不用 fs.cpSync(force)：Windows 上 core.autocrlf=true 时，内容与索引完全一致、
+// 只是被重新写过的文件会让 `git status` 伪报 " M"（w/lf 与检出预期不符），
+// 表现为"同步后出现零内容差异的 modified"（审计报告 A5）。
+// 跳过相同内容即可从根上消除这类噪音，同时让同步保持真正的幂等。
+function copyIfChanged(src, dest) {
+  let st;
+  try { st = fs.statSync(src); } catch (_) { return; }
+  if (st.isDirectory()) {
+    fs.mkdirSync(dest, { recursive: true });
+    for (const name of fs.readdirSync(src)) copyIfChanged(path.join(src, name), path.join(dest, name));
+    return;
+  }
+  try {
+    if (fs.readFileSync(dest).equals(fs.readFileSync(src))) {
+      // 内容一致：不动数据，但修复权限漂移（如执行位丢失）。仅类 Unix（Windows mode 恒
+      // 0o666/0o444 无意义，且 --check（diffTree）只比对内容，chmod 不会制造伪漂移）。
+      if (process.platform !== 'win32') {
+        try {
+          const dm = fs.statSync(dest).mode & 0o777;
+          const sm = st.mode & 0o777; // 掩掉文件类型位，直接传 chmodSync 会 EINVAL
+          if (dm !== sm) fs.chmodSync(dest, sm);
+        } catch (_) {}
+      }
+      return;
+    }
+  } catch (_) { /* 目标缺失/不可读：走复制分支 */ }
+  // tmp + rename 原子替换：并发读者（宿主加载插件文件）不会读到半文件；
+  // rename 撞上杀毒句柄 EPERM 时退避重试（hooks/lib/state.js saveState 同款），退出时清尸。
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  const tmp = `${dest}.tmp-${process.pid}`;
+  fs.copyFileSync(src, tmp);
+  try {
+    for (let i = 0; ; i++) {
+      try { fs.renameSync(tmp, dest); return; } catch (err) {
+        if (i >= 2 || !err || (err.code !== 'EPERM' && err.code !== 'EACCES')) throw err;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30 * (i + 1));
+      }
+    }
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
+}
+
 function sync() {
   fs.mkdirSync(DEST, { recursive: true });
   for (const item of ITEMS) {
     const src = path.join(ROOT, item);
     if (!fs.existsSync(src)) continue;
-    fs.cpSync(src, path.join(DEST, item), { recursive: true, force: true });
+    copyIfChanged(src, path.join(DEST, item));
   }
 }
 

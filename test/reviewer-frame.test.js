@@ -193,6 +193,60 @@ test('callReviewer：content 为 null 时回退 reasoning_content（思考型模
   }
 });
 
+// ---------------- 整轮共享截止时间（A2 回归） ----------------
+// 修复前：reviewTurn 的空响应重试每次调用 callReviewer 都各自起算 Date.now()+timeoutMs，
+// 单轮最坏 2×reviewTimeoutMs（240s×2=480s），突破 hooks.json 的 Stop 硬超时 320s →
+// 宿主强杀 hook → 指针不推进 → 每轮重审同一增量的停滞循环。
+// 现在调用方可传入 deadline，整轮（含重试）共享同一预算。
+
+test('callReviewer：外部 deadline 生效（不再独自起算 timeoutMs）', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  let calls = 0;
+  // 挂起到被 AbortSignal 中止（与真实 fetch 一致：不监听 signal 的桩会让用例永不结束）
+  globalThis.fetch = (url, opt) => new Promise((resolve, reject) => {
+    calls++;
+    const s = opt && opt.signal;
+    if (s) s.addEventListener('abort', () => {
+      const e = new Error('aborted'); e.name = 'AbortError'; reject(e);
+    }, { once: true });
+  });
+  try {
+    const t0 = Date.now();
+    const r = await callReviewer({
+      baseUrl: 'http://127.0.0.1:9/v1', model: 'm', apiKey: 'k',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 100, temperature: 0,
+      timeoutMs: 60000,                      // 故意远大于外部 deadline
+      deadline: Date.now() + 1500
+    });
+    const elapsed = Date.now() - t0;
+    assert.strictEqual(r.error, 'llm_timeout');
+    assert.ok(elapsed <= 3500, `应在外部 deadline 附近结束而非 timeoutMs，实际 ${elapsed}ms`);
+    assert.strictEqual(calls, 1);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('callReviewer：预算已耗尽时不再发起注定超时的请求', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return { ok: true, status: 200, json: async () => ({}) }; };
+  try {
+    const r = await callReviewer({
+      baseUrl: 'http://127.0.0.1:9/v1', model: 'm', apiKey: 'k',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 100, temperature: 0,
+      timeoutMs: 60000,
+      deadline: Date.now() - 5000            // 上一轮已耗尽预算
+    });
+    assert.strictEqual(r.error, 'llm_timeout');
+    assert.strictEqual(calls, 0, '预算已耗尽不应发起任何请求');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
 test('callReviewer：content 正常时不使用 reasoning_content（优先级正确）', async () => {
   const { callReviewer } = require('../hooks/lib/reviewer.js');
   const origFetch = globalThis.fetch;

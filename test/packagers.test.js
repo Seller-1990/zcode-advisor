@@ -156,7 +156,12 @@ test('stageMacApp：生成完整 .app（Info.plist / 启动器 / Resources/app /
   assert.ok(fs.existsSync(path.join(appDir, 'Contents', 'Info.plist')));
   const launcher = path.join(appDir, 'Contents', 'MacOS', 'ZCodeAdvisor');
   assert.ok(fs.existsSync(launcher));
-  assert.ok((fs.statSync(launcher).mode & 0o111) !== 0, '启动器应有执行位');
+  // Windows 无法表示 POSIX 执行位（fs.chmod 只能切换只读属性，mode 恒为 0o666/0o444），
+  // 该断言只在类 Unix 上有意义；.app 组装本身也是 macOS 专属产物。
+  // 不加平台门会让本用例在 Windows 上假失败（审计报告 A3）。
+  if (process.platform !== 'win32') {
+    assert.ok((fs.statSync(launcher).mode & 0o111) !== 0, '启动器应有执行位');
+  }
 
   for (const f of ['controller.cjs', 'inject.js', 'lib.cjs', 'zcode-path.cjs']) {
     assert.ok(fs.existsSync(path.join(appDir, 'Contents', 'Resources', 'app', f)), `应有 app/${f}`);

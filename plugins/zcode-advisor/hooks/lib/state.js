@@ -46,6 +46,13 @@ function freshState(sessionId, transcriptPath, startEnabled) {
     tokensIn: 0,
     tokensOut: 0,
     sessionModel: '',
+    // 会话级 API 覆盖（/advisor-api set 写入）。三键独立可空：只存显式设置过的项，
+    // 空项回落全局配置。apiKey 含明文——saveState 落盘收紧到 0600（见下）。
+    sessionApi: {
+      baseUrl: '',
+      apiKey: '',
+      model: ''
+    },
     lastAction: '',
     lastActivity: '',
     createdAt: new Date().toISOString()
@@ -54,7 +61,10 @@ function freshState(sessionId, transcriptPath, startEnabled) {
 
 // 找不到就创建（幂等）。所有调用方都必须拿到一个可用 state，保证流程可继续。
 function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
-  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  // 目录已存在时 mkdirSync 的 mode 不生效：state 目录含会话明文 key 的文件，
+  // 历史遗留的宽权限目录在此收紧（失败不阻断——只读文件系统下尽力而为）。
+  try { fs.chmodSync(stateDir, 0o700); } catch (_) {}
   const file = stateFilePath(stateDir, sessionId);
   if (fs.existsSync(file)) {
     const current = loadStateDetailed(file);
@@ -116,8 +126,12 @@ function saveState(file, state) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${attempt}`;
     try {
-      fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+      // state 可能含会话级 API key（sessionApi.apiKey）：0600 落盘，不依赖 umask。
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(tmp, file);
+      // rename 后文件 inode 来自 tmp（恒 0600）；此 chmod 是针对异常文件系统的
+      // 纵深防御（正常 POSIX 下为 no-op，失败静默不影响主流程）。
+      try { fs.chmodSync(file, 0o600); } catch (_) {}
       return;
     } catch (err) {
       lastErr = err;
