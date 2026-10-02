@@ -307,7 +307,14 @@
       const c = r.config;
       curCfg = c;
       const st = document.getElementById('zca-status');
-      if (st) st.textContent = `模型 ${c.model || '（默认）'} ｜ key ${c.keyMasked} ｜ 模式 ${c.reviewMode || 'async'} ｜ 来源 ${c.apiSource === 'zcode' ? 'ZCode' : '手动'}`;
+      // zcode 模式下实际生效的是服务商端点/模型/key（审查通道按 apiSource 解析），
+      // 展示手动字段会误导（手动 key 常为「未设置」，但审查照样能用服务商 key）。
+      if (st) {
+        const zcode = c.apiSource === 'zcode';
+        const modelShown = zcode ? (c.zcodeModel || '（服务商默认）') : (c.model || '（默认）');
+        const keyShown = zcode ? '服务商 key' : c.keyMasked;
+        st.textContent = `模型 ${modelShown} ｜ key ${keyShown} ｜ 模式 ${c.reviewMode || 'async'} ｜ 来源 ${zcode ? 'ZCode' : '手动'}`;
+      }
       const f = fill();
       if (f) {
         // 模型值回填到下拉框：若 select 里没有该 id（尚未拉取或列表不含它），

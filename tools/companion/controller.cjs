@@ -518,13 +518,17 @@ async function ping(body) {
   try {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 20000);
-    const r = await fetch(baseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, temperature: 0, stream: false }),
-      signal: ctl.signal
-    });
-    clearTimeout(t);
+    let r;
+    try {
+      r = await fetch(baseUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, temperature: 0, stream: false }),
+        signal: ctl.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!r.ok) {
       const hint = r.status === 401 || r.status === 403 ? 'key 无效或无权限' : (r.status === 404 || r.status === 400 ? '模型 id 或端点路径不对' : '');
       return { ok: false, error: `llm_http_${r.status}`, hint, endpoint: baseUrl };
