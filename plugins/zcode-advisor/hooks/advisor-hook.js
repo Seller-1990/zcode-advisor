@@ -443,6 +443,7 @@ function onUserPromptSubmit(ctx) {
   // 控制面（注册行/门禁提示）不受 enabled 门控——停用的会话也必须能用 /advisor-on 自救。
   let deliver = '';
   let deliveredNoteCount = 0;
+  let deliveredNotes = [];   // 本次送达的意见正文（写进 delivered 事件，供面板回看内容）
   mutateStateExclusive(file, (s) => {
     s.consecutiveSteers = 0;
     s.lastActivity = new Date().toISOString();
@@ -455,6 +456,10 @@ function onUserPromptSubmit(ctx) {
     if (s.enabled && Array.isArray(s.pendingNotes) && s.pendingNotes.length > 0) {
       parts.push(s.pendingNotes.join('\n\n'));
       deliveredNoteCount = s.pendingNotes.length;
+      // 只带本次真正送达的前 N 条（与下面的 slice 清理口径一致）。
+      // 记录正文的原因：delivered 事件此前只有 count，面板只能显示"已送达 N 条"，
+      // 用户无法回看顾问到底说了什么——正是 issue #102 要解决的"看不见意见"。
+      deliveredNotes = s.pendingNotes.slice(0, deliveredNoteCount).map((n) => String(n));
     }
     if (s.pendingRegistration) {
       parts.push(controlLines(cfg, apiKeyInfo, stateDir, file).join('\n'));
@@ -526,10 +531,12 @@ function onUserPromptSubmit(ctx) {
       additionalContext: deliver
     }
   });
-  // 历史记录：意见真实送达主会话（与入队记录通过 ts 顺序可对应）
+  // 历史记录：意见真实送达主会话。note 字段带正文（多条时用分隔符拼接并限长），
+  // 面板据此可悬浮回看"顾问到底说了什么"；仅计数的事件无法回看，等于没记。
   appendHistory({
     event: 'delivered',
     count: deliveredNoteCount,
+    note: deliveredNotes.join('\n---\n').slice(0, 2000),
     sessionId,
     mode: 'async'
   });

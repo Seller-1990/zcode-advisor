@@ -310,6 +310,33 @@ test('落盘：主模型恢复（成功且非降级）→ 清 primaryFailStreak 
   assert.strictEqual(got.s.fallbackUsed, 5, '历史降级次数是累计证据，不应被清');
 });
 
+// —— 清零口径的语义边界（顾问 concern：none 算不算"成功"） ——
+// 结论：清零条件是「主模型本轮**自己返回了可解析的帧**」，不是「判据通过」。
+//   - severity=none 是模型的合法审查结论（"我没发现问题"），属成功产出 → 清 streak。
+//   - llm_empty_response / unparsed 是"没产出"，走 result.error 分支 → 累加 streak，绝不清零。
+// 所以"只会回 none 的静默模型"不会掩盖故障：它每次都在产出结论；真正静默的模型是空响应，
+// 那类会持续累加到告警阈值。此测试把这条边界钉死，防止日后有人把 none 误并入失败或反之。
+test('落盘口径：none 帧（合法结论）→ 视为成功、清 streak（与空响应失败区分）', () => {
+  const got = applyInChild(
+    { frame: { severity: 'none', note: '' }, usedFallback: false, primaryFailure: '' },
+    { failStreak: { reason: 'llm_empty_response', count: 2, sinceTs: '2026-01-01T00:00:00.000Z' } }
+  );
+  assert.strictEqual(got.s.failStreak, null, 'none 是合法结论，成功产出，应清 failStreak');
+});
+
+test('落盘口径：空响应/未解析（真·无产出）→ 累加 streak，绝不当成功清零', () => {
+  const empty = applyInChild(
+    { error: 'llm_empty_response' },
+    { failStreak: { reason: 'llm_empty_response', count: 2, sinceTs: '2026-01-01T00:00:00.000Z' } }
+  );
+  assert.strictEqual(empty.s.failStreak.count, 3, '空响应必须累加，不得当作成功');
+  const unparsed = applyInChild(
+    { error: 'unparsed' },
+    { failStreak: { reason: 'unparsed', count: 1, sinceTs: '2026-01-01T00:00:00.000Z' } }
+  );
+  assert.strictEqual(unparsed.s.failStreak.count, 2, '未解析同样累加');
+});
+
 // ---------------- 降级告警文案 ----------------
 
 test('degradeAlertLine：含主模型失败次数/时长/原因与备用模型名，且不谎称服务中断', () => {

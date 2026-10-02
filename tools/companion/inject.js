@@ -197,6 +197,15 @@
     m.className = 'zca-msg ' + (ok ? 'zca-ok' : 'zca-bad');
   }
 
+  // 时间戳格式化：历史里存的是 UTC ISO（new Date().toISOString()），直接 slice 显示
+  // 会与用户本地时间差一个时区（实测差 8 小时）。这里转成本地时区再显示成 MM-DD HH:MM。
+  function fmtTs(iso) {
+    const d = new Date(String(iso || ''));
+    if (isNaN(d.getTime())) return String(iso || '').replace('T', ' ').slice(5, 16); // 非法值原样兜底
+    const p2 = (n) => String(n).padStart(2, '0');
+    return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+  }
+
   // 顾问意见历史：读 controller 的 /api/history（JSONL 追加日志，新的在前）。
   // 数据侧写入点在 hooks/lib/history（入队/丢弃/送达三个事件），此处只读。
   async function fetchHistory() {
@@ -209,10 +218,11 @@
         box.innerHTML = '<div class="zca-history-empty">暂无记录——顾问意见产生后会出现在这里</div>';
         return;
       }
+      // 正文取用顺序：note 正文 > delivered 计数占位 > 事件名。
+      const noteOf = (it) => String(it.note || (it.event === 'delivered' ? `已送达 ${it.count || ''} 条意见` : it.event || ''));
       box.innerHTML = items.map((it) => {
-        const ts = String(it.ts || '').replace('T', ' ').slice(5, 16);   // MM-DD HH:MM
+        const ts = fmtTs(it.ts);
         const sev = it.severity || it.event || '-';
-        const note = String(it.note || (it.event === 'delivered' ? `已送达 ${it.count || ''} 条意见` : it.event || '')).slice(0, 200);
         const cls = it.event === 'delivered' ? 'ev-delivered' : (String(it.event).startsWith('dropped') ? 'ev-dropped' : 'ev-queued');
         return `<div class="zca-history-item ${cls}">`
           + `<span class="h-ts">${ts}</span> <span class="h-sev">${sev}</span>`
@@ -221,8 +231,12 @@
       // 用 textContent 填正文，避免把模型产出当作 HTML 注入（注入链防线的一部分）
       const nodes = box.querySelectorAll('.h-note');
       items.forEach((it, i) => {
-        const note = String(it.note || (it.event === 'delivered' ? `已送达 ${it.count || ''} 条意见` : it.event || '')).slice(0, 200);
-        if (nodes[i]) nodes[i].textContent = note;
+        const full = noteOf(it);
+        if (nodes[i]) {
+          nodes[i].textContent = full.slice(0, 200);
+          // 悬浮显示完整意见：列表里截断到 200 字，悬停看全文（delivered 事件现已带正文）。
+          nodes[i].setAttribute('title', full.slice(0, 1000));
+        }
       });
     } catch (e) {
       box.innerHTML = `<div class="zca-history-empty">读取失败：${String(e).slice(0, 80)}</div>`;
@@ -324,22 +338,36 @@
       zcodeProviders = list;
       const eligible = list.filter((p) => p.eligible);
       sel.innerHTML = '';
-      if (eligible.length === 0) {
+      if (list.length === 0) {
         const o = document.createElement('option');
         o.value = '';
-        o.textContent = '（ZCode 里暂无 OpenAI 兼容服务商）';
+        o.textContent = '（ZCode 里暂无服务商）';
         sel.appendChild(o);
       } else {
-        for (const p of eligible) {
+        // 列出**全部**服务商（含非 OpenAI 兼容）——此前只列 eligible 的会让人以为
+        // "我维护的模型少了很多"（实测 40 个模型只显示 24 个）。不可用的标灰并注明原因，
+        // 让用户看到全貌、理解为什么某些不能选，而不是静默消失。
+        for (const p of list) {
           const o = document.createElement('option');
           o.value = p.id;
-          o.textContent = p.name ? `${p.name}（${p.models.length} 模型）` : p.id;
+          const md = `${p.models.length} 模型`;
+          if (p.eligible) {
+            o.textContent = p.name ? `${p.name}（${md}）` : `${p.id}（${md}）`;
+          } else {
+            o.textContent = `${p.name || p.id}（${md} · 不支持：${p.kind || '未知协议'}）`;
+            o.disabled = true;   // 不可选：审查通道仅支持 OpenAI 兼容端点
+          }
           sel.appendChild(o);
         }
       }
       const want = curCfg && curCfg.zcodeProvider;
       if (want && eligible.some((p) => p.id === want)) {
         sel.value = want;
+      } else if (want && list.some((p) => p.id === want)) {
+        // 已存 provider 存在但非 OpenAI 兼容（被改成不支持协议）：提示但不静默改选。
+        sel.value = '';
+        msg('已存服务商在 ZCode 里不是 OpenAI 兼容协议，审查通道用不了。未替你改选；'
+          + '请重新选择服务商，或切回「手动维护」。', false);
       } else if (want) {
         // 已存 provider 不在 eligible 列表（被改成非兼容协议/已删除/仅 name 命中）：
         // 保留空选项并提示，绝不静默改选别的服务商——否则用户只想改个模式，
@@ -579,7 +607,7 @@
     p.setAttribute('aria-modal', 'true');
     p.setAttribute('aria-label', 'ZCode Advisor 顾问设置');
     p.innerHTML = `
-      <h3><span>🛡️ 顾问设置</span><span class="zca-close" id="zca-close">✕</span></h3>
+      <h3><span>顾问设置</span><span class="zca-close" id="zca-close">✕</span></h3>
       <div class="zca-status" id="zca-status">读取中…</div>
       <div class="zca-toggle-row">
         <label class="zca-switch" title="新会话是否自动启用审查">

@@ -74,6 +74,7 @@ function makeDom() {
     // 标签名必须保真：脚本会按 tagName 判断控件类型（如 SELECT vs INPUT）。
     set innerHTML(html) {
       this._html = String(html);
+      this._qsa = null;   // innerHTML 变了，类选择器缓存作废
       const re = /<(\w+)([^>]*\bid="([^"]+)"[^>]*)>/g;
       let m;
       while ((m = re.exec(this._html)) !== null) {
@@ -100,6 +101,32 @@ function makeDom() {
       const i = this.children.indexOf(c);
       if (i >= 0) this.children.splice(i, 1);
       return c;
+    }
+    // 类选择器：面板历史上用 innerHTML 渲染（无 id），脚本随后用 querySelectorAll('.h-note')
+    // 取节点填正文。桩需返回**稳定**节点（缓存），否则脚本的 textContent/setAttribute 写到
+    // 临时对象上、测试读不到。扫开标签匹配 class，纯文本内容一并捕获（如 .h-ts）。
+    querySelectorAll(sel) {
+      if (typeof sel !== 'string' || !sel.startsWith('.')) return [];
+      this._qsa = this._qsa || {};
+      if (this._qsa[sel]) return this._qsa[sel];
+      const cls = sel.slice(1);
+      const out = [];
+      const re = /<(\w+)([^>]*)>/g;
+      let m;
+      while ((m = re.exec(this._html || '')) !== null) {
+        const tag = m[1];
+        const attrs = m[2] || '';
+        const cm = /class="([^"]*)"/.exec(attrs);
+        if (!cm || !cm[1].split(/\s+/).includes(cls)) continue;
+        const el = new El(tag);
+        el.className = cm[1];
+        const rest = (this._html || '').slice(re.lastIndex);
+        const close = new RegExp(`^([\\s\\S]*?)</${tag}>`).exec(rest);
+        if (close && !close[1].includes('<')) el.textContent = close[1];  // 纯文本内容
+        out.push(el);
+      }
+      this._qsa[sel] = out;
+      return out;
     }
     // 真实 DOM 的 insertBefore / firstChild：脚本用它们把「当前模型」插到首位
     insertBefore(node, ref) {
@@ -136,7 +163,6 @@ function makeDom() {
       }
       return null;
     }
-    querySelectorAll() { return []; }
   }
 
   const body = new El('body');
@@ -697,10 +723,13 @@ test('inject.js：手动模式保存载荷与旧行为一致（apiSource=manual�
   assert.strictEqual(payload.zcodeProvider, undefined);
 });
 
-test('inject.js：zcode 服务商列表不含合格项时给出占位提示（不静默空白）', async () => {
+test('inject.js：非 OpenAI 兼容服务商仍列出但标灰禁用（不静默消失）', async () => {
   const fetchStub = async (url) => ({
     json: async () => (String(url).includes('/api/zcode-providers')
-      ? { ok: true, providers: [{ id: 'ant', name: 'Anthropic 中转', kind: 'anthropic', baseURL: 'https://r', models: ['c'], eligible: false }] }
+      ? { ok: true, providers: [
+        { id: 'ant', name: 'Anthropic 中转', kind: 'anthropic', baseURL: 'https://r', models: ['c'], eligible: false },
+        { id: 'ok1', name: '内网网关', kind: 'openai-compatible', baseURL: 'http://x', models: ['m'], eligible: true }
+      ] }
       : { ok: false })
   });
   const dom = runInject({ fetch: fetchStub });
@@ -709,11 +738,93 @@ test('inject.js：zcode 服务商列表不含合格项时给出占位提示（�
   dom.byId.get('zca-src-zcode')._listeners.click[0]();
   await new Promise((r) => setTimeout(r, 10));
   const psel = dom.byId.get('zca-zcode-provider');
-  assert.match(psel.children[0].textContent, /暂无 OpenAI 兼容服务商/);
+  // 回归：此前只列 eligible 的，导致用户以为"我维护的模型少了很多"（实测 40→24）
+  const opts = psel.children;
+  assert.strictEqual(opts.length, 2, '两个服务商都应列出（含不兼容的）');
+  const anthropicOpt = opts.find((o) => o.value === 'ant');
+  assert.ok(anthropicOpt, '不兼容服务商必须出现，不能静默消失');
+  assert.strictEqual(anthropicOpt.disabled, true, '不兼容协议应禁用不可选');
+  assert.match(anthropicOpt.textContent, /不支持/, '应注明不支持原因');
+  // 默认选中唯一合格项
+  assert.strictEqual(psel.value, 'ok1');
+});
+
+test('inject.js：ZCode 里完全无服务商时给出占位提示', async () => {
+  const fetchStub = async (url) => ({
+    json: async () => (String(url).includes('/api/zcode-providers')
+      ? { ok: true, providers: [] }
+      : { ok: false })
+  });
+  const dom = runInject({ fetch: fetchStub });
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  dom.byId.get('zca-src-zcode')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  const psel = dom.byId.get('zca-zcode-provider');
+  assert.match(psel.children[0].textContent, /暂无服务商/);
   assert.strictEqual(psel.value, '');
 });
 
-// ---------------- 健康指示灯（M1） ----------------
+// ---------------- 顾问意见历史（内容可回看 + 本地时区） ----------------
+
+function historyDom(items) {
+  const fetchStub = async (url) => ({
+    json: async () => (String(url).includes('/api/history')
+      ? { ok: true, history: items }
+      : { ok: false })
+  });
+  return runInject({ fetch: fetchStub });
+}
+
+async function openHistory(dom) {
+  dom.byId.get('zca-badge')._listeners.click[0]();   // 开面板
+  await new Promise((r) => setTimeout(r, 10));
+  const head = dom.byId.get('zca-history-head');
+  if (head && head._listeners.click) head._listeners.click[0]();  // 展开历史
+  await new Promise((r) => setTimeout(r, 10));
+}
+
+test('inject.js：delivered 事件带回看内容（悬浮 title 有正文，不再只有"已送达 N 条"）', async () => {
+  const dom = historyDom([
+    { ts: '2030-01-01T02:03:04.000Z', event: 'delivered', count: 1, note: '建议把重复分支合并为一个查表。' }
+  ]);
+  await openHistory(dom);
+  const box = dom.byId.get('zca-history-body');
+  const noteEls = box.querySelectorAll('.h-note');
+  assert.ok(noteEls.length > 0, '应渲染出意见条目');
+  assert.match(noteEls[0].textContent, /查表/, '应显示意见正文，而非只有计数');
+  assert.match(String(noteEls[0].getAttribute('title')), /查表/, '悬浮 title 应含完整意见，供回看');
+});
+
+test('inject.js：历史时间戳按本地时区显示（回归：UTC 原样显示差 8 小时）', async () => {
+  // 用一个明确的 UTC 时刻，断言显示的是转成本地后的时间，而不是 UTC 字面量
+  const iso = '2030-06-15T02:03:00.000Z';
+  const d = new Date(iso);
+  const p2 = (n) => String(n).padStart(2, '0');
+  const expectLocal = `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+  const dom = historyDom([{ ts: iso, event: 'queued', severity: 'nit', note: 'x' }]);
+  await openHistory(dom);
+  const box = dom.byId.get('zca-history-body');
+  const tsEls = box.querySelectorAll('.h-ts');
+  assert.ok(tsEls.length > 0, '应渲染时间戳');
+  assert.strictEqual(tsEls[0].textContent, expectLocal, '时间戳必须是本地时区（非 UTC 字面量）');
+  // 反证：UTC 字面量 MM-DD HH:MM 与本地不同（若相同则测试环境恰好在 UTC，跳过反证）
+  const utcLiteral = iso.replace('T', ' ').slice(5, 16);
+  if (expectLocal !== utcLiteral) {
+    assert.notStrictEqual(tsEls[0].textContent, utcLiteral, '不应原样显示 UTC 字面量');
+  }
+});
+
+test('inject.js：设置面板标题不含 🛡️（用户要求去掉该处图标）', () => {
+  const dom = runInject();
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  const p = dom.byId.get('zca-panel');
+  assert.ok(p, '面板应存在');
+  assert.ok(!p.innerHTML.includes('🛡'), '面板标题不应再有盾牌 emoji');
+  assert.match(p.innerHTML, /顾问设置/, '标题文字保留');
+});
+
+
 // 角标上的状态灯读 /api/health 着色。核心不变量：**只有明确 ok 才显绿**，
 // 网络失败/无数据一律 unknown。若哪天有人加了"取不到数据就当健康"的分支，
 // 用户会把"灯坏了"误读成"顾问正常"——比没有灯更糟。
