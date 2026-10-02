@@ -801,3 +801,70 @@ test('inject.js：角标重建后保留上一次已知健康态（不在轮询�
   assert.ok(rebuilt, '应重建角标');
   assert.ok(rebuilt.classList.contains('zca-h-ok'), '重建后应立即恢复已知的 ok 态，不闪回灰');
 });
+
+// —— 会话归属（P0：多会话下灯必须标明指向哪个会话） ——
+
+function healthDomFull(resp) {
+  const fetchStub = async (url) => ({
+    json: async () => (String(url).includes('/api/health') ? resp : { ok: false })
+  });
+  return runInject({ fetch: fetchStub });
+}
+
+test('inject.js：多会话时 title 标注最近活动的会话（灯不再是无归属的谜）', async () => {
+  const dom = healthDomFull({
+    ok: true, state: 'ok', candidates: 3,
+    beacon: { sessionId: 'sess_793e6f9a-a85e-43ca-9fef-1f27e6f4742c', lastSuccessAt: '2030-01-01T00:00:00.000Z' }
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  const b = dom.byId.get('zca-badge');
+  assert.match(b.title, /793e6f9a/, 'title 必须含会话短 id，否则用户会误认为是自己会话的灯');
+  assert.match(b.title, /共 3 个/, '多会话应提示总数');
+});
+
+test('inject.js：单会话时不显示「共 N 个」噪音，但仍带会话标识', async () => {
+  const dom = healthDomFull({
+    ok: true, state: 'ok', candidates: 1,
+    beacon: { sessionId: 'sess_abc12345-xxxx', lastSuccessAt: '2030-01-01T00:00:00.000Z' }
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  const b = dom.byId.get('zca-badge');
+  assert.match(b.title, /abc12345/);
+  assert.ok(!/共 1 个/.test(b.title), '单会话不应显示「共 1 个」');
+});
+
+test('inject.js：aria-label 携带健康状态（屏幕阅读器用户也能感知，不止靠颜色）', async () => {
+  const dom = healthDom('down', { lastAttemptAt: '2030-01-01T00:00:00.000Z', reason: 'llm_http_401' });
+  await new Promise((r) => setTimeout(r, 10));
+  const b = dom.byId.get('zca-badge');
+  const aria = b.getAttribute('aria-label') || '';
+  assert.match(aria, /异常/, 'aria-label 必须含健康状态，不能只说「设置」');
+  // 非颜色编码：状态点带字形
+  const dot = dom.byId.get('zca-hdot');
+  assert.ok(dot && dot.textContent, '状态点应有字形（非仅颜色）');
+});
+
+test('inject.js：/api/health 返回 404（老 companion）→ 提示版本过旧，而非沉默灰灯', async () => {
+  const dom = healthDomFull({ ok: false, error: 'not_found' });
+  await new Promise((r) => setTimeout(r, 10));
+  const b = dom.byId.get('zca-badge');
+  assert.ok(b.classList.contains('zca-h-unknown'));
+  assert.match(b.title, /版本过旧|更新/, '老 companion 应提示更新，别让用户排查不存在的故障');
+});
+
+test('inject.js：/api/health 返回 bad_token → 提示刷新页面恢复', async () => {
+  const dom = healthDomFull({ ok: false, error: 'bad_token' });
+  await new Promise((r) => setTimeout(r, 10));
+  const b = dom.byId.get('zca-badge');
+  assert.match(b.title, /刷新/, 'bad_token 应给出可操作提示');
+});
+
+test('inject.js：令牌轮换时断开旧 MutationObserver（防跨代叠加回写旧状态）', async () => {
+  const dom = runInject();
+  const firstObserver = dom.observers[0];
+  assert.ok(firstObserver, '首代应注册 observer');
+  // 模拟令牌变更后的重新注入：脚本顶部清理块应 disconnect 旧 observer
+  dom.window.__zcodeAdvisorToken = 'stale-token';
+  const dom2 = runInject({ reuse: dom, token: 'new-token' });
+  assert.ok(firstObserver.observed === null, '旧 observer 必须被 disconnect，否则会回写旧状态');
+});

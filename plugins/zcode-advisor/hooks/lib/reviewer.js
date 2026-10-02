@@ -383,7 +383,9 @@ const PROBE_DEFAULTS = {
   temperature: 0.2,
   reviewTimeoutMs: 240000,
   maxNoteChars: 768,
-  proseFallback: true
+  proseFallback: true,
+  // 整批上限：无论 n 与单次 timeout 多大，探针最坏耗时封顶 10 分钟（防 --n 50 --timeout 240000 = 3.3h）。
+  maxBatchTimeoutMs: 600000
 };
 
 // 代表性 delta：模拟真实增量形态（含代码块与回答正文），而非 'ping'——
@@ -406,18 +408,19 @@ const PROBE_DELTA = [
 //   5. note 未被截断（截断 = 模型失控信号）
 //   6. 帧来自 JSON 而非散文救回（salvageProse 一律 nit → 永远产不出 concern/blocker，
 //      是隐性降级；只看 parseFrame 非空会把「只会说散文」误判为可用）
-// 返回 { ok, reason }，reason 为失败分类（成功时 ''）。
+// 返回 { ok, reason, severity }，reason 为失败分类（成功时 ''），severity 为解析出的严重级
+// （成功时才有意义；用于统计分布，暴露"只会回 none"的退化模型——见 probeModel）。
 function classifyProbeResult(res, cfg) {
   if (!res || res.error) {
-    return { ok: false, reason: (res && res.error) || 'no_result' };
+    return { ok: false, reason: (res && res.error) || 'no_result', severity: '' };
   }
   const det = parseFrameDetailed(res.text, cfg.proseFallback !== false, { maxNoteChars: cfg.maxNoteChars });
-  if (!det.frame) return { ok: false, reason: 'unparsed' };
-  if (!SEVERITIES.includes(det.frame.severity)) return { ok: false, reason: 'bad_severity' };
-  if (det.frame.severity !== 'none' && !String(det.frame.note || '').trim()) return { ok: false, reason: 'empty_note' };
-  if (det.truncated) return { ok: false, reason: 'note_truncated' };
-  if (det.from === 'prose') return { ok: false, reason: 'prose_only' };
-  return { ok: true, reason: '' };
+  if (!det.frame) return { ok: false, reason: 'unparsed', severity: '' };
+  if (!SEVERITIES.includes(det.frame.severity)) return { ok: false, reason: 'bad_severity', severity: '' };
+  if (det.frame.severity !== 'none' && !String(det.frame.note || '').trim()) return { ok: false, reason: 'empty_note', severity: det.frame.severity };
+  if (det.truncated) return { ok: false, reason: 'note_truncated', severity: det.frame.severity };
+  if (det.from === 'prose') return { ok: false, reason: 'prose_only', severity: det.frame.severity };
+  return { ok: true, reason: '', severity: det.frame.severity };
 }
 
 function percentile(sortedAsc, p) {
@@ -426,8 +429,24 @@ function percentile(sortedAsc, p) {
   return sortedAsc[idx];
 }
 
+// 单次探针调用：跑首调 + 最多 2 次空响应重试（与 reviewTurn 的 runAttempt 同一策略）。
+// 必须复刻重试：思考型模型首调 content 为空、带 reasoning 回灌的第 2 调常能救回，
+// 探针若不做重试会把这类模型误判为不可用（与旧 ping 误报方向相反的另一种失真）。
+async function probeOnce(call, params, deadline) {
+  let res = await call(Object.assign({}, params, { deadline }));
+  for (let i = 0; i < 2 && res && res.error === 'llm_empty_response'; i++) {
+    if (deadline - Date.now() < 10000) break; // 剩余不足一次重试：放弃
+    const carry = res.reasoningText
+      ? `\n\n【你上一步的分析（供参考，不要重复）】\n${res.reasoningText.slice(0, 3000)}\n\n请基于以上分析，只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}。不要输出任何其他文字。`
+      : '\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）';
+    res = await call(Object.assign({}, params, { deadline, temperature: 0, userContent: `${params.userContent}${carry}` }));
+  }
+  return res;
+}
+
 // 跑 N 次探针，返回统计分布。**绝不返回「可用/不可用」判决**。
 // deps.callReviewer 可注入（测试 stub fetch；生产用真实 callReviewer）。
+// 整批有预算上限（batchTimeoutMs）：n 次串行 × 单次 timeout 可能到几小时，必须能提前收尾。
 async function probeModel(target, opts, deps) {
   const o = opts || {};
   const call = (deps && deps.callReviewer) || callReviewer;
@@ -439,15 +458,27 @@ async function probeModel(target, opts, deps) {
   };
   const n = Number.isFinite(o.n) && o.n > 0 ? Math.floor(o.n) : 5;
   const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : PROBE_DEFAULTS.reviewTimeoutMs;
+  // 整批预算：默认 min(n×timeout, 10min)；调用方可覆盖（也有上界）。
+  const batchCap = Number.isFinite(o.batchTimeoutMs) && o.batchTimeoutMs > 0
+    ? Math.min(o.batchTimeoutMs, PROBE_DEFAULTS.maxBatchTimeoutMs)
+    : Math.min(n * timeoutMs, PROBE_DEFAULTS.maxBatchTimeoutMs);
+  const batchDeadline = Date.now() + batchCap;
   const systemPrompt = (o.systemPrompt && String(o.systemPrompt).trim()) || DEFAULT_SYSTEM_PROMPT;
   const userContent = o.delta || PROBE_DELTA;
 
   const results = [];
+  let aborted = false;
   for (let i = 0; i < n; i++) {
+    // 每次调用用 min(单次 timeout, 整批剩余)：避免最后一次拖爆整批预算。
+    const left = batchDeadline - Date.now();
+    if (left < 1000) { aborted = true; break; }
+    const perCallTimeout = Math.min(timeoutMs, left);
+    // 单次调用预算 = perCallTimeout，deadline 供 callReviewer 内部裁剪。
+    const deadline = Date.now() + perCallTimeout;
     const t0 = Date.now();
     let res;
     try {
-      res = await call({
+      res = await probeOnce(call, {
         baseUrl: target.baseUrl,
         model: target.model,
         apiKey: target.apiKey,
@@ -455,30 +486,41 @@ async function probeModel(target, opts, deps) {
         userContent,
         maxTokens: cfg.maxTokens,
         temperature: cfg.temperature,
-        timeoutMs
-      });
+        timeoutMs: perCallTimeout
+      }, deadline);
     } catch (err) {
       res = { error: 'llm_error', detail: String(err).slice(0, 200) };
     }
     const ms = Date.now() - t0;
     const c = classifyProbeResult(res, cfg);
-    results.push({ ok: c.ok, reason: c.reason, ms, severity: res && res.frame ? res.frame.severity : '' });
+    results.push({ ok: c.ok, reason: c.reason, ms, severity: c.severity });
   }
 
   const passed = results.filter((r) => r.ok).length;
+  const ran = results.length;
   const sorted = results.map((r) => r.ms).sort((a, b) => a - b);
   const failures = {};
+  // 严重级分布：暴露「只会回 none」的退化模型——它能让判据全过（none 合法），
+  // 但在生产里制造的是静默。只看通过率会把这种退化误认证为合格。
+  const severities = {};
+  for (const r of results) {
+    if (r.severity) severities[r.severity] = (severities[r.severity] || 0) + 1;
+  }
   for (const r of results) {
     if (!r.ok) failures[r.reason] = (failures[r.reason] || 0) + 1;
   }
   return {
     model: target.model,
     n,
+    ran,
+    aborted,
+    batchMs: batchCap,
     passed,
     failed: n - passed,
     passRate: n > 0 ? passed / n : 0,
     ms: { min: sorted[0] || 0, median: percentile(sorted, 50), p90: percentile(sorted, 90), max: sorted[sorted.length - 1] || 0 },
-    failures
+    failures,
+    severities
   };
 }
 
@@ -487,11 +529,25 @@ async function probeModel(target, opts, deps) {
 function renderProbeReport(stat, opts) {
   const o = opts || {};
   const lines = [];
-  lines.push(`  探针: ${stat.model} —— ${stat.passed}/${stat.n} 次通过（失败 ${stat.failed}）`);
+  const ranNote = stat.aborted && stat.ran < stat.n ? `（预算内只跑了 ${stat.ran}/${stat.n}，整批上限 ${Math.round(stat.batchMs / 1000)}s）` : '';
+  lines.push(`  探针: ${stat.model} —— ${stat.passed}/${stat.n} 次通过（失败 ${stat.failed}）${ranNote}`);
   lines.push(`  耗时: min=${stat.ms.min}ms median=${stat.ms.median}ms p90=${stat.ms.p90}ms max=${stat.ms.max}ms`);
   const reasons = Object.keys(stat.failures);
   if (reasons.length > 0) {
     lines.push(`  失败分类: ${reasons.map((k) => `${k}×${stat.failures[k]}`).join(', ')}`);
+  }
+  // 严重级分布：暴露「只会回 none」的退化——它能让判据全过（none 合法）却在生产中制造静默。
+  const sev = stat.severities || {};
+  const sevKeys = Object.keys(sev);
+  if (sevKeys.length > 0) {
+    const total = sevKeys.reduce((a, k) => a + sev[k], 0);
+    const order = ['blocker', 'concern', 'nit', 'none'];
+    const parts = order.filter((k) => sev[k]).map((k) => `${k}×${sev[k]}`);
+    lines.push(`  严重级分布: ${parts.join(', ')}`);
+    if (sev.none === total && total >= 3) {
+      lines.push('  ⚠ 全部返回 none：模型可能只是"从不产出意见"。none 是合法帧、判据会全过，'
+        + '但这类模型在生产里制造的是静默——请用更多轮/更贴真实的 delta 复核，勿仅凭通过率换掉现有模型。');
+    }
   }
   // N 的诚实说明：按**实际 N** 算「全过时失败率的 95% 上界」= 1 - 0.05^(1/N)。
   // 写死 N=5 会在用户指定其它 N 时误导，故动态计算。

@@ -82,18 +82,27 @@ function deriveHealth(beacon, opts) {
 
 // 读全部信标，取「最近活动」的一个（多会话并存时；不按 mtime 猜当前会话——
 // controller 无从得知用户在哪个会话，故返回该条并附 sessionId 供 UI 标注）。
-function readHealth(reviewBudgetMs) {
+// 上限 cap：读取侧只关心最近活动，没必要解析上千个历史信标（该 handler 每 5s 被轮询）。
+function readHealth(reviewBudgetMs, cap) {
+  const limit = Number.isFinite(cap) && cap > 0 ? cap : 50;
   try {
     if (!fs.existsSync(HEALTH_DIR)) return { state: 'unknown', beacon: null, candidates: 0 };
     const files = fs.readdirSync(HEALTH_DIR).filter((f) => /^advisor-health-.*\.json$/.test(f));
+    const withMtime = files.map((f) => {
+      const full = path.join(HEALTH_DIR, f);
+      let mtime = 0;
+      try { mtime = fs.statSync(full).mtimeMs; } catch (_) {}
+      return { full, mtime };
+    }).sort((a, b) => b.mtime - a.mtime).slice(0, limit);
     const beacons = [];
-    for (const f of files) {
+    for (const { full } of withMtime) {
       try {
-        const b = JSON.parse(fs.readFileSync(path.join(HEALTH_DIR, f), 'utf8'));
+        const b = JSON.parse(fs.readFileSync(full, 'utf8'));
         if (b && typeof b === 'object') beacons.push(b);
       } catch (_) { /* 跳过坏文件 */ }
     }
     if (beacons.length === 0) return { state: 'unknown', beacon: null, candidates: 0 };
+    // 与 hooks/lib/health.js:readBeacons 同一比较器（含 || 0 兜底，非法时间戳不得产生 NaN 排序）
     beacons.sort((a, b) => (Date.parse(b.lastAttemptAt || 0) || 0) - (Date.parse(a.lastAttemptAt || 0) || 0));
     const top = beacons[0];
     return {
@@ -734,11 +743,16 @@ function startApi(cdpPort, apiPort, token) {
         return done(200, { ok: true, history: readHistory(50), file: HISTORY_FILE });
       }
       // 健康态（M1）：读信标派生 ok/degraded/down/unknown，供顶部角标着色。
-      // 无信标 = unknown（绝不回 ok）；reviewBudgetMs 取自用户配置，与 hook 侧同算式。
+      // 无信标 = unknown（绝不回 ok）。预算算式与 hooks/lib/config.js 的归一/钳制保持一致：
+      // sync 上限 300s、async 上限 600s——否则两侧 STALE 不同源，同一信标一侧判 ok、一侧判 unknown。
       if (req.method === 'GET' && req.url === '/api/health') {
         const c = readUserConfig();
-        const timeoutMs = Number.isFinite(c.reviewTimeoutMs) && c.reviewTimeoutMs > 0 ? c.reviewTimeoutMs : 240000;
-        const reviewBudgetMs = (c.reviewMode === 'sync') ? timeoutMs : timeoutMs * 2;
+        const rawTimeout = Number.isFinite(c.reviewTimeoutMs) && c.reviewTimeoutMs >= 1000 ? c.reviewTimeoutMs : 240000;
+        const mode = c.reviewMode === 'sync' ? 'sync' : 'async';
+        const timeoutMs = mode === 'sync'
+          ? Math.min(rawTimeout, 300000)   // SYNC_TIMEOUT_CAP_MS，同 config.js
+          : Math.min(rawTimeout, 600000);  // async 上界，同 config.js
+        const reviewBudgetMs = mode === 'sync' ? timeoutMs : timeoutMs * 2;
         const h = readHealth(reviewBudgetMs);
         return done(200, {
           ok: true,

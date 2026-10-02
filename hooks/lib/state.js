@@ -284,9 +284,12 @@ function isFailStreakReason(reason) {
 // "advisor 在跑但从不说话" 可被发现，而不是只能开 debug 才看见。
 // 这里用最小侵入的方式实现同等能力：保留原有 dropped[reason] 计数形状不变
 // （既有 status 输出与测试依赖它），时间戳记入同级的 droppedAt[reason]。
-// 同时维护 failStreak（4a）：同因连击累加，白名单异因切换重置，
-// 非白名单原因冻结——UPS 侧据此在连续失败达到阈值时注入健康告警。
+// 同时维护 failStreak（4a）：**跨原因累计**连续失败，非白名单原因冻结——
+// UPS 侧据此在连续失败达到阈值时注入健康告警。
 // failStreak.sinceTs 记录本轮连击的起点，告警消息据此显示"停摆约 X 小时"。
+// 「跨原因」是关键：白名单原因（llm_* 前缀 + 解析/转录类）都表示"审查本身失败"，
+// 若按原因字符串重置连击，则 404/empty/unparsed 交替出现时每次都被重置为新连击，
+// 计数永远到不了阈值 → 端点持续劣化却不告警（漏报）。reason 记最近一次用于归因。
 function bumpDrop(state, reason) {
   if (!reason) reason = 'unknown';
   state.dropped = state.dropped || {};
@@ -295,15 +298,13 @@ function bumpDrop(state, reason) {
   state.droppedAt = state.droppedAt || {};
   state.droppedAt[reason] = new Date().toISOString();
   if (isFailStreakReason(reason)) {
-    if (state.failStreak && state.failStreak.reason === reason) {
+    if (state.failStreak) {
       state.failStreak.count = (state.failStreak.count || 0) + 1;
-      // 防御：旧版本写入的 streak 无 sinceTs（升级横跨一次连击），补当前时间为停摆起点
+      state.failStreak.reason = reason; // 归因用最近原因；连击次数与起点不因原因变化而重置
       if (!state.failStreak.sinceTs) state.failStreak.sinceTs = new Date().toISOString();
     } else {
       state.failStreak = { reason, count: 1, sinceTs: new Date().toISOString() };
-      // 连击身份已切换（新故障类型）：旧故障积累的告警计数一并清零——
-      // 否则新故障达阈值后沿用旧阶梯（1h→3h→…）被压住，用户看不到新停摆。
-      // healthNotifiedAt 保留：本轮故障恢复后仍能补一声"已恢复"。
+      // 新连击（此前已恢复）：告警阶梯从第 1 次开始
       state.healthAlertCount = 0;
     }
   }
@@ -313,14 +314,18 @@ function bumpDrop(state, reason) {
 // 为什么必须分开：fallback 成功后清 failStreak（系统可用，不该再喊停摆），
 // 但主模型劣化仍在继续——若连它一起清，降级成功会把主模型故障**完全掩盖**，
 // 用户永远收不到「主模型一直在坏」的提醒。
+// 同样**跨原因累计**：白名单三兄弟（llm_empty_response/unparsed/llm_http_404）交替出现
+// 是端点劣化的常见形态，若按原因重置则永远到不了阈值 → 降级告警漏报。
+// 清零路径在调用方（applyReviewOutcome）：主模型本轮自己成功时置 null（恢复语义）。
 function bumpPrimaryFailStreak(state, reason) {
   if (!reason) reason = 'unknown';
-  if (state.primaryFailStreak && state.primaryFailStreak.reason === reason) {
+  if (state.primaryFailStreak) {
     state.primaryFailStreak.count = (state.primaryFailStreak.count || 0) + 1;
+    state.primaryFailStreak.reason = reason;
     if (!state.primaryFailStreak.sinceTs) state.primaryFailStreak.sinceTs = new Date().toISOString();
   } else {
     state.primaryFailStreak = { reason, count: 1, sinceTs: new Date().toISOString() };
-    state.degradeAlertCount = 0; // 故障身份切换：旧阶梯作废（与 failStreak 同纪律）
+    state.degradeAlertCount = 0; // 新一轮劣化：告警阶梯从第 1 次开始
   }
 }
 

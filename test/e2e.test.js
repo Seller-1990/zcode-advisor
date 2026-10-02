@@ -844,6 +844,22 @@ test('M4 告警：同时停摆与降级时只报停摆（避免两条告警刷�
   assert.ok(!line.includes('降级告警'), '停摆期间不叠加降级告警');
 });
 
+test('M4 告警：曾到阈值但从未真正降级过（fallbackLastModel 空）→ 不喊「由备用模型维持」', (t) => {
+  const { stateDir } = setup(t);
+  const env = makeEnv(stateDir);
+  // 防回归：sync 模式 / 未配备用模型 / 备用也失败时，primaryFailStreak 仍会累加，
+  // 但没有任何备用模型在兜——此时喊「由备用模型维持，服务未中断」是把停摆粉饰成降级。
+  writeStateForAlert(stateDir, 'd5', {
+    primaryFailStreak: { reason: 'llm_http_404', count: 5, sinceTs: new Date().toISOString() },
+    fallbackLastModel: '',   // 从未降级成功
+    failStreak: null
+  });
+  const r = runHook(['user-prompt-submit'], { session_id: 'd5', transcript_path: '/nonexistent', prompt: 'x' }, env);
+  const line = r.stdout ? (JSON.parse(r.stdout).hookSpecificOutput.additionalContext || '') : '';
+  assert.ok(!line.includes('降级告警'), '没有备用模型在兜，不得宣称已降级');
+  assert.ok(!line.includes('由备用模型'), '不得出现「由备用模型维持」的假安慰');
+});
+
 test('M4 告警：旧形状 state（无 M4 字段）升级后不炸', (t) => {
   const { stateDir } = setup(t);
   const env = makeEnv(stateDir);

@@ -47,12 +47,14 @@ test('parseFrameDetailed：截断标记（note 超上限 → truncated=true）',
 
 const PC = { maxTokens: 4096, maxNoteChars: 768, proseFallback: true };
 
-test('classify：合法 JSON 帧 → 通过', () => {
+test('classify：合法 JSON 帧 → 通过（并回报 severity 供分布统计）', () => {
   assert.deepStrictEqual(
     R.classifyProbeResult({ text: '{"severity":"concern","note":"这里有问题"}' }, PC),
-    { ok: true, reason: '' });
+    { ok: true, reason: '', severity: 'concern' });
   // none 也合法（模型判定无问题，是正确输出而非失败）
-  assert.strictEqual(R.classifyProbeResult({ text: '{"severity":"none","note":""}' }, PC).ok, true);
+  const n = R.classifyProbeResult({ text: '{"severity":"none","note":""}' }, PC);
+  assert.strictEqual(n.ok, true);
+  assert.strictEqual(n.severity, 'none');
 });
 
 test('classify：空响应 → 失败（old ping 在这里误报 OK，探针必须判失败）', () => {
@@ -108,7 +110,7 @@ test('probeModel：N 次采样、统计通过数与耗时分布', async () => {
     { callReviewer: stubReviewer([
       { text: '{"severity":"none","note":""}' },
       { text: '{"severity":"nit","note":"a"}' },
-      { error: 'llm_empty_response' },
+      { error: 'llm_http_500' },   // 非空响应类失败，不触发重试（重试仅针对 llm_empty_response）
       { text: '{"severity":"concern","note":"b"}' }
     ]) }
   );
@@ -116,7 +118,7 @@ test('probeModel：N 次采样、统计通过数与耗时分布', async () => {
   assert.strictEqual(stat.passed, 3);
   assert.strictEqual(stat.failed, 1);
   assert.strictEqual(stat.passRate, 0.75);
-  assert.deepStrictEqual(stat.failures, { llm_empty_response: 1 });
+  assert.deepStrictEqual(stat.failures, { llm_http_500: 1 });
   assert.ok(stat.ms.median >= stat.ms.min, 'median 应 ≥ min');
   assert.ok(stat.ms.max >= stat.ms.p90, 'max 应 ≥ p90');
 });
@@ -176,4 +178,80 @@ test('renderProbeReport：上界随 N 变化（不能写死 N=5）', async () =>
   const outN15 = R.renderProbeReport(await mk(15));
   assert.match(outN5, /约 45%/, 'N=5 全过时上界约 45%');
   assert.match(outN15, /约 18%/, 'N=15 全过时上界约 18%');
+});
+
+// ---------------- severity 分布（暴露「只会回 none」的退化） ----------------
+
+test('probeModel：采集 severity 分布（回归：曾读 res.frame 恒为空 → 分布永远缺失）', async () => {
+  const stat = await R.probeModel(
+    { baseUrl: 'http://x', model: 'm', apiKey: 'k' },
+    { n: 4 },
+    { callReviewer: stubReviewer([
+      { text: '{"severity":"nit","note":"a"}' },
+      { text: '{"severity":"concern","note":"b"}' },
+      { text: '{"severity":"none","note":""}' },
+      { text: '{"severity":"nit","note":"c"}' }
+    ]) }
+  );
+  assert.deepStrictEqual(stat.severities, { nit: 2, concern: 1, none: 1 }, 'severity 必须来自解析结果，非 res.frame');
+});
+
+test('renderProbeReport：全 none 退化 → 判据虽全过，但报告必须显式警示（不能被判据掩盖）', async () => {
+  const stat = await R.probeModel(
+    { baseUrl: 'http://x', model: 'degenerate', apiKey: 'k' },
+    { n: 5 },
+    { callReviewer: stubReviewer([{ text: '{"severity":"none","note":""}' }]) }
+  );
+  assert.strictEqual(stat.passed, 5, '只会回 none 的模型在判据层面确实全过');
+  const out = R.renderProbeReport(stat);
+  assert.match(out, /严重级分布|none×5/, '应展示严重级分布');
+  assert.match(out, /全部返回 none|从不产出/, '必须警示全 none 退化，否则用户会把静默当合格');
+});
+
+// ---------------- 整批预算（防 --n 50 --timeout 240000 = 3.3 小时） ----------------
+
+test('probeModel：整批预算封顶——超预算提前收尾并标记 aborted，不跑满全部 n', async () => {
+  let calls = 0;
+  const stat = await R.probeModel(
+    { baseUrl: 'http://x', model: 'slow', apiKey: 'k' },
+    { n: 100, timeoutMs: 1000, batchTimeoutMs: 50 },
+    {
+      callReviewer: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 40)); // 每次 40ms，50ms 预算内只够 1 次
+        return { text: '{"severity":"nit","note":"a"}' };
+      }
+    }
+  );
+  assert.ok(calls < 100, `整批预算应阻止跑满 100 次（实际 ${calls} 次）`);
+  assert.strictEqual(stat.aborted, true, '应标记整批被预算截断');
+  assert.ok(stat.ran < stat.n, 'ran 应小于 n');
+  assert.ok(stat.batchMs <= 600000, '整批上限不得超过硬顶');
+});
+
+test('probeModel：batchTimeoutMs 有硬上界（用户传超大值也不能突破封顶）', async () => {
+  const stat = await R.probeModel(
+    { baseUrl: 'http://x', model: 'm', apiKey: 'k' },
+    { n: 1, batchTimeoutMs: 999999999 },
+    { callReviewer: async () => ({ text: '{"severity":"nit","note":"a"}' }) }
+  );
+  assert.strictEqual(stat.batchMs, R.PROBE_DEFAULTS.maxBatchTimeoutMs, '整批预算必须被硬顶钳制');
+});
+
+test('probeModel：空响应带 reasoning 回灌重试（与 reviewTurn 同策略，避免误判思考型模型）', async () => {
+  let calls = 0;
+  const stat = await R.probeModel(
+    { baseUrl: 'http://x', model: 'thinker', apiKey: 'k' },
+    { n: 1, timeoutMs: 60000 },
+    {
+      callReviewer: async (p) => {
+        calls++;
+        if (calls === 1) return { error: 'llm_empty_response', reasoningText: '我在思考…' };
+        assert.ok(String(p.userContent).includes('我在思考'), '重试应携带上一次 reasoning 回灌');
+        return { text: '{"severity":"nit","note":"ok"}' };
+      }
+    }
+  );
+  assert.strictEqual(calls, 2, '首次空响应应触发一次带 reasoning 的重试');
+  assert.strictEqual(stat.passed, 1, '重试成功后应计通过，不误判为不可用');
 });

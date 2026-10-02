@@ -397,6 +397,15 @@ function applyReviewOutcome(s, result, eff, cfg) {
     });
   }
   s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
+  // 主模型本轮**自己**成功产出（非降级）：主模型劣化已消 → 清零降级连击与告警阶梯。
+  // 没有这条会退化成 latch：primaryFailStreak 只增不减，主模型修好后 degradeActive 恒真、
+  // UPS 永久重发陈旧告警、status 永久显示"主模型连续失败"。语义上它必须与 failStreak
+  // 对称地有恢复路径——「不掩盖故障」不等于「永不消解」。
+  if (!result.usedFallback) {
+    s.primaryFailStreak = null;
+    s.degradeAlertCount = 0;
+    s.degradeNotifiedAt = '';
+  }
 }
 
 function accumulateUsage(state, result) {
@@ -412,6 +421,8 @@ function onSessionStart(ctx) {
   const { stateDir, sessionId, transcriptPath, cfg, input } = ctx;
   const { file } = ensureState(stateDir, sessionId, transcriptPath, cfg.startEnabled);
   pruneStates(stateDir, 7, 50);
+  // 信标回收：信标目录可能与 stateDir 不同（默认 ~/.zcode），单独 prune，防无界增长拖慢读取侧。
+  try { health.pruneBeacons(health.resolveHealthDir(process.env), 7, 50); } catch (_) {}
   // resume/compact/clear 后重发注册行：旧注册行可能已被压缩出上下文，
   // 没有它 /advisor-* 命令在最需要排查的长会话里失联。
   const source = String((input && (input.source || input.matcher)) || 'startup');
@@ -483,9 +494,13 @@ function onUserPromptSubmit(ctx) {
       }
     }
     // 降级告警（M4）：**独立阶梯**，不与停摆告警共计数——否则两类故障互相压制对方的提醒。
-    // 只在「主模型仍在劣化」时喊：primaryFailStreak 达阈值。fallback 成功会清 failStreak
-    // 但不清它，所以这条恰好在「系统看似正常、实则一直在降级」时提醒用户。
-    const degradeActive = s.enabled === true && s.primaryFailStreak && (s.primaryFailStreak.count || 0) >= FAIL_STREAK_ALERT_THRESHOLD;
+    // 只在「主模型仍在劣化」**且确实降级过**时喊：primaryFailStreak 达阈值 + fallbackLastModel 非空。
+    // fallbackLastModel 只在 fallback 真跑成功时写入（applyReviewOutcome 的 usedFallback 分支）——
+    // sync 模式、未配备用模型、备用也失败三种情形都不会有值，此时喊「由备用模型维持」就是把
+    // 停摆粉饰成「降级兜住」（本模块要消灭的静默掩盖的镜像），必须由这条门控挡住。
+    const degradeActive = s.enabled === true && s.primaryFailStreak
+      && (s.primaryFailStreak.count || 0) >= FAIL_STREAK_ALERT_THRESHOLD
+      && Boolean(s.fallbackLastModel);
     if (degradeActive && !outageActive) {
       const prevDeg = s.degradeAlertCount || 0;
       const lastDeg = Date.parse(s.degradeNotifiedAt || '') || 0;
@@ -730,36 +745,44 @@ async function onStopSync(ctx) {
 
   // 指针推进策略：只要完成了一次审查尝试就前进——失败同样前进（drop 即放弃，
   // 与 dsh-advisor 的有界积压一致，绝不反复重试拖住主循环）。
+  // 返回锁内计算出的 reviews 数（供锁外写信标用）——信标不写在临界区内：
+  // state 锁竞争超时时 mutateStateExclusive 不执行 fn，若信标写在里面会被一并丢弃
+  // （一次成功的审查完全不写结果 → 读取侧误判 down）。
   const finish = (mutateFn) => {
+    let reviews = 0;
     mutateStateExclusive(file, (s) => {
       s.byteOffset = delta.nextOffset;
       s.lastHeadHash = delta.headHash;
       mutateFn(s);
+      reviews = s.reviews || 0;
     });
+    return reviews;
   };
 
   if (result.error) {
-    finish((s) => {
+    const reviews = finish((s) => {
       s.reviews = (s.reviews || 0) + 1;
       accumulateUsage(s, result);
       applyReviewOutcome(s, result, eff, cfg);
-      health.writeResult(health.resolveHealthDir(process.env), sessionId, {
-        ok: false, reason: result.error, model: eff.model, effectiveModel: eff.model, reviews: s.reviews
-      });
+    });
+    health.writeResult(health.resolveHealthDir(process.env), sessionId, {
+      ok: false, reason: result.error, model: eff.model, effectiveModel: eff.model, reviews
     });
     return;
   }
 
   const frame = result.frame;
-  finish((s) => {
+  const reviews = finish((s) => {
     s.reviews = (s.reviews || 0) + 1;
     accumulateUsage(s, result);
     applyReviewOutcome(s, result, eff, cfg);
-    health.writeResult(health.resolveHealthDir(process.env), sessionId, {
-      ok: true, model: eff.model,
-      effectiveModel: result.usedFallback ? (result.fallbackModel || eff.model) : eff.model,
-      reviews: s.reviews
-    });
+  });
+  health.writeResult(health.resolveHealthDir(process.env), sessionId, {
+    ok: true, degraded: Boolean(result.usedFallback), model: eff.model,
+    effectiveModel: result.usedFallback ? (result.fallbackModel || eff.model) : eff.model,
+    reviews
+  });
+  mutateStateExclusive(file, (s) => {
     // 恢复信号：告警发过的会话（healthNotifiedAt 非空）恢复后，下一次 UPS 喊一声"已恢复"
     if (s.healthNotifiedAt) s.healthRecoveryPending = true;
   });
@@ -922,6 +945,9 @@ async function handleReviewWorker(args) {
 
     // 最终落盘：短临界区内重读最新状态、只写自己拥有的字段——
     // 审查期间 UPS/ctl 的修改（清队列、off、model set）不会被旧快照覆盖。
+    // 信标**不写在临界区内**：锁竞争超时时 mutateStateExclusive 不执行 fn，
+    // 若信标写在里面会连同本次成功的审查一起被丢弃（读取侧误判 down）。改为收集载荷、锁外写。
+    let beaconPayload = null;
     mutateStateExclusive(file, (s) => {
       if (!usingSnapshot) {
         // 持续文件路径（Claude Code 同构宿主）：正常推进增量指针
@@ -934,21 +960,20 @@ async function handleReviewWorker(args) {
       accumulateUsage(s, result);
       applyReviewOutcome(s, result, eff, cfg);
 
+      const sid = s.sessionId;
       if (result.error) {
         // 健康信标（M1）：审查失败 → down；lastSuccessAt 不更新（保持上次成功时间）。
-        health.writeResult(health.resolveHealthDir(process.env), s.sessionId, {
-          ok: false, reason: result.error, model: eff.model, effectiveModel: eff.model,
-          reviews: s.reviews
-        });
+        beaconPayload = { sid, ok: false, reason: result.error, model: eff.model, effectiveModel: eff.model, reviews: s.reviews };
         return;
       }
 
-      // 健康信标（M1）：审查成功 → ok。降级成功也算 ok，但 effectiveModel 用实际干活的模型。
-      health.writeResult(health.resolveHealthDir(process.env), s.sessionId, {
-        ok: true, model: eff.model,
+      // 健康信标（M1）：审查成功 → ok；靠备用模型完成 → degraded（黄）。
+      // degraded 优先于 ok——有产出但非主模型产出，角标必须显示降级，否则持续劣化被绿色藏起来。
+      beaconPayload = {
+        sid, ok: true, degraded: Boolean(result.usedFallback), model: eff.model,
         effectiveModel: result.usedFallback ? (result.fallbackModel || eff.model) : eff.model,
         reviews: s.reviews
-      });
+      };
       // 恢复信号：告警发过的会话（healthNotifiedAt 非空）恢复后，下一次 UPS 喊一声"已恢复"
       if (s.healthNotifiedAt) s.healthRecoveryPending = true;
 
@@ -984,6 +1009,14 @@ async function handleReviewWorker(args) {
         mode: 'async'
       });
     });
+    // 锁外写信标：锁超时也不会丢（载荷来自上面的临界区，失败时保持 null 不写）。
+    if (beaconPayload) {
+      const p = beaconPayload;
+      health.writeResult(health.resolveHealthDir(process.env), p.sid, {
+        ok: p.ok, degraded: p.degraded, reason: p.reason, model: p.model,
+        effectiveModel: p.effectiveModel, reviews: p.reviews
+      });
+    }
   } catch (err) {
     // worker 内任何异常：留下计数痕迹（此前版本此处静默消失），尽力落盘。
     try {
@@ -1271,7 +1304,11 @@ async function ctlDoctor(cfg, args) {
     const idxN = args.indexOf('--n');
     const n = idxN !== -1 && args[idxN + 1] ? Math.max(1, Math.min(50, parseInt(args[idxN + 1], 10) || 5)) : 5;
     const idxTo = args.indexOf('--timeout');
-    const timeoutMs = idxTo !== -1 && args[idxTo + 1] ? Math.max(1000, parseInt(args[idxTo + 1], 10) || cfg.reviewTimeoutMs) : cfg.reviewTimeoutMs;
+    // 单次 timeout 上界=cfg.reviewTimeoutMs（与配置同一钳制），下界 1000ms；
+    // 整批上限在 probeModel 内另有硬顶（PROBE_DEFAULTS.maxBatchTimeoutMs），防 --n/timeout 组合拖爆。
+    const timeoutMs = idxTo !== -1 && args[idxTo + 1]
+      ? Math.min(cfg.reviewTimeoutMs, Math.max(1000, parseInt(args[idxTo + 1], 10) || cfg.reviewTimeoutMs))
+      : cfg.reviewTimeoutMs;
     if (model !== cfg.model) process.stdout.write(`  探针: 目标模型 ${model}（非配置模型）\n`);
     process.stdout.write(`  探针: 正在用生产参数测试 ${model} ×${n} …\n`);
     const stat = await probeModel(

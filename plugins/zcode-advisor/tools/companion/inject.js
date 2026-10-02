@@ -22,6 +22,8 @@
     // 旧脚本的健康轮询用的是过期令牌（一律 403 → unknown），会与新脚本的新令牌轮询
     // 互相打架（灯在 ok/未知间闪）；清掉旧定时器，只留新脚本的。
     if (window.__zcaHealthTimer) { clearInterval(window.__zcaHealthTimer); window.__zcaHealthTimer = null; }
+    // observer 与定时器同等对待：旧一代不断开会在轮换后叠加并回写旧状态
+    if (window.__zcaObserver) { try { window.__zcaObserver.disconnect(); } catch (_) {} window.__zcaObserver = null; }
   }
   window.__zcodeAdvisorInjected = true;
   window.__zcodeAdvisorToken = TOKEN;
@@ -48,17 +50,24 @@
 /* 健康指示点（M1）：角标上的状态灯。颜色由 /api/health 轮询结果决定。
    默认灰=未知；**代码里不存在"取不到数据就显示绿"的分支**——
    指示器失效必须显示未知，否则用户会把"灯坏了"误读成"顾问健康"。 */
-.zca-hdot{position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;
- background:#8b94a3;flex:0 0 auto;transition:background .2s}
+.zca-hdot{position:absolute;top:-2px;right:-2px;width:12px;height:12px;border-radius:50%;
+ background:#8b94a3;flex:0 0 auto;transition:background .2s;
+ display:flex;align-items:center;justify-content:center;
+ font-size:8px;line-height:1;font-weight:700;color:#0b1220}
 .zca-badge.zca-topbar-badge .zca-hdot{position:static;top:auto;right:auto}
 .zca-badge.zca-h-ok .zca-hdot{background:#10b981}
-.zca-badge.zca-h-degraded .zca-hdot{background:#f59e0b}
-.zca-badge.zca-h-down .zca-hdot{background:#ef4444;animation:zca-pulse 1.6s ease-out infinite}
-.zca-badge.zca-h-unknown .zca-hdot{background:#8b94a3;opacity:.55}
+.zca-badge.zca-h-degraded .zca-hdot{background:#f59e0b;color:#3a2500}
+.zca-badge.zca-h-down .zca-hdot{background:#ef4444;color:#fff;animation:zca-pulse 1.6s ease-out infinite}
+.zca-badge.zca-h-unknown .zca-hdot{background:#8b94a3;opacity:.55;color:#0b1220}
 /* 异常态整体染色：顶部 tab 一眼可见（用户诉求"出问题 tab 变红"） */
 .zca-badge.zca-h-down{border-color:rgba(239,68,68,.65);background:rgba(239,68,68,.14);opacity:1;color:#fca5a5}
 .zca-badge.zca-h-degraded{border-color:rgba(245,158,11,.55);background:rgba(245,158,11,.12);opacity:1;color:#fcd34d}
 @keyframes zca-pulse{0%{box-shadow:0 0 0 0 rgba(239,68,68,.55)}70%{box-shadow:0 0 0 7px rgba(239,68,68,0)}100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}}
+/* 尊重系统「减弱动态效果」：脉冲降为静态红，避免持续动画打扰 */
+@media (prefers-reduced-motion: reduce){
+ .zca-badge.zca-h-down .zca-hdot{animation:none}
+ .zca-hdot{transition:none}
+}
 .zca-panel{position:fixed;width:320px;max-height:76vh;overflow:auto;z-index:2147483001;
  right:16px;bottom:140px;
  background:#1c1f26;color:#e6e8ec;border:1px solid #333842;border-radius:14px;padding:12px 14px 14px;
@@ -225,9 +234,11 @@
   // 绝不写「取不到数据就当健康」的分支——那会让灯坏了被误读成顾问正常。
   const HEALTH_STATES = { ok: 1, degraded: 1, down: 1, unknown: 1 };
   const HEALTH_TEXT = {
-    ok: '顾问正常', degraded: '顾问降级（部分审查失败）',
+    ok: '顾问正常', degraded: '顾问降级（部分审查由备用模型完成）',
     down: '顾问异常：审查未成功返回', unknown: '顾问状态未知（尚未运行或数据过期）'
   };
+  // 非颜色编码：给每种状态一个字形，色觉障碍用户不依赖红/绿也能分辨。
+  const HEALTH_GLYPH = { ok: '✓', degraded: '!', down: '✕', unknown: '?' };
   let healthState = 'unknown';
   let healthDetail = '';
 
@@ -238,14 +249,25 @@
     healthState = s;
     healthDetail = detail || '';
     for (const k of Object.keys(HEALTH_STATES)) b.classList.toggle('zca-h-' + k, k === s);
+    // 状态字形：非颜色渠道，避免仅靠红/绿（色盲不友好）
+    const dot = document.getElementById('zca-hdot');
+    if (dot) dot.textContent = HEALTH_GLYPH[s] || '';
     // 顶部条模式下角标自带文字，把健康态写成 title 提示；图标模式也写 title
     b.title = `ZCode Advisor｜${HEALTH_TEXT[s]}${healthDetail ? '｜' + healthDetail : ''}（点击打开设置）`;
+    // 辅助技术：aria-label 必须携带健康态，否则屏幕阅读器用户对本次功能全无感知。
+    b.setAttribute('aria-label', `ZCode Advisor 设置；健康状态：${HEALTH_TEXT[s]}${healthDetail ? '，' + healthDetail : ''}`);
   }
 
   async function pollHealth() {
     try {
       const r = await api('/api/health');
-      if (!r || !r.ok) { paintHealth('unknown', ''); return; }
+      if (!r) { paintHealth('unknown', ''); return; }
+      // 明确区分失败类型，别把「版本过旧/令牌失效」吞成安静的灰灯（用户会去查不存在的故障）
+      if (!r.ok) {
+        if (r.error === 'not_found') { paintHealth('unknown', '外挂版本过旧，不支持健康检查，请更新'); return; }
+        if (r.error === 'bad_token') { paintHealth('unknown', '令牌已失效，刷新 ZCode 页面即可恢复'); return; }
+        paintHealth('unknown', ''); return;
+      }
       const b = r.beacon || null;
       let detail = '';
       if (b && b.lastSuccessAt) {
@@ -254,6 +276,14 @@
         detail = '上次尝试 ' + String(b.lastAttemptAt).replace('T', ' ').slice(5, 16) + '（未成功）';
       }
       if (b && b.reason) detail += '｜' + String(b.reason).slice(0, 40);
+      // 会话归属：controller 返回的是「最近活动的会话」，不是「当前会话」——
+      // 不标注会让用户把另一个会话的灯读成自己会话的灯（多会话下的假绿/假红）。
+      const sid = b && b.sessionId ? String(b.sessionId) : '';
+      const cand = Number.isFinite(r.candidates) ? r.candidates : 0;
+      if (sid) {
+        const short = sid.replace(/^sess_/, '').slice(0, 8);
+        detail += `｜最近活动会话 ${short}${cand > 1 ? `（共 ${cand} 个）` : ''}`;
+      }
       paintHealth(r.state, detail);
     } catch (_) {
       // 外挂未运行 / 网络错误：不能装作正常，显示未知
@@ -544,6 +574,10 @@
     const p = el('div', 'zca-panel');
     p.id = 'zca-panel';
     p.style.display = 'none';
+    // 对话框语义：屏幕阅读器需要知道这是模态面板，且 Esc 可关闭、打开时焦点进入。
+    p.setAttribute('role', 'dialog');
+    p.setAttribute('aria-modal', 'true');
+    p.setAttribute('aria-label', 'ZCode Advisor 顾问设置');
     p.innerHTML = `
       <h3><span>🛡️ 顾问设置</span><span class="zca-close" id="zca-close">✕</span></h3>
       <div class="zca-status" id="zca-status">读取中…</div>
@@ -603,7 +637,10 @@
       <div class="zca-hint" style="margin-top:8px">保存后下一轮审查即生效；意见以 [advisor:*] 前缀随下一条消息送达。</div>
     `;
     document.body.appendChild(p);
-    p.querySelector('#zca-close').addEventListener('click', () => { p.style.display = 'none'; });
+    const closePanel = () => { p.style.display = 'none'; };
+    p.querySelector('#zca-close').addEventListener('click', closePanel);
+    // Esc 关闭（对话框惯例）：键盘用户不必去够右上角小叉
+    p.addEventListener('keydown', (ev) => { if (ev && ev.key === 'Escape') closePanel(); });
     p.querySelector('#zca-save').addEventListener('click', save);
     p.querySelector('#zca-ping').addEventListener('click', ping);
     p.querySelector('#zca-models').addEventListener('click', fetchModels);
@@ -701,7 +738,12 @@
       if (!panel || !document.getElementById('zca-panel')) panel = buildPanel();
       const show = panel.style.display === 'none';
       panel.style.display = show ? 'block' : 'none';
-      if (show) refreshStatus();
+      if (show) {
+        refreshStatus();
+        // 焦点管理：打开时把焦点移入面板首个可聚焦控件，键盘用户不必 Tab 穿越宿主 UI
+        const first = panel.querySelector('#zca-enabled') || panel.querySelector('#zca-close');
+        if (first && typeof first.focus === 'function') { try { first.focus(); } catch (_) {} }
+      }
     };
     b.addEventListener('click', toggle);
     b.addEventListener('keydown', (ev) => {
@@ -716,6 +758,9 @@
   // 用 MutationObserver 监听并重新挂载——比定时轮询更省资源且响应更快。
   function watchComposer() {
     if (typeof MutationObserver !== 'function' || !document.body) return;
+    // 跨代清理：旧一代 observer 若不 disconnect，令牌轮换后会叠加，其回调仍闭包引用旧
+    // TOKEN/healthState，可能把新一代刚拉到的正确态踹回旧值。挂到 window 供清理块断开。
+    if (window.__zcaObserver) { try { window.__zcaObserver.disconnect(); } catch (_) {} }
     const observer = new MutationObserver(() => {
       const b = document.getElementById('zca-badge');
       if (!b) {
@@ -730,6 +775,7 @@
       if (anchor && b.parentNode !== anchor) mountBadge(b);
     });
     observer.observe(document.body, { childList: true, subtree: true });
+    window.__zcaObserver = observer;
   }
 
   function boot() {

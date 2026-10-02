@@ -109,6 +109,38 @@ test('writeResult(失败)：不更新 lastSuccessAt（判据：有尝试无新�
   assert.strictEqual(got.reason, 'llm_http_500');
 });
 
+test('writeResult(降级成功)：ok+degraded 并存时棋标必须是 degraded 而非 ok（劣化不得被绿色藏起来）', () => {
+  const dir = tmpDir();
+  const got = runInChild(
+    { ZCODE_ADVISOR_HEALTH_DIR: dir, ZCODE_ADVISOR_STATE_DIR: null },
+    `
+      const d = H.resolveHealthDir(process.env);
+      H.writeAttempt(d, 's1', { model: 'primary' });
+      // 靠备用模型完成：本次确有产出(ok)且降级(degraded)同时为真
+      H.writeResult(d, 's1', { ok: true, degraded: true, model: 'primary', effectiveModel: 'fb', reviews: 1 });
+      const b = H.readBeacons(d)[0];
+      process.stdout.write(JSON.stringify({ state: b.state, effectiveModel: b.effectiveModel, hasSuccess: Boolean(b.lastSuccessAt) }));
+    `
+  );
+  assert.strictEqual(got.state, 'degraded', 'ok+degraded 并存时必须降级优先，否则黄灯永远不可达');
+  assert.strictEqual(got.effectiveModel, 'fb', '生效模型应记实际干活的备用模型');
+  assert.ok(got.hasSuccess, '降级成功仍算成功，应更新 lastSuccessAt');
+});
+
+test('writeResult(正常成功)：只 ok 时 state=ok', () => {
+  const dir = tmpDir();
+  const got = runInChild(
+    { ZCODE_ADVISOR_HEALTH_DIR: dir, ZCODE_ADVISOR_STATE_DIR: null },
+    `
+      const d = H.resolveHealthDir(process.env);
+      H.writeAttempt(d, 's1', { model: 'm' });
+      H.writeResult(d, 's1', { ok: true, model: 'm', reviews: 1 });
+      process.stdout.write(JSON.stringify(H.readBeacons(d)[0].state));
+    `
+  );
+  assert.strictEqual(got, 'ok');
+});
+
 test('readBeacons：多会话并存，按 lastAttemptAt 倒序（最近活动在前）', () => {
   const dir = tmpDir();
   const got = runInChild(
@@ -404,3 +436,68 @@ test('GET /api/health：无信标目录 → state=unknown（HTTP 层也不假绿
 });
 
 
+
+// ---------------- 信标回收（防无界增长） ----------------
+
+test('pruneBeacons：超龄信标被删；只保留最近 keep 个；非信标文件不受影响', () => {
+  const dir = tmpDir('zca-prune-');
+  const got = runInChild(
+    { ZCODE_ADVISOR_HEALTH_DIR: dir, ZCODE_ADVISOR_STATE_DIR: null },
+    `
+      const fsx = require('fs');
+      const pathx = require('path');
+      const mk = (name, ageDays) => {
+        const f = pathx.join(${JSON.stringify(dir)}, name);
+        fsx.writeFileSync(f, JSON.stringify({ sessionId: name, lastAttemptAt: new Date().toISOString() }));
+        const t = Date.now() - ageDays * 24 * 3600 * 1000;
+        fsx.utimesSync(f, t / 1000, t / 1000);
+      };
+      mk('advisor-health-old1.json', 30);   // 超龄应删
+      mk('advisor-health-old2.json', 30);
+      mk('advisor-health-fresh1.json', 0.1);  // 较旧的新文件
+      mk('advisor-health-fresh2.json', 0);    // 最新，应保留
+      fsx.writeFileSync(pathx.join(${JSON.stringify(dir)}, 'keep-me.json'), '{}'); // 非信标
+      H.pruneBeacons(${JSON.stringify(dir)}, 7, 1);
+      const left = fsx.readdirSync(${JSON.stringify(dir)}).sort();
+      process.stdout.write(JSON.stringify(left));
+    `
+  );
+  assert.deepStrictEqual(got, ['advisor-health-fresh2.json', 'keep-me.json'].sort(),
+    '超龄删、只留最近 1 个、非信标文件不动');
+});
+
+test('readBeacons：maxRead 上限生效（历史信标无界时不做全量解析）', () => {
+  const dir = tmpDir('zca-cap-');
+  const got = runInChild(
+    { ZCODE_ADVISOR_HEALTH_DIR: dir, ZCODE_ADVISOR_STATE_DIR: null },
+    `
+      const fsx = require('fs');
+      const pathx = require('path');
+      for (let i = 0; i < 10; i++) {
+        fsx.writeFileSync(pathx.join(${JSON.stringify(dir)}, 'advisor-health-s' + i + '.json'),
+          JSON.stringify({ sessionId: 's' + i, lastAttemptAt: new Date(Date.now() - i * 1000).toISOString() }));
+      }
+      process.stdout.write(JSON.stringify({ capped: H.readBeacons(${JSON.stringify(dir)}, 3).length, all: H.readBeacons(${JSON.stringify(dir)}, 50).length }));
+    `
+  );
+  assert.strictEqual(got.capped, 3, 'maxRead 应限制读取条数');
+  assert.strictEqual(got.all, 10, '上限足够时读全部');
+});
+
+test('readBeacons：非法时间戳不产生 NaN 排序（与 controller 比较器一致）', () => {
+  const dir = tmpDir('zca-nan-');
+  const got = runInChild(
+    { ZCODE_ADVISOR_HEALTH_DIR: dir, ZCODE_ADVISOR_STATE_DIR: null },
+    `
+      const fsx = require('fs');
+      const pathx = require('path');
+      fsx.writeFileSync(pathx.join(${JSON.stringify(dir)}, 'advisor-health-a.json'), JSON.stringify({ sessionId: 'a', lastAttemptAt: 'not-a-date' }));
+      fsx.writeFileSync(pathx.join(${JSON.stringify(dir)}, 'advisor-health-b.json'), JSON.stringify({ sessionId: 'b', lastAttemptAt: '' }));
+      const out = H.readBeacons(${JSON.stringify(dir)}).map(x => x.sessionId);
+      process.stdout.write(JSON.stringify({ sorted: out.slice().sort().join(','), count: out.length }));
+    `
+  );
+  // 关键：不抛错、不丢条目（NaN 比较器会让 sort 结果未定义，但不应崩溃或丢数据）
+  assert.strictEqual(got.count, 2, '非法时间戳不得导致条目丢失');
+  assert.strictEqual(got.sorted, 'a,b', '两条都应在结果中');
+});

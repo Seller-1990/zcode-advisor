@@ -46,14 +46,35 @@ function readBeaconFile(file) {
 
 // 读取 + 合并写：信标是「同一会话多字段分次写」，不能整覆盖——Stop 写 attempt 后
 // worker 再写 result，若 result 用整对象覆盖会丢掉 attempt（反之亦然）。
+// rename 在 Windows 上可能被索引器/杀毒临时占用（EPERM），故做有限重试（与 state.js 同策略）；
+// 写 tmp 失败时 unlink 残留 tmp，避免反复失败累积垃圾文件。
 function mergeBeacon(file, patch) {
+  const dir = path.dirname(file);
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    // 目录存在则跳过 mkdir（热路径：每次写都 mkdir 无谓损耗）；不存在再建并补 0700。
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    } else {
+      try { fs.chmodSync(dir, 0o700); } catch (_) {} // 历史目录可能是 0755，补正（文件名含会话 id）
+    }
     const prev = readBeaconFile(file) || {};
     const next = Object.assign({}, prev, patch);
     const tmp = `${file}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(tmp, file);
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+    } catch (e) {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+      throw e;
+    }
+    let lastErr = null;
+    for (let i = 0; i < 4; i++) {
+      try { fs.renameSync(tmp, file); lastErr = null; break; } catch (e) {
+        lastErr = e;
+        // 忙等退避：Atomic 的 sleepSync 优先，退回同步自旋（不与主流程引入异步）
+        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); } catch (_) {}
+      }
+    }
+    if (lastErr) { try { fs.unlinkSync(tmp); } catch (_) {} return null; }
     try { fs.chmodSync(file, 0o600); } catch (_) {}
     return next;
   } catch (_) {
@@ -74,11 +95,14 @@ function writeAttempt(dir, sessionId, info) {
 
 // worker 完成审查时调用：记录结果。成功写 lastSuccessAt；失败只更新 state/reason
 // （lastSuccessAt 保持上一次成功时间——「有尝试无成功」正是 down 的判据）。
+// degraded（黄）：审查靠备用模型完成——服务未中断，但主模型在劣化。它**优先于 ok**：
+// 调用方可能同时传 ok:true（本次确有产出）与 degraded:true（非主模型产出），
+// 此时角标必须显示黄（降级可见），不能因 ok 而显示绿（那会把持续劣化藏起来）。
 function writeResult(dir, sessionId, result) {
   const r = result || {};
   const patch = {
     sessionId: String(sessionId || ''),
-    state: r.ok ? 'ok' : (r.degraded ? 'degraded' : 'down'),
+    state: r.degraded ? 'degraded' : (r.ok ? 'ok' : 'down'),
     reason: String(r.reason || ''),
     model: String(r.model || ''),
     effectiveModel: String(r.effectiveModel || r.model || '')
@@ -89,20 +113,58 @@ function writeResult(dir, sessionId, result) {
 }
 
 // 读目录下全部信标（新的在前）。任何失败返回 []。
-function readBeacons(dir) {
+// 上限 maxRead=50：读取侧只关心「最近活动」，没必要把上千个历史信标全解析。
+function readBeacons(dir, maxRead) {
+  const cap = Number.isFinite(maxRead) && maxRead > 0 ? maxRead : 50;
   try {
     const files = fs.readdirSync(dir)
       .filter((f) => /^advisor-health-.*\.json$/.test(f))
       .map((f) => path.join(dir, f));
+    // 先按 mtime 预筛，避免对全部文件做同步读+解析（历史信标无界增长时这是热路径）
+    const withMtime = files.map((f) => {
+      let mtime = 0;
+      try { mtime = fs.statSync(f).mtimeMs; } catch (_) {}
+      return { f, mtime };
+    }).sort((a, b) => b.mtime - a.mtime).slice(0, cap);
     const out = [];
-    for (const f of files) {
+    for (const { f } of withMtime) {
       const b = readBeaconFile(f);
       if (b && typeof b === 'object') out.push(b);
     }
-    out.sort((a, b) => Date.parse(b.lastAttemptAt || 0) - Date.parse(a.lastAttemptAt || 0));
+    out.sort((a, b) => (Date.parse(b.lastAttemptAt || 0) || 0) - (Date.parse(a.lastAttemptAt || 0) || 0));
     return out;
   } catch (_) {
     return [];
+  }
+}
+
+// 信标回收：信标按会话分文件、只增不减，长期使用会在 ~/.zcode 累积成千上万个，
+// 拖慢读取侧（每 5s 全目录扫描）。与 state 同纪律：超龄删除 + 只留最近 keep 个。
+function pruneBeacons(dir, maxAgeDays, keep) {
+  const limitAge = (maxAgeDays || 7) * 24 * 3600 * 1000;
+  const limitKeep = keep || 50;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir)
+      .filter((f) => /^advisor-health-.*\.json$/.test(f))
+      .map((f) => {
+        const full = path.join(dir, f);
+        let mtime = 0;
+        try { mtime = fs.statSync(full).mtimeMs; } catch (_) {}
+        return { full, mtime };
+      });
+  } catch (_) {
+    return;
+  }
+  const now = Date.now();
+  for (const e of entries) {
+    if (now - e.mtime > limitAge) {
+      try { fs.unlinkSync(e.full); } catch (_) {}
+    }
+  }
+  const kept = entries.filter((e) => fs.existsSync(e.full)).sort((a, b) => b.mtime - a.mtime);
+  for (const e of kept.slice(limitKeep)) {
+    try { fs.unlinkSync(e.full); } catch (_) {}
   }
 }
 
@@ -137,5 +199,5 @@ function deriveHealth(beacon, opts) {
 
 module.exports = {
   resolveHealthDir, beaconPath, writeAttempt, writeResult,
-  readBeacons, deriveHealth, staleThresholdMs
+  readBeacons, deriveHealth, staleThresholdMs, pruneBeacons
 };

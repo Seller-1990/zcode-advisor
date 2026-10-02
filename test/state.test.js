@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  ensureState, mutateStateExclusive, loadState, saveState, createLock, countLocks, lockPathFor, freshState, bumpDrop
+  ensureState, mutateStateExclusive, loadState, saveState, createLock, countLocks, lockPathFor, freshState, bumpDrop, bumpPrimaryFailStreak
 } = require('../hooks/lib/state');
 
 function tmpDir(t) {
@@ -143,7 +143,7 @@ test('4a failStreak：同因累加到 3，sinceTs 保持连击起点不变', () 
   assert.ok(s.droppedAt.llm_http_401);
 });
 
-test('4a failStreak：白名单异因切换重置为 1（sinceTs 重新起算）', () => {
+test('4a failStreak：白名单异因**跨原因累计**（交替原因不得重置连击）', () => {
   const s = freshState('x', '', true);
   // 先建立 llm_http_401 连击并模拟已提醒 2 次（告警路径写入的计数/时间）
   bumpDrop(s, 'llm_http_401');
@@ -152,23 +152,19 @@ test('4a failStreak：白名单异因切换重置为 1（sinceTs 重新起算）
   bumpDrop(s, 'llm_http_401');
   assert.strictEqual(s.healthAlertCount, 2, '同因累加不动告警计数');
   assert.strictEqual(s.healthNotifiedAt, '2000-01-01T00:00:00.000Z', '同因累加不动提醒时间');
-  // 固定旧起点（避免同毫秒内 ISO 字符串相同导致断言失真），异因切换必须换新
+  // 固定旧起点（避免同毫秒内 ISO 字符串相同导致断言失真），异因累加必须保留起点
   s.failStreak.sinceTs = '2000-01-01T00:00:00.000Z';
   bumpDrop(s, 'unparsed');
-  assert.strictEqual(s.failStreak.reason, 'unparsed');
-  assert.strictEqual(s.failStreak.count, 1);
-  // 异因切换清告警计数：新故障达阈值后从第 1 次提醒开始，不被旧故障阶梯压制
-  //（healthNotifiedAt 保留，供本轮故障恢复后补发恢复信号）
-  assert.strictEqual(s.healthAlertCount, 0, '异因切换应清 healthAlertCount');
-  assert.strictEqual(s.healthNotifiedAt, '2000-01-01T00:00:00.000Z', '异因切换保留 healthNotifiedAt');
-  assert.ok(s.failStreak.sinceTs !== '2000-01-01T00:00:00.000Z', '异因重置应更新连击起点');
-  // llm_* 家族内部切换同样重置
-  s.failStreak.sinceTs = '2000-01-01T00:00:00.000Z';
+  assert.strictEqual(s.failStreak.reason, 'unparsed', 'reason 记最近一次（用于归因）');
+  assert.strictEqual(s.failStreak.count, 3, '跨原因累计：404→unparsed 不重置计数（否则交替原因永不达阈值）');
+  assert.strictEqual(s.failStreak.sinceTs, '2000-01-01T00:00:00.000Z', '跨原因累计保留连击起点（停摆时长不因原因变化而重算）');
+  assert.strictEqual(s.healthAlertCount, 2, '连击未中断，告警阶梯不动');
+  // llm_* 家族内部交替同样累计
   bumpDrop(s, 'llm_empty_response');
   bumpDrop(s, 'llm_timeout');
   assert.strictEqual(s.failStreak.reason, 'llm_timeout');
-  assert.strictEqual(s.failStreak.count, 1);
-  assert.ok(s.failStreak.sinceTs !== '2000-01-01T00:00:00.000Z', '家族内切换同样应更新连击起点');
+  assert.strictEqual(s.failStreak.count, 5, '家族内交替同样累计');
+  assert.strictEqual(s.failStreak.sinceTs, '2000-01-01T00:00:00.000Z', '家族内交替保留起点');
 });
 
 test('4a failStreak：非白名单原因冻结不改写（count 与 sinceTs 均不动）', () => {
@@ -213,4 +209,23 @@ test('4a failStreak：旧版本 streak 缺 sinceTs 时同因累加防御补齐',
   assert.strictEqual(s.failStreak.count, 3);
   assert.ok(s.failStreak.sinceTs, '应补齐 sinceTs');
   assert.ok(!Number.isNaN(Date.parse(s.failStreak.sinceTs)), '补齐的 sinceTs 应为合法时间');
+});
+
+// M4：主模型失败连击同样跨原因累计——白名单三兄弟交替是端点劣化常见形态，
+// 按原因重置会让计数永远到不了降级告警阈值（漏报）。
+test('M4 primaryFailStreak：白名单原因交替仍累计到阈值（防漏报）', () => {
+  const s = freshState('x', '', true);
+  bumpPrimaryFailStreak(s, 'llm_http_404');
+  s.primaryFailStreak.sinceTs = '2000-01-01T00:00:00.000Z';
+  bumpPrimaryFailStreak(s, 'llm_empty_response');
+  bumpPrimaryFailStreak(s, 'unparsed');
+  assert.strictEqual(s.primaryFailStreak.count, 3, '交替原因必须累计（否则永远触发不了降级告警）');
+  assert.strictEqual(s.primaryFailStreak.reason, 'unparsed', 'reason 记最近一次用于归因');
+  assert.strictEqual(s.primaryFailStreak.sinceTs, '2000-01-01T00:00:00.000Z', '连击起点不因原因变化重置');
+  // 新一轮劣化（此前已清零）从 count=1 起，且清告警阶梯
+  const s2 = freshState('x', '', true);
+  s2.degradeAlertCount = 4;
+  bumpPrimaryFailStreak(s2, 'llm_http_404');
+  assert.strictEqual(s2.primaryFailStreak.count, 1);
+  assert.strictEqual(s2.degradeAlertCount, 0, '新一轮劣化应复位降级告警阶梯');
 });

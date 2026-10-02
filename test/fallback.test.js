@@ -294,6 +294,22 @@ test('落盘：普通成功（无降级）→ 清 failStreak，不产生 primary
   assert.strictEqual(got.hist, '', '无降级不应写 history');
 });
 
+test('落盘：主模型恢复（成功且非降级）→ 清 primaryFailStreak 与降级告警阶梯', () => {
+  // 防回归：primaryFailStreak 曾只增不减（latch），主模型修好后 UPS 永久重发陈旧降级告警。
+  // 主模型**自己**成功产出 = 劣化已消，必须与 failStreak 对称地清零，连同告警阶梯一起复位。
+  const got = applyInChild(
+    { frame: { severity: 'nit', note: 'x' }, usedFallback: false, primaryFailure: '' },
+    {
+      primaryFailStreak: { reason: 'llm_http_404', count: 3, sinceTs: '2026-01-01T00:00:00.000Z' },
+      fallbackLastModel: 'fb', fallbackUsed: 5, degradeAlertCount: 2, degradeNotifiedAt: '2026-01-01T00:00:00.000Z'
+    }
+  );
+  assert.strictEqual(got.s.primaryFailStreak, null, '主模型恢复后劣化连击必须清零（否则是 latch）');
+  assert.strictEqual(got.s.degradeAlertCount, 0, '降级告警阶梯应复位');
+  assert.strictEqual(got.s.degradeNotifiedAt, '', '降级告警时间戳应清空');
+  assert.strictEqual(got.s.fallbackUsed, 5, '历史降级次数是累计证据，不应被清');
+});
+
 // ---------------- 降级告警文案 ----------------
 
 test('degradeAlertLine：含主模型失败次数/时长/原因与备用模型名，且不谎称服务中断', () => {
