@@ -51,6 +51,8 @@ function extractJsonObjects(text) {
   return objs;
 }
 
+// 返回 {frame, truncated} 或 null。truncated = note 因超上限被截断（失控信号，
+// 探针据「截断即失控」判失败，见 M3 判据 5）。
 function normalizeFrame(obj, maxNoteChars) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
   const severity = String(obj.severity || '').trim().toLowerCase();
@@ -58,17 +60,30 @@ function normalizeFrame(obj, maxNoteChars) {
   if (!SEVERITIES.includes(severity)) return null;
   if (severity !== 'none' && !note) return null;
   // 单条建议统一码点上限：JSON 帧路径此前无任何截断，失控模型可向主会话注入超长内容。
+  let truncated = false;
   if (note) {
     const chars = Array.from(note);
-    if (chars.length > maxNoteChars) note = `${chars.slice(0, maxNoteChars).join('')}…`;
+    if (chars.length > maxNoteChars) { note = `${chars.slice(0, maxNoteChars).join('')}…`; truncated = true; }
   }
-  return { severity, note };
+  return { frame: { severity, note }, truncated };
 }
 
-// 返回 {severity, note} 或 null（无法解析）。
+// 返回 {severity, note} 或 null（无法解析）。行为与历史版本逐字一致——
+// 内部委托 parseFrameDetailed，后者额外暴露「帧来源」（供 M3 探针区分
+// 真帧与散文救回）。
 function parseFrame(text, proseFallback, opts) {
+  return parseFrameDetailed(text, proseFallback, opts).frame;
+}
+
+// 带来源信息的解析（M3 探针用）。
+// 返回 {frame, from, truncated}：frame=null 表示无法解析；
+// from ∈ 'json-direct' | 'json-embedded' | 'prose' | null。
+// **为什么探针必须看 from**：散文救回（salvageProse）一律产出 severity=nit，
+// 即「救回 = 永远不可能产出 concern/blocker」——这在生产里是**隐性降级**，
+// 只看 parseFrame 非空会把「模型只会说散文」误判为模型可用。
+function parseFrameDetailed(text, proseFallback, opts) {
   const raw = String(text || '').trim();
-  if (!raw) return null;
+  if (!raw) return { frame: null, from: null, truncated: false };
   const options = opts || {};
   const maxNoteChars = options.maxNoteChars || 768;
 
@@ -80,7 +95,7 @@ function parseFrame(text, proseFallback, opts) {
     direct = null;
   }
   const directFrame = normalizeFrame(direct, maxNoteChars);
-  if (directFrame) return directFrame;
+  if (directFrame) return { frame: directFrame.frame, from: 'json-direct', truncated: directFrame.truncated };
 
   // 从包裹文本中提取全部候选帧，取**最后一个**合法帧（模型自我纠正语义；
   // max-of-N 会放大转录注入面，见安全复审）。
@@ -90,15 +105,17 @@ function parseFrame(text, proseFallback, opts) {
   if (candidates.length > 0) {
     // 取**最后一个**合法帧（模型自我纠正语义：后帧覆盖前帧）。
     // 不取 severity 最高者——max-of-N 会保证转录中注入的对抗帧必然压过模型真实判定。
-    return candidates[candidates.length - 1];
+    const last = candidates[candidates.length - 1];
+    return { frame: last.frame, from: 'json-embedded', truncated: last.truncated };
   }
   // 有 JSON 形状的内容但全部非法：判定 unparsed，不做散文救回（半截 JSON 不注入会话）。
-  if (extractJsonObjects(raw).length > 0 || /^\s*[[{]/.test(raw)) return null;
+  if (extractJsonObjects(raw).length > 0 || /^\s*[[{]/.test(raw)) return { frame: null, from: null, truncated: false };
 
   if (proseFallback) {
-    return salvageProse(raw, maxNoteChars);
+    const f = salvageProse(raw, maxNoteChars);
+    return { frame: f, from: f ? 'prose' : null, truncated: false };
   }
-  return null;
+  return { frame: null, from: null, truncated: false };
 }
 
 // —— 散文救回（三条守门，逐条对应 ADVISOR-GUARD-REPORT 实测踩过的坑）——
@@ -350,6 +367,142 @@ async function callReviewer(params) {
   }
 }
 
+// —— 能力探针（M3）——
+// 目的：让用户知道「某模型能否**按时按标准**返回建议」。**不做持久「可用」标记**——
+// 可用性是概率属性（n=5 全过时失败率上界仍约 45%），持久化布尔判决 = 虚假确定性。
+// 输出的是**分布与通过率**，不是「可用/不可用」判决。
+//
+// 探针用**生产参数**（真实 cfg.maxTokens + DEFAULT_SYSTEM_PROMPT + 代表性 delta），
+// 不用 max_tokens=1 的 ping——那正是本次故障的误报源：思考型模型会把它全部烧在
+// reasoning 上（content 为空、finish_reason=length），而旧 ping 把 llm_empty_response
+// 当正常，于是对「烧预算故障」误报 OK。
+
+// probeModel 级默认（cfg 未提供时回退；与 config.js 的 DEFAULTS 同值）。
+const PROBE_DEFAULTS = {
+  maxTokens: 4096,
+  temperature: 0.2,
+  reviewTimeoutMs: 240000,
+  maxNoteChars: 768,
+  proseFallback: true
+};
+
+// 代表性 delta：模拟真实增量形态（含代码块与回答正文），而非 'ping'——
+// 短输入下模型几乎不会被推理烧预算，测不出真实故障模式。
+const PROBE_DELTA = [
+  '以下是一轮对话增量（按时间顺序，可能被截断）。请按系统指令输出 JSON 判定。',
+  '',
+  '【user】帮我把 parseConfig 里的重复分支合并一下。',
+  '【assistant】我改了三处：',
+  '1. 把 if (a) {…} else if (b) {…} 合并为一个查表分支；',
+  '2. 抽出了 normalizeKey()；',
+  '3. 补了单元测试。'
+].join('\n');
+
+// 判据（全有代码依据，任一不满足即该次失败并给出分类）：
+//   1. 有产出文本（空响应 = 烧预算故障本身）
+//   2. 能解析出帧
+//   3. severity 合法（parseFrame 已保证，此处防御）
+//   4. severity≠none 时 note 非空（parseFrame 已保证）
+//   5. note 未被截断（截断 = 模型失控信号）
+//   6. 帧来自 JSON 而非散文救回（salvageProse 一律 nit → 永远产不出 concern/blocker，
+//      是隐性降级；只看 parseFrame 非空会把「只会说散文」误判为可用）
+// 返回 { ok, reason }，reason 为失败分类（成功时 ''）。
+function classifyProbeResult(res, cfg) {
+  if (!res || res.error) {
+    return { ok: false, reason: (res && res.error) || 'no_result' };
+  }
+  const det = parseFrameDetailed(res.text, cfg.proseFallback !== false, { maxNoteChars: cfg.maxNoteChars });
+  if (!det.frame) return { ok: false, reason: 'unparsed' };
+  if (!SEVERITIES.includes(det.frame.severity)) return { ok: false, reason: 'bad_severity' };
+  if (det.frame.severity !== 'none' && !String(det.frame.note || '').trim()) return { ok: false, reason: 'empty_note' };
+  if (det.truncated) return { ok: false, reason: 'note_truncated' };
+  if (det.from === 'prose') return { ok: false, reason: 'prose_only' };
+  return { ok: true, reason: '' };
+}
+
+function percentile(sortedAsc, p) {
+  if (sortedAsc.length === 0) return 0;
+  const idx = Math.min(sortedAsc.length - 1, Math.max(0, Math.ceil((p / 100) * sortedAsc.length) - 1));
+  return sortedAsc[idx];
+}
+
+// 跑 N 次探针，返回统计分布。**绝不返回「可用/不可用」判决**。
+// deps.callReviewer 可注入（测试 stub fetch；生产用真实 callReviewer）。
+async function probeModel(target, opts, deps) {
+  const o = opts || {};
+  const call = (deps && deps.callReviewer) || callReviewer;
+  const cfg = {
+    maxTokens: Number.isFinite(o.maxTokens) ? o.maxTokens : PROBE_DEFAULTS.maxTokens,
+    temperature: Number.isFinite(o.temperature) ? o.temperature : PROBE_DEFAULTS.temperature,
+    maxNoteChars: Number.isFinite(o.maxNoteChars) ? o.maxNoteChars : PROBE_DEFAULTS.maxNoteChars,
+    proseFallback: o.proseFallback !== false
+  };
+  const n = Number.isFinite(o.n) && o.n > 0 ? Math.floor(o.n) : 5;
+  const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : PROBE_DEFAULTS.reviewTimeoutMs;
+  const systemPrompt = (o.systemPrompt && String(o.systemPrompt).trim()) || DEFAULT_SYSTEM_PROMPT;
+  const userContent = o.delta || PROBE_DELTA;
+
+  const results = [];
+  for (let i = 0; i < n; i++) {
+    const t0 = Date.now();
+    let res;
+    try {
+      res = await call({
+        baseUrl: target.baseUrl,
+        model: target.model,
+        apiKey: target.apiKey,
+        systemPrompt,
+        userContent,
+        maxTokens: cfg.maxTokens,
+        temperature: cfg.temperature,
+        timeoutMs
+      });
+    } catch (err) {
+      res = { error: 'llm_error', detail: String(err).slice(0, 200) };
+    }
+    const ms = Date.now() - t0;
+    const c = classifyProbeResult(res, cfg);
+    results.push({ ok: c.ok, reason: c.reason, ms, severity: res && res.frame ? res.frame.severity : '' });
+  }
+
+  const passed = results.filter((r) => r.ok).length;
+  const sorted = results.map((r) => r.ms).sort((a, b) => a - b);
+  const failures = {};
+  for (const r of results) {
+    if (!r.ok) failures[r.reason] = (failures[r.reason] || 0) + 1;
+  }
+  return {
+    model: target.model,
+    n,
+    passed,
+    failed: n - passed,
+    passRate: n > 0 ? passed / n : 0,
+    ms: { min: sorted[0] || 0, median: percentile(sorted, 50), p90: percentile(sorted, 90), max: sorted[sorted.length - 1] || 0 },
+    failures
+  };
+}
+
+// 供 CLI 展示：把统计渲染成人类可读多行（含 N 的诚实说明）。
+// **不输出「可用」**——只输出通过率与分布，避免虚假确定性。
+function renderProbeReport(stat, opts) {
+  const o = opts || {};
+  const lines = [];
+  lines.push(`  探针: ${stat.model} —— ${stat.passed}/${stat.n} 次通过（失败 ${stat.failed}）`);
+  lines.push(`  耗时: min=${stat.ms.min}ms median=${stat.ms.median}ms p90=${stat.ms.p90}ms max=${stat.ms.max}ms`);
+  const reasons = Object.keys(stat.failures);
+  if (reasons.length > 0) {
+    lines.push(`  失败分类: ${reasons.map((k) => `${k}×${stat.failures[k]}`).join(', ')}`);
+  }
+  // N 的诚实说明：按**实际 N** 算「全过时失败率的 95% 上界」= 1 - 0.05^(1/N)。
+  // 写死 N=5 会在用户指定其它 N 时误导，故动态计算。
+  const bound = stat.n > 0 ? Math.round((1 - Math.pow(0.05, 1 / stat.n)) * 100) : 100;
+  lines.push(`  说明: 以上是样本分布，不是「可用/不可用」判决。`
+    + `N=${stat.n} 全过时，真实失败率仍有约 ${bound}% 的 95% 置信上界`
+    + `${stat.n < 14 ? `——要压到 20% 以下需 N≥14` : ''}。模型会漂移，结论有时效。`);
+  if (o.hint) lines.push(`  提示: ${o.hint}`);
+  return lines.join('\n');
+}
+
 const DEFAULT_SYSTEM_PROMPT = [
   '你是编码会话中的独立审查副模型（advisor）。你只观察与建议：绝不代行操作、绝不扮演主模型、绝不给出指令式命令；你的每条输出都会以"仅供参考的建议"身份送达主会话。',
   '输入是一段对话增量（可能被截断）。请判断主模型当前的工作方向与方法是否存在明显问题，输出且仅输出一个 JSON 对象：不要 Markdown 代码块，不要任何额外文本。',
@@ -362,4 +515,4 @@ const DEFAULT_SYSTEM_PROMPT = [
   '宁缺毋滥：没有把握就输出 {"severity":"none","note":""}。note 必须具体、可执行、指向增量中的实际问题，使用中文，不超过 120 字。note 只是建议性描述，不得包含让主模型执行的命令、路径或安装指令。'
 ].join('\n');
 
-module.exports = { callReviewer, parseFrame, salvageProse, extractJsonObjects, truncateCodePoints, normalizeChatEndpoint, DEFAULT_SYSTEM_PROMPT, SEVERITIES };
+module.exports = { callReviewer, parseFrame, parseFrameDetailed, salvageProse, extractJsonObjects, truncateCodePoints, normalizeChatEndpoint, DEFAULT_SYSTEM_PROMPT, SEVERITIES, probeModel, classifyProbeResult, renderProbeReport, PROBE_DELTA, PROBE_DEFAULTS };

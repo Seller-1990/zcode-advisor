@@ -30,7 +30,7 @@ const {
   readDelta, renderDelta
 } = require('./lib/transcript');
 const {
-  callReviewer, parseFrame, DEFAULT_SYSTEM_PROMPT
+  callReviewer, parseFrame, DEFAULT_SYSTEM_PROMPT, probeModel, renderProbeReport
 } = require('./lib/reviewer');
 const {
   decideAction, decideActionAsync, prefixFor, applyDeliveryToState, enqueueNote
@@ -1070,7 +1070,7 @@ async function handleCtl(args) {
     return;
   }
 
-  process.stdout.write(`advisor: 未知子命令 ${sub}。可用：status | on | off | model [set <id>|reset] | api [set <baseUrl|-> <apiKey|-> [model:<id>]|show|reset] | doctor [--ping] [--model <id>]\n`);
+  process.stdout.write(`advisor: 未知子命令 ${sub}。可用：status | on | off | model [set <id>|reset] | api [set <baseUrl|-> <apiKey|-> [model:<id>]|show|reset] | doctor [--probe [--n 5]] [--ping] [--model <id>]\n`);
 }
 
 // 体检：展示配置解析链、key 来源（脱敏）、门禁与警告；--ping 用 max_tokens=1 的
@@ -1090,13 +1090,43 @@ async function ctlDoctor(cfg, args) {
   for (const w of configWarnings(cfg, apiKeyInfo)) lines.push(`  配置警告: ${w}`);
   process.stdout.write(lines.join('\n') + '\n');
 
-  if (!args.includes('--ping')) return;
+  if (!args.includes('--ping') && !args.includes('--probe')) return;
+
   const idxModel = args.indexOf('--model');
   const model = idxModel !== -1 && args[idxModel + 1] ? args[idxModel + 1] : cfg.model;
   if (gateReasons.length > 0) {
     process.stdout.write(`  Ping: 跳过（门禁未满足：${gateReasons.join(',')}）\n`);
     return;
   }
+
+  // —— 能力探针（M3，推荐）——
+  // 用**生产参数**（真实 maxTokens + 系统提示 + 代表性 delta）跑 N 次，
+  // 输出通过率与耗时分布。修掉旧 ping 的误报：旧 ping 用 max_tokens=1，
+  // 思考型模型会把它全烧在 reasoning 上（content 空、finish=length），
+  // 而旧 ping 把 llm_empty_response 当正常 → 对「烧预算故障」判 OK（本次故障的误报源）。
+  if (args.includes('--probe')) {
+    const idxN = args.indexOf('--n');
+    const n = idxN !== -1 && args[idxN + 1] ? Math.max(1, Math.min(50, parseInt(args[idxN + 1], 10) || 5)) : 5;
+    const idxTo = args.indexOf('--timeout');
+    const timeoutMs = idxTo !== -1 && args[idxTo + 1] ? Math.max(1000, parseInt(args[idxTo + 1], 10) || cfg.reviewTimeoutMs) : cfg.reviewTimeoutMs;
+    if (model !== cfg.model) process.stdout.write(`  探针: 目标模型 ${model}（非配置模型）\n`);
+    process.stdout.write(`  探针: 正在用生产参数测试 ${model} ×${n} …\n`);
+    const stat = await probeModel(
+      { baseUrl: cfg.baseUrl, model, apiKey: apiKeyInfo.key },
+      {
+        n,
+        timeoutMs,
+        maxTokens: cfg.maxTokens,
+        temperature: cfg.temperature,
+        maxNoteChars: cfg.maxNoteChars,
+        proseFallback: cfg.proseFallback,
+        systemPrompt: cfg.systemPrompt && cfg.systemPrompt.trim() ? cfg.systemPrompt : DEFAULT_SYSTEM_PROMPT
+      }
+    );
+    process.stdout.write(renderProbeReport(stat) + '\n');
+    return;
+  }
+
   process.stdout.write(`  Ping: 正在测试 ${model} …\n`);
   const t0 = Date.now();
   const res = await callReviewer({

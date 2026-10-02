@@ -25,14 +25,19 @@ argument-hint: "[<api-key>] [model:<model-id>]"
    ```
 
    注意：不要把 key 写进插件安装目录的 advisor.config.json（那是会被升级覆盖的缓存副本），也不要写入会话 Transcript 或让 key 出现在最终回复里。
-4. **验证**：运行
+4. **验证**：优先用能力探针（比 ping 准——ping 用 max_tokens=1，思考型模型会把预算全烧在推理上而误报 OK）：
 
    ```
-   node "<脚本绝对路径>" ctl doctor --ping
+   node "<脚本绝对路径>" ctl doctor --probe
    ```
 
-   向用户如实报告输出：门禁是否满足、Ping 是否 OK、耗时。若 Ping 失败：
+   如实报告输出的**通过率与耗时分布**（如「5 次通过 4/5，median 8s，失败分类 llm_empty_response×1」）。**不要**替用户下「模型可用」的判决——探针输出的是样本分布，N=5 全过时失败率上界仍有约 45%；要更强的判断可建议加 `--n 15`。
+
+   若只想快速看端点/认证是否连通（不测能力），可用 `node "<脚本绝对路径>" ctl doctor --ping`。
+
+   若探针/ping 失败：
    - `llm_http_401/403` → key 无效或无权限；
-   - `llm_http_404/400` → 模型 id 或端点路径不对，建议换模型再用 `ctl doctor --ping --model <id>` 逐个验证；
+   - `llm_http_404/400` → 模型 id 或端点路径不对，建议换模型再用 `ctl doctor --probe --model <id>` 逐个验证；
+   - `llm_empty_response` → 思考型模型烧预算（探针会带 reasoning 提示），调大 maxTokens（建议 ≥4096）；
    - `llm_timeout`/`llm_error` → 网络或端点问题。
 5. **收尾**：告知用户配置已写入用户级配置文件（给出实际路径），对新会话与既有会话的下一轮审查立即生效；会话级临时换模型用 `/advisor-model set <id>`；之后可用 `/advisor-status` 观察审查次数与 Token 累计。

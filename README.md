@@ -218,13 +218,13 @@ dsh 端教训（`ADVISOR-GUARD-REPORT.md`，[issue #102](https://github.com/omds
 
 | 命令 | 作用 |
 | --- | --- |
-| `/advisor-setup` | **交互式配置**：填写 API key、选择模型 → 写入用户级配置 → `ctl doctor --ping` 当场验证（`--model <id>` 可逐个测试候选模型） |
+| `/advisor-setup` | **交互式配置**：填写 API key、选择模型 → 写入用户级配置 → `ctl doctor --probe` 当场验证能力（`--n 5` 采样、`--model <id>` 逐个测候选）；只想看连通性用 `--ping` |
 | `/advisor-status` | 状态：启用/门禁/模式/模型及来源/审查与 steer 计数/Token 累计/顺延队列/`Dropped` 分类/配置问题与警告 |
 | `/advisor-api` | 会话级覆盖端点/key/模型（`api set <baseUrl|-> <apiKey|-> [model:<id>]`、`api show`、`api reset`）；key 明文只落本会话状态文件（0600），状态行只回显掩码 |
 | `/advisor-on` `/advisor-off` | 当前会话启停（临时覆盖；审查在飞时执行也不会被回滚；停用会话仍可用注册行自救） |
 | `/advisor-model` | 查看审查模型及来源；`/advisor-model set <model-id>` 本会话固定（下一轮生效）；`/advisor-model reset` 回落全局默认 |
 
-命令通过首条消息注入的 `[advisor]` 注册行定位（含脚本与状态文件两个绝对路径；门禁失败/会话停用时也会投递或重发）。`ctl doctor` 可随时做无会话体检：配置解析链、key 来源（脱敏）、门禁、Ping 连通性。
+命令通过首条消息注入的 `[advisor]` 注册行定位（含脚本与状态文件两个绝对路径；门禁失败/会话停用时也会投递或重发）。`ctl doctor` 可随时做无会话体检：配置解析链、key 来源（脱敏）、门禁；`ctl doctor --probe` 用**生产参数**跑 N 次能力探针并输出通过率与耗时分布（不做「可用/不可用」判决——可用性是概率属性），`--ping` 则是最小连通性检查。
 
 ## 验证
 

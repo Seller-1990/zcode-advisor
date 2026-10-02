@@ -276,6 +276,69 @@ test('readHealth：控制器读取侧返回最近活动信标并派生状态', (
   assert.strictEqual(got.n, 2);
 });
 
+// —— 写读往返（这是比 deriveHealth 比对更早失效的一环）——
+// 若 hooks/lib/health.js 改了文件前缀/命名，controller 侧的内联 glob 会**静默匹配不到**，
+// 角标永远灰而没有任何报错。deriveHealth 比对抓不到这类漂移，必须真写真读。
+
+test('往返一致性：hooks 写入的信标，controller.readHealth 必须能读到（命名/形状不漂移）', () => {
+  const dir = tmpDir('zca-rt-');
+  const CTRL = JSON.stringify(path.join(__dirname, '../tools/companion/controller.cjs'));
+  const got = runInChild({ ZCODE_ADVISOR_HEALTH_DIR: dir, ZCODE_ADVISOR_STATE_DIR: null }, `
+    const C = require(${CTRL});
+    // 只经 hooks 的写入口落盘（attempt + result 两次合并写）
+    H.writeAttempt(H.resolveHealthDir(process.env), 'sess_rt-1', { model: 'glm-5.3-flash' });
+    H.writeResult(H.resolveHealthDir(process.env), 'sess_rt-1', { ok: true, model: 'glm-5.3-flash', reviews: 4 });
+    // 再经 controller 的读入口读回
+    const r = C.readHealth(480000);
+    process.stdout.write(JSON.stringify({ raw: r }));
+  `);
+  assert.strictEqual(got.raw.candidates, 1, 'controller 若匹配不到 hooks 写的文件 = 静默失败（角标永远灰）');
+  assert.strictEqual(got.raw.state, 'ok');
+  assert.strictEqual(got.raw.beacon.sessionId, 'sess_rt-1');
+  assert.strictEqual(got.raw.beacon.reviews, 4);
+  assert.ok(got.raw.beacon.lastSuccessAt, 'lastSuccessAt 应经往返保留');
+});
+
+test('往返一致性：controller 与 hooks 的目录解析规则一致（HEALTH_DIR / STATE_DIR / 默认）', () => {
+  const a = tmpDir('zca-pa-');
+  const b = tmpDir('zca-pb-');
+  const CTRL = JSON.stringify(path.join(__dirname, '../tools/companion/controller.cjs'));
+  const cases = [
+    { ZCODE_ADVISOR_HEALTH_DIR: a, ZCODE_ADVISOR_STATE_DIR: b, expect: a },
+    { ZCODE_ADVISOR_HEALTH_DIR: null, ZCODE_ADVISOR_STATE_DIR: b, expect: b },
+    { ZCODE_ADVISOR_HEALTH_DIR: null, ZCODE_ADVISOR_STATE_DIR: null, expect: path.join(os.homedir(), '.zcode') }
+  ];
+  for (const c of cases) {
+    const got = runInChild(c, `
+      const C = require(${CTRL});
+      process.stdout.write(JSON.stringify({ h: H.resolveHealthDir(process.env), c: C.HEALTH_DIR }));
+    `);
+    assert.strictEqual(got.c, c.expect, `controller 目录解析漂移（输入=${JSON.stringify(c)}）`);
+    assert.strictEqual(got.h, c.expect, `hooks 目录解析漂移（输入=${JSON.stringify(c)}）`);
+  }
+});
+
+test('往返一致性：多会话排序在两侧一致（都按 lastAttemptAt 倒序）', () => {
+  const dir = tmpDir('zca-sort-');
+  const fsx = require('fs');
+  // 刻意让「文件名序」与「时间序」相反，逼出按内容的正确排序
+  fsx.writeFileSync(path.join(dir, 'advisor-health-zzz-old.json'),
+    JSON.stringify({ sessionId: 'old', lastAttemptAt: '2020-01-01T00:00:00.000Z', state: 'ok', lastSuccessAt: '2020-01-01T00:00:00.000Z' }));
+  fsx.writeFileSync(path.join(dir, 'advisor-health-aaa-new.json'),
+    JSON.stringify({ sessionId: 'new', lastAttemptAt: '2030-01-01T00:00:00.000Z', state: 'ok', lastSuccessAt: '2030-01-01T00:00:00.000Z' }));
+  const CTRL = JSON.stringify(path.join(__dirname, '../tools/companion/controller.cjs'));
+  const got = runInChild({ ZCODE_ADVISOR_HEALTH_DIR: dir, ZCODE_ADVISOR_STATE_DIR: null }, `
+    const C = require(${CTRL});
+    process.stdout.write(JSON.stringify({
+      hFirst: (H.readBeacons(H.resolveHealthDir(process.env))[0] || {}).sessionId,
+      cFirst: ((C.readHealth(480000) || {}).beacon || {}).sessionId
+    }));
+  `);
+  assert.strictEqual(got.hFirst, 'new');
+  assert.strictEqual(got.cFirst, 'new', 'controller 排序与 hooks 漂移会导致角标显示错会话');
+});
+
+
 // ---------------- HTTP 端到端：/api/health 的真实形状（含鉴权） ----------------
 // 上面的 readHealth 测的是内层逻辑；这里起真实 HTTP server，锁住 route 串接
 // （URL 精确匹配、令牌校验继承、JSON 字段形状）——route 写错时内层测试全绿也发现不了。
