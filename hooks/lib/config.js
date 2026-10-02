@@ -134,8 +134,15 @@ function applyZcodeSource(cfg, problems, sources, env) {
     problems.push(`zcode_provider_ineligible: provider「${found.name || found.id}」协议为 ${found.kind || '未知'}，审查通道仅支持 OpenAI 兼容端点，已沿用手动配置值`);
     return;
   }
-  if (found.baseURL) cfg.baseUrl = found.baseURL;
-  if (found.apiKey) cfg.apiKey = found.apiKey;
+  // baseURL 与 apiKey 必须成对覆盖：只覆盖其一会把手动 key 发往 ZCode 端点，
+  // 或把 ZCode key 发往手动端点（密钥交叉）。缺任一字段则整段回退手动配置。
+  if (!found.baseURL || !found.apiKey) {
+    const missing = [!found.baseURL && 'baseURL', !found.apiKey && 'apiKey'].filter(Boolean).join('/');
+    problems.push(`zcode_provider_incomplete: provider「${found.name || found.id}」缺少 ${missing}，为避免密钥与端点交叉使用，已整段沿用手动配置`);
+    return;
+  }
+  cfg.baseUrl = found.baseURL;
+  cfg.apiKey = found.apiKey;
   const wantModel = String(cfg.zcodeModel || '').trim();
   if (wantModel) {
     cfg.model = wantModel; // 显式指定的模型即使不在 provider 列表里也尊重（列表可能滞后）

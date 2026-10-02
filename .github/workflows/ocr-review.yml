@@ -18,12 +18,19 @@
 name: OpenCodeReview PR Review
 
 concurrency:
-  group: ocr-review-${{ github.event.pull_request.number || github.ref }}
+  # dispatch 时 pull_request 上下文为空：用 inputs.pr_number 隔离，两个手动补跑不互踩
+  group: ocr-review-${{ github.event.inputs.pr_number || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: '要评审的 PR 号（pull_request 事件丢失时手动补跑用）'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -41,9 +48,30 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Resolve PR context (workflow_dispatch 时 pull_request 上下文为空，需查 API)
+        if: github.event_name == 'workflow_dispatch'
+        id: prctx
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = Number(process.env.prNumber);
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            core.setOutput('base', pr.base.ref);
+            core.setOutput('head', pr.head.sha);
+            core.setOutput('number', String(pr.number));
+        env:
+          prNumber: ${{ inputs.pr_number }}
+
       - name: Run OpenCodeReview
         uses: alibaba/open-code-review@5f8e5ab328e1449ba4d5f14d2a7542117543d753
         with:
+          pr_number: ${{ steps.prctx.outputs.number || github.event.pull_request.number }}
+          base_ref: ${{ steps.prctx.outputs.base || github.event.pull_request.base.ref }}
+          head_sha: ${{ steps.prctx.outputs.head || github.event.pull_request.head.sha }}
           llm_url: ${{ secrets.OCR_LLM_URL }}
           llm_auth_token: ${{ secrets.OCR_LLM_TOKEN }}
           llm_model: ${{ secrets.OCR_LLM_MODEL }}
@@ -58,4 +86,4 @@ jobs:
           # 提高单请求超时、开进度流（日志可观测）、并发 4 提速。
           llm_timeout: '600'
           stream_progress: 'true'
-          review_concurrency: '4'
+          review_concurrency: '2'

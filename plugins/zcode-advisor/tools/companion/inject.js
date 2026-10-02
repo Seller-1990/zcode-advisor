@@ -250,8 +250,19 @@
         }
       }
       const want = curCfg && curCfg.zcodeProvider;
-      if (want && eligible.some((p) => p.id === want)) sel.value = want;
-      else sel.value = eligible.length > 0 ? eligible[0].id : '';
+      if (want && eligible.some((p) => p.id === want)) {
+        sel.value = want;
+      } else if (want) {
+        // 已存 provider 不在 eligible 列表（被改成非兼容协议/已删除/仅 name 命中）：
+        // 保留空选项并提示，绝不静默改选别的服务商——否则用户只想改个模式，
+        // 保存时 formValues() 就会把新 provider 写回覆盖原选择。审查侧此时
+        // 会按 applyZcodeSource 回退手动配置，两边口径一致。
+        sel.value = '';
+        msg('已存服务商在 ZCode 里不可用（非 OpenAI 兼容或已删除）。未替你改选；'
+          + '请手动选择服务商，或切回「手动维护」。', false);
+      } else {
+        sel.value = eligible.length > 0 ? eligible[0].id : '';
+      }
       fillZcodeModels();
     } catch (e) {
       msg(`服务商列表载入失败：${e && e.message ? e.message : e}`, false);
@@ -307,7 +318,14 @@
       const c = r.config;
       curCfg = c;
       const st = document.getElementById('zca-status');
-      if (st) st.textContent = `模型 ${c.model || '（默认）'} ｜ key ${c.keyMasked} ｜ 模式 ${c.reviewMode || 'async'} ｜ 来源 ${c.apiSource === 'zcode' ? 'ZCode' : '手动'}`;
+      // zcode 模式下实际生效的是服务商端点/模型/key（审查通道按 apiSource 解析），
+      // 展示手动字段会误导（手动 key 常为「未设置」，但审查照样能用服务商 key）。
+      if (st) {
+        const zcode = c.apiSource === 'zcode';
+        const modelShown = zcode ? (c.zcodeModel || '（服务商默认）') : (c.model || '（默认）');
+        const keyShown = zcode ? '服务商 key' : c.keyMasked;
+        st.textContent = `模型 ${modelShown} ｜ key ${keyShown} ｜ 模式 ${c.reviewMode || 'async'} ｜ 来源 ${zcode ? 'ZCode' : '手动'}`;
+      }
       const f = fill();
       if (f) {
         // 模型值回填到下拉框：若 select 里没有该 id（尚未拉取或列表不含它），
@@ -495,6 +513,7 @@
         <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">
         <label class="zca-label">API key</label>
         <input id="zca-apiKey" type="password" placeholder="留空 = 不修改已保存的 key">
+        <div class="zca-hint">清除已保存的 key 不在本面板：请到 zcode-advisor 源码目录打开本地配置面板（Windows 双击「配置面板.cmd」，macOS 运行 node tools/setup-server.js），再点「清除 API key」</div>
         <label class="zca-label">审查模型（先点「拉取模型」，或直接手动输入）</label>
         <select id="zca-model">
           <option value="">（尚未拉取，请在下方手动输入）</option>

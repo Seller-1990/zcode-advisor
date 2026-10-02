@@ -476,13 +476,22 @@ function effectiveTarget(body) {
   }
   const prov = pickZcodeProvider(b.zcodeProvider || cfg.zcodeProvider || '');
   const model = String(b.zcodeModel || cfg.zcodeModel || (prov && prov.models[0]) || '').trim();
+  // 与审查侧 applyZcodeSource 同一规则：provider 缺失/非 OpenAI 兼容/端点或 key
+  // 缺一 → 不产出任何凭据（调用方按 error 字段失败返回）。否则 Ping 用一组、
+  // 审查用另一组，或把手动 key 发往服务商端点（密钥交叉）。
+  const usable = Boolean(prov && prov.eligible && prov.baseURL && prov.apiKey);
+  const reason = !prov ? 'provider_missing'
+    : (!prov.eligible ? 'provider_ineligible'
+      : (!prov.baseURL || !prov.apiKey ? 'provider_incomplete' : ''));
   return {
     apiSource: 'zcode',
-    baseUrl: prov ? prov.baseURL : '',
-    apiKey: prov ? prov.apiKey : '',
+    baseUrl: usable ? prov.baseURL : '',
+    apiKey: usable ? prov.apiKey : '',
     model,
     providerName: prov ? (prov.name || prov.id) : '',
-    providerFound: Boolean(prov)
+    providerFound: Boolean(prov),
+    providerUsable: usable,
+    providerError: reason || ''
   };
 }
 
@@ -511,6 +520,16 @@ function normalizeChatEndpoint(baseUrl) {
 
 async function ping(body) {
   const t = effectiveTarget(body);
+  // zcode 模式 provider 不可用时按审查侧同一语义失败，绝不把空端点替换成
+  // 硬编码默认（那会把服务商 key 发到智谱官方端点）。
+  if (t.apiSource === 'zcode' && !t.providerUsable) {
+    const hints = {
+      provider_missing: 'ZCode 配置里找不到所选服务商，请重新选择',
+      provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+      provider_incomplete: 'provider 的 baseURL/apiKey 缺一，为避免密钥与端点交叉使用，Ping 已中止'
+    };
+    return { ok: false, error: t.providerError, hint: hints[t.providerError] || '' };
+  }
   const baseUrl = normalizeChatEndpoint(t.baseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions');
   const model = t.model || 'glm-5.3-flash';
   const apiKey = t.apiKey || '';
@@ -518,13 +537,17 @@ async function ping(body) {
   try {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 20000);
-    const r = await fetch(baseUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, temperature: 0, stream: false }),
-      signal: ctl.signal
-    });
-    clearTimeout(t);
+    let r;
+    try {
+      r = await fetch(baseUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, temperature: 0, stream: false }),
+        signal: ctl.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     if (!r.ok) {
       const hint = r.status === 401 || r.status === 403 ? 'key 无效或无权限' : (r.status === 404 || r.status === 400 ? '模型 id 或端点路径不对' : '');
       return { ok: false, error: `llm_http_${r.status}`, hint, endpoint: baseUrl };
@@ -541,17 +564,32 @@ async function fetchModels(body) {
   const t = effectiveTarget(body);
   // zcode 模式：模型列表直接来自 ZCode provider 数据，无需请求端点 /models。
   if (t.apiSource === 'zcode') {
-    if (!t.providerFound) return { ok: false, error: 'provider_missing', hint: 'ZCode 配置里找不到所选服务商，请重新选择' };
+    if (!t.providerUsable) {
+      const hints = {
+        provider_missing: 'ZCode 配置里找不到所选服务商，请重新选择',
+        provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+        provider_incomplete: 'provider 的 baseURL/apiKey 缺一，已按审查侧同一规则中止'
+      };
+      return { ok: false, error: t.providerError, hint: hints[t.providerError] || '' };
+    }
     if (!t.model) return { ok: false, error: 'no_models', hint: '该服务商未配置模型，请在 ZCode 设置里添加' };
-    return { ok: true, models: [t.model], source: 'zcode' };
+    // 整表返回（当前选中项排前）：多模型服务商不再只剩一项
+    const prov = pickZcodeProvider(body && (body.zcodeProvider || readUserConfig().zcodeProvider) || '');
+    const all = (prov && prov.models) || [];
+    const models = [t.model, ...all.filter((m) => m !== t.model)];
+    return { ok: true, models, source: 'zcode' };
   }
   const url = modelsUrl(t.baseUrl);
   if (!url) return { ok: false, error: 'baseUrl 为空' };
+  let r;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 12000);
   try {
-    const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), 12000);
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${t.apiKey}` }, signal: ctl.signal });
+    r = await fetch(url, { headers: { Authorization: `Bearer ${t.apiKey}` }, signal: ctl.signal });
+  } finally {
     clearTimeout(timer);
+  }
+  try {
     if (!r.ok) {
       const hint = r.status === 401 || r.status === 403 ? 'key 无效' : '该端点可能不提供 /models，请手动输入模型 id';
       return { ok: false, error: `http_${r.status}`, hint };
