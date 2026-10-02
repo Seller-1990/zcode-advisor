@@ -24,6 +24,12 @@ concurrency:
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: '要评审的 PR 号（pull_request 事件丢失时手动补跑用）'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -44,6 +50,7 @@ jobs:
       - name: Run OpenCodeReview
         uses: alibaba/open-code-review@5f8e5ab328e1449ba4d5f14d2a7542117543d753
         with:
+          pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
           llm_url: ${{ secrets.OCR_LLM_URL }}
           llm_auth_token: ${{ secrets.OCR_LLM_TOKEN }}
           llm_model: ${{ secrets.OCR_LLM_MODEL }}
