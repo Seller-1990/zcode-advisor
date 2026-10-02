@@ -20,7 +20,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const {
-  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey
+  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey, isPlaceholderKey
 } = require('./lib/config');
 const {
   ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, loadState, mutateStateExclusive,
@@ -86,12 +86,15 @@ function effectiveApi(cfg, apiKeyInfo, state) {
   const baseUrl = String(ov.baseUrl || '').trim();
   const apiKey = String(ov.apiKey || '').trim();
   const effModel = effectiveModel(cfg, state);
-  const resolvedKey = apiKey || (apiKeyInfo ? apiKeyInfo.key : '');
+  // 会话 key 与全局 resolveApiKey 同一占位符纪律：test-*/your-api-key 一类值
+  // 视为未配置，回落全局 key，不放行去打真实请求。
+  const sessionKey = apiKey && !isPlaceholderKey(apiKey) ? apiKey : '';
+  const resolvedKey = sessionKey || (apiKeyInfo ? apiKeyInfo.key : '');
   return {
     baseUrl: baseUrl || cfg.baseUrl,
     apiKey: resolvedKey,
     key: resolvedKey,
-    source: apiKey ? 'session-override' : ((apiKeyInfo && apiKeyInfo.source) || ''),
+    source: sessionKey ? 'session-override' : ((apiKeyInfo && apiKeyInfo.source) || ''),
     model: effModel.model,
     modelSource: effModel.source,
     hasOverride: Boolean(baseUrl || apiKey),
@@ -326,7 +329,10 @@ function onStopAsync(ctx) {
 
   const current = loadState(file);
   // 门禁按会话级生效值评估：全局 key 缺失但本会话已 /advisor-api set 过 key 时照常审查。
-  const gateReasons = gate(cfg, effectiveApi(cfg, apiKeyInfo, current));
+  // gate 的 baseUrl/model 也必须取生效值——gate(cfg, ...) 检查的是第一参的字段，
+  // 传全局 cfg 会在「全局配空 + 会话已 set 端点/模型」时误报 missing 并跳过审查。
+  const effForGate = effectiveApi(cfg, apiKeyInfo, current);
+  const gateReasons = gate({ baseUrl: effForGate.baseUrl, model: effForGate.model }, effForGate);
   if (!current || !current.enabled || gateReasons.length > 0) {
     mutateStateExclusive(file, (s) => {
       s.lastActivity = new Date().toISOString();
@@ -826,7 +832,9 @@ async function handleCtl(args) {
     for (const h of hints) lines.push(`  提示: ${h}`);
 
     for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
-    for (const w of configWarnings(cfg, apiKeyInfo)) lines.push(`  配置警告: ${w}`);
+    // 告警按会话生效端点评估：会话把端点覆盖成 http:// 或把官方 key 指到第三方时
+    // 必须能告警出来；全局告警也不应误报到已被覆盖的配置上。
+    for (const w of configWarnings({ baseUrl: eff.baseUrl }, eff)) lines.push(`  配置警告: ${w}`);
     if (state.lastAction) lines.push(`  最近动作: ${state.lastAction}`);
     lines.push(`  最后活动: ${state.lastActivity || '(无)'}`);
     process.stdout.write(lines.join('\n') + '\n');
@@ -834,16 +842,21 @@ async function handleCtl(args) {
   }
 
   if (sub === 'on') {
-    const state0 = loadState(file);
-    const reasons = gate(cfg, effectiveApi(cfg, resolveApiKey(cfg, process.env), state0));
+    // 门禁在临界区内按重读后的状态重算：锁外用旧快照算好再写回，并发
+    // /advisor-api set 改了 sessionApi 时会用过期结果覆盖 disabledReason。
+    let reasons = [];
+    let enabledModel = '';
     mutateStateExclusive(file, (s) => {
       s.enabled = true;
+      const eff = effectiveApi(cfg, resolveApiKey(cfg, process.env), s);
+      reasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, eff);
       s.disabledReason = reasons.length > 0 ? reasons.join(',') : '';
+      enabledModel = eff.model;
     });
     if (reasons.length > 0) {
       process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 advisor.config.json、环境变量，或用 /advisor-api set 为本会话单独配置。\n`);
     } else {
-      process.stdout.write(`advisor: 本会话已启用（模式 ${cfg.reviewMode}，模型 ${effectiveModel(cfg, state0).model}）。\n`);
+      process.stdout.write(`advisor: 本会话已启用（模式 ${cfg.reviewMode}，模型 ${enabledModel}）。\n`);
     }
     return;
   }

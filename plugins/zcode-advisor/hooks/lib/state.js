@@ -58,6 +58,9 @@ function freshState(sessionId, transcriptPath, startEnabled) {
 // 找不到就创建（幂等）。所有调用方都必须拿到一个可用 state，保证流程可继续。
 function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  // 目录已存在时 mkdirSync 的 mode 不生效：state 目录含会话明文 key 的文件，
+  // 历史遗留的宽权限目录在此收紧（失败不阻断——只读文件系统下尽力而为）。
+  try { fs.chmodSync(stateDir, 0o700); } catch (_) {}
   const file = stateFilePath(stateDir, sessionId);
   if (fs.existsSync(file)) {
     const current = loadStateDetailed(file);
@@ -122,6 +125,9 @@ function saveState(file, state) {
       // state 可能含会话级 API key（sessionApi.apiKey）：0600 落盘，不依赖 umask。
       fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(tmp, file);
+      // POSIX rename 覆盖已存在文件时保留目标原权限：升级前遗留的 0644 state
+      // 写入会话明文 key 后仍是 0644，rename 后补一次 chmod 才真正收紧。
+      try { fs.chmodSync(file, 0o600); } catch (_) {}
       return;
     } catch (err) {
       lastErr = err;
