@@ -250,8 +250,19 @@
         }
       }
       const want = curCfg && curCfg.zcodeProvider;
-      if (want && eligible.some((p) => p.id === want)) sel.value = want;
-      else sel.value = eligible.length > 0 ? eligible[0].id : '';
+      if (want && eligible.some((p) => p.id === want)) {
+        sel.value = want;
+      } else if (want) {
+        // 已存 provider 不在 eligible 列表（被改成非兼容协议/已删除/仅 name 命中）：
+        // 保留空选项并提示，绝不静默改选别的服务商——否则用户只想改个模式，
+        // 保存时 formValues() 就会把新 provider 写回覆盖原选择。审查侧此时
+        // 会按 applyZcodeSource 回退手动配置，两边口径一致。
+        sel.value = '';
+        msg('已存服务商在 ZCode 里不可用（非 OpenAI 兼容或已删除）。未替你改选；'
+          + '请手动选择服务商，或切回「手动维护」。', false);
+      } else {
+        sel.value = eligible.length > 0 ? eligible[0].id : '';
+      }
       fillZcodeModels();
     } catch (e) {
       msg(`服务商列表载入失败：${e && e.message ? e.message : e}`, false);
