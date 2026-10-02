@@ -780,3 +780,80 @@ test('4a 恢复信号作废：告警后恢复置标志、再次连败到阈值 �
   const st = readState(stateDir, 'h8');
   assert.strictEqual(st.healthRecoveryPending, false, '过期恢复标志应被作废');
 });
+
+// ---------------- M4 降级告警（UPS 侧，无网络） ----------------
+// 直接构造 state（模拟 async worker 已把 primaryFailStreak 累积到阈值），
+// 验证 UPS 注入降级告警、且不与停摆告警混淆。这覆盖 alert 组装逻辑，不需要真实端点。
+
+function writeStateForAlert(stateDir, sid, patch) {
+  const file = path.join(stateDir, `sess-${sid}.json`);
+  const base = {
+    schema: 1, sessionId: sid, transcriptPath: '', enabled: true, disabledReason: '',
+    pendingRegistration: false, pendingNotes: [], byteOffset: 0, lastHeadHash: '',
+    immuneTurns: 0, consecutiveSteers: 0, reviews: 0, steers: 0, deferred: 0, dropped: {},
+    failStreak: null, healthNotifiedAt: '', healthAlertCount: 0, healthRecoveryPending: false,
+    primaryFailStreak: null, fallbackUsed: 0, fallbackLastAt: '', fallbackLastModel: '',
+    degradeNotifiedAt: '', degradeAlertCount: 0, sessionFallbackModel: '',
+    tokensIn: 0, tokensOut: 0, sessionModel: '', sessionApi: { baseUrl: '', apiKey: '', model: '' },
+    lastAction: '', lastActivity: '', createdAt: new Date().toISOString()
+  };
+  fs.writeFileSync(file, JSON.stringify(Object.assign(base, patch || {}), null, 2), 'utf8');
+  return file;
+}
+
+test('M4 告警：primaryFailStreak 达阈值 → UPS 注入降级告警（不停摆告警）', (t) => {
+  const { stateDir } = setup(t);
+  const env = makeEnv(stateDir);
+  writeStateForAlert(stateDir, 'd1', {
+    primaryFailStreak: { reason: 'llm_http_404', count: 3, sinceTs: new Date(Date.now() - 3600 * 1000).toISOString() },
+    fallbackLastModel: 'fb-model',
+    failStreak: null // 系统可用（备用兜住）
+  });
+  const r = runHook(['user-prompt-submit'], { session_id: 'd1', transcript_path: '/nonexistent', prompt: 'x' }, env);
+  const line = r.stdout ? JSON.parse(r.stdout).hookSpecificOutput.additionalContext : '';
+  assert.ok(line.includes('降级告警'), '应注入降级告警');
+  assert.ok(line.includes('主模型已连续失败 3 次'), '应含主模型失败次数');
+  assert.ok(line.includes('fb-model'), '应指明备用模型');
+  assert.ok(!line.includes('健康告警'), '服务未中断，不得报停摆');
+  const st = readState(stateDir, 'd1');
+  assert.strictEqual(st.degradeAlertCount, 1);
+  assert.ok(st.degradeNotifiedAt, '应记录降级告警时间');
+});
+
+test('M4 告警：低于阈值不喊；停摆与降级各自独立计数', (t) => {
+  const { stateDir } = setup(t);
+  const env = makeEnv(stateDir);
+  // count=2 < 阈值 3：不喊
+  writeStateForAlert(stateDir, 'd2', {
+    primaryFailStreak: { reason: 'unparsed', count: 2, sinceTs: new Date().toISOString() }
+  });
+  const r = runHook(['user-prompt-submit'], { session_id: 'd2', transcript_path: '/nonexistent', prompt: 'x' }, env);
+  assert.strictEqual(r.stdout.trim(), '', '未达阈值不应有任何注入');
+});
+
+test('M4 告警：同时停摆与降级时只报停摆（避免两条告警刷屏）', (t) => {
+  const { stateDir } = setup(t);
+  const env = makeEnv(stateDir);
+  writeStateForAlert(stateDir, 'd3', {
+    failStreak: { reason: 'llm_http_401', count: 3, sinceTs: new Date().toISOString() },
+    primaryFailStreak: { reason: 'llm_http_404', count: 5, sinceTs: new Date().toISOString() }
+  });
+  const r = runHook(['user-prompt-submit'], { session_id: 'd3', transcript_path: '/nonexistent', prompt: 'x' }, env);
+  const line = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(line.includes('健康告警'), '停摆优先');
+  assert.ok(!line.includes('降级告警'), '停摆期间不叠加降级告警');
+});
+
+test('M4 告警：旧形状 state（无 M4 字段）升级后不炸', (t) => {
+  const { stateDir } = setup(t);
+  const env = makeEnv(stateDir);
+  // 模拟仅含旧字段的 state（无 primaryFailStreak/degrade*）
+  const file = path.join(stateDir, 'sess-d4.json');
+  fs.writeFileSync(file, JSON.stringify({
+    schema: 1, sessionId: 'd4', enabled: true, pendingRegistration: false, pendingNotes: [],
+    failStreak: null, healthNotifiedAt: '', healthAlertCount: 0, healthRecoveryPending: false,
+    dropped: {}, sessionApi: {}
+  }), 'utf8');
+  const r = runHook(['user-prompt-submit'], { session_id: 'd4', transcript_path: '/nonexistent', prompt: 'x' }, env);
+  assert.strictEqual(r.status, 0, '旧形状 state 不应导致崩溃');
+});

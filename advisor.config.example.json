@@ -17,6 +17,7 @@
   "immuneTurns": 3,
   "maxDeltaMessages": 60,
   "maxTokens": 2048,
+  "fallbackModel": "",
   "temperature": 0.2,
   "proseFallback": true,
   "maxNoteChars": 768,

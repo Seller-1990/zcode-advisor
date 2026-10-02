@@ -49,6 +49,10 @@ const DEFAULTS = {
   backfillLimitBytes: 2097152,
   maxContextChars: 48000,
   pendingNotesCap: 5,
+  // 降级备用模型（M4）：主模型触发**白名单**失败时临时换用。空 = 关闭（默认）。
+  // 只换 model id，端点/key 沿用同一 effective pair（防密钥交叉）。
+  // 建议配**快模型/非思考型**——它要在主模型烧剩的预算里跑完（见 reviewTurn 的 reserve）。
+  fallbackModel: '',
   stateDir: ''
 };
 
@@ -230,6 +234,7 @@ function loadConfig(pluginRoot, env) {
   if (env.ZCODE_ADVISOR_MODEL) cfg.model = env.ZCODE_ADVISOR_MODEL;
   if (env.ZCODE_ADVISOR_API_KEY) cfg.apiKey = env.ZCODE_ADVISOR_API_KEY;
   if (env.ZCODE_ADVISOR_REVIEW_MODE) cfg.reviewMode = env.ZCODE_ADVISOR_REVIEW_MODE === 'sync' ? 'sync' : 'async';
+  if (env.ZCODE_ADVISOR_FALLBACK_MODEL != null) cfg.fallbackModel = String(env.ZCODE_ADVISOR_FALLBACK_MODEL).trim();
   for (const k of INT_KEYS) {
     if (env[`ZCODE_ADVISOR_${snake(k)}`] != null) cfg[k] = toInt(env[`ZCODE_ADVISOR_${snake(k)}`], cfg[k]);
   }

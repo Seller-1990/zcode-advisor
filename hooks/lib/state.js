@@ -43,6 +43,18 @@ function freshState(sessionId, transcriptPath, startEnabled) {
     healthNotifiedAt: '',
     healthAlertCount: 0,
     healthRecoveryPending: false,
+    // —— 降级（fallback，M4）——
+    // primaryFailStreak：只记「触发 fallback 的主模型失败」。fallback 成功清 failStreak
+    // （系统可用）但**不清它**——否则降级成功会把主模型劣化掩盖掉、告警永不触发。
+    primaryFailStreak: null,
+    fallbackUsed: 0,
+    fallbackLastAt: '',
+    fallbackLastModel: '',
+    // 降级告警走独立阶梯（不与停摆告警共计数，否则两类故障互相压制对方的提醒间隔）。
+    degradeNotifiedAt: '',
+    degradeAlertCount: 0,
+    // 会话级备用模型（/advisor-api 可覆盖全局 fallbackModel）。
+    sessionFallbackModel: '',
     tokensIn: 0,
     tokensOut: 0,
     sessionModel: '',
@@ -297,6 +309,21 @@ function bumpDrop(state, reason) {
   }
 }
 
+// 主模型失败连击（M4）：与 failStreak 分开维护。
+// 为什么必须分开：fallback 成功后清 failStreak（系统可用，不该再喊停摆），
+// 但主模型劣化仍在继续——若连它一起清，降级成功会把主模型故障**完全掩盖**，
+// 用户永远收不到「主模型一直在坏」的提醒。
+function bumpPrimaryFailStreak(state, reason) {
+  if (!reason) reason = 'unknown';
+  if (state.primaryFailStreak && state.primaryFailStreak.reason === reason) {
+    state.primaryFailStreak.count = (state.primaryFailStreak.count || 0) + 1;
+    if (!state.primaryFailStreak.sinceTs) state.primaryFailStreak.sinceTs = new Date().toISOString();
+  } else {
+    state.primaryFailStreak = { reason, count: 1, sinceTs: new Date().toISOString() };
+    state.degradeAlertCount = 0; // 故障身份切换：旧阶梯作废（与 failStreak 同纪律）
+  }
+}
+
 // —— 审查互斥锁（防同一会话并行审查堆积）——
 // 生命周期：Stop（async 父进程）创建 → review-worker 认领（改写 pid）→ 完成后按 pid 清除；
 // 陈旧锁超过 staleMs 可被下一个 Stop 抢走重建。
@@ -354,6 +381,6 @@ function countLocks(stateDir, staleMs) {
 
 module.exports = {
   ensureState, loadState, loadStateDetailed, saveState, mutateStateExclusive, latestStatePath, listStatePaths, stateFilePath,
-  sanitizeSessionId, pruneStates, bumpDrop, isFailStreakReason, freshState, createLock, clearLock, clearLockIfOwner,
+  sanitizeSessionId, pruneStates, bumpDrop, bumpPrimaryFailStreak, isFailStreakReason, freshState, createLock, clearLock, clearLockIfOwner,
   lockPathFor, countLocks, sleepSync
 };

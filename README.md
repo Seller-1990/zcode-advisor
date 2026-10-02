@@ -133,6 +133,7 @@ ZCode 桌面版没有官方 UI 扩展机制，因此在界面内提供设置入�
   - **拉取模型**（手动维护模式）：填好端点与 key 后点「拉取模型」，自动请求 `{端点}/models` 列出可选模型；
   - **Ping 测试** / **保存**：保存写入用户级配置，下一轮审查即生效，无需重启；
   - 审查模式 / max_tokens 收在「高级」折叠区，面板默认占地更小。
+- **健康状态灯（角标上的小圆点）**：角标带一个状态灯，由图外的 companion 每 5s 轮询本机 `/api/health` 着色——**绿=正常、黄=降级、红=审查未成功返回、灰=未知**（未运行或数据过期）。**只有明确成功才显绿**：取不到数据一律灰，避免"灯坏了"被误读成"顾问健康"。悬停角标可看上次成功/尝试时间与失败原因。
 - 注入采用 `Page.addScriptToEvaluateOnNewDocument` + 当前文档补注入双通道，
   页面刷新/导航后角标自动恢复；原版方式启动的 ZCode 不会有角标（无调试通道）。
 
@@ -201,6 +202,7 @@ dsh 端教训（`ADVISOR-GUARD-REPORT.md`，[issue #102](https://github.com/omds
 | `immuneTurns` | 3 | steer 后的冷却轮数；冷却期内 concern 降级顺延（blocker 不受限） |
 | `maxDeltaMessages` / `maxContextChars` | 60 / 48000 | 送审窗口（条数 / 总字符）。两者同时生效，长消息下字符帽先到 |
 | `maxTokens` | 4096 | 单次审查输出预算；接受字符串数字，越界钳到 64–16384 并登记「配置问题」 |
+| `fallbackModel` | 空（关闭） | **降级备用模型**：主模型遇白名单错误（`llm_empty_response`/`unparsed`/`llm_http_404`）时临时换用它，端点/key 不变。**仅 async 生效**（sync 下会砍半 primary 预算，已禁用）。建议配**快模型/非思考型**——它要在主模型烧剩的预算里跑完。降级成功会写 history 的 `degraded` 事件并触发独立降级告警（不掩盖主模型劣化） |
 | `temperature` | 0.2 | 审查调用温度 |
 | `proseFallback` / `maxNoteChars` | true / 768 | 无 JSON 帧时把清洗后的散文救回为 nit；JSON 帧与散文的 note 统一按码点截断到该上限 |
 | `systemPrompt` | 内置 | **完全替换**内置审查提示词（含 advisory-only 纪律）。注意：插件目录可被会话内的工具写入，不建议设置——保持内置纪律不可被改写 |
@@ -289,6 +291,9 @@ ZCODE_ADVISOR_REVIEW_MODE=sync \
 - 转录按 Claude Code 同构 JSONL 容错解析，**尚未在真实 zcode 转录上验证过**；宿主格式差异的表现为 `parse_empty` 信号 + 审查无产出，不崩溃。
 - headHash 指纹取文件头 64 字节：若真实转录前 64 字节为纯样板（跨重写恒定），重写检测退化为"仅变小才重置"——真机验证项。
 - 单 advisor、单模型；无会话内面板、无转录持久化。逐步（step-boundary）审查未实现，粒度为整轮。
+- **降级（fallback）仅 async**：sync 下单轮受 Stop 硬超时约束，切预算会复活"强杀→指针不推进→每轮重审"停滞循环，故禁用。且只在"换模型能治"的白名单错误上切换（401/403/429/5xx/timeout 都不切——那是 key/端点问题）。
+- **配置面板的 Ping 仍按旧口径**（`max_tokens=1`，思考型模型会误报 OK）；能力探针 `ctl doctor --probe` 是 CLI 入口，面板用户暂不受益。三处 ping 的统一是后续项。
+- **健康状态灯依赖 CDP 角标**：controller 未运行时角标不存在，也就没有灯（不是"灯变灰"，是"没有灯"）。此时用 `/advisor-status` 或 `ctl doctor` 兜底。
 
 ## 目录结构
 

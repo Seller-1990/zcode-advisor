@@ -23,7 +23,7 @@ const {
   loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey, isPlaceholderKey
 } = require('./lib/config');
 const {
-  ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, loadState, mutateStateExclusive,
+  ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, bumpPrimaryFailStreak, loadState, mutateStateExclusive,
   createLock, clearLock, clearLockIfOwner, lockPathFor, countLocks, sanitizeSessionId
 } = require('./lib/state');
 const {
@@ -74,6 +74,18 @@ function healthAlertLine(streak, alertCount) {
 }
 
 const HEALTH_RECOVERY_LINE = '[advisor] 监督已恢复：此前有一段不可用期（期间审查可能缺失），现已恢复正常。';
+
+// 降级告警（M4）：主模型持续失败、靠备用模型续命时喊一声。
+// 为什么必须喊：fallback 成功会清 failStreak（系统可用），若不同时记录主模型劣化，
+// 用户会看到「一切正常」而实际一直在降级——这正是「静默掩盖故障」。
+function degradeAlertLine(streak, fallbackModel, alertCount) {
+  const sinceTs = Date.parse(streak.sinceTs || '') || 0;
+  const dur = sinceTs > 0 ? formatDowntime(Date.now() - sinceTs) : '未知';
+  let line = `[advisor] 降级告警（第 ${alertCount} 次提醒 · 主模型已连续失败 ${streak.count} 次 · 持续约 ${dur} · 原因：${streak.reason}）：`
+    + `审查当前由备用模型${fallbackModel ? ` ${fallbackModel}` : ''}维持，服务未中断，但主模型本身需要处理（请检查主模型配置：/advisor-setup）。`;
+  if (alertCount >= 5) line += "此后每 24 小时提醒一次。";
+  return line;
+}
 
 function readStdinJson() {
   try {
@@ -218,62 +230,171 @@ function reviewBudgetMs(cfg) {
   return cfg.reviewMode === 'sync' ? cfg.reviewTimeoutMs : cfg.reviewTimeoutMs * 2;
 }
 
-async function reviewTurn(cfg, target, userContent, allowMock) {
+// 降级（fallback，M4）：只对「换模型能治」的错切换。
+// 端点故障/限流/超时/与模型无关的错**不触发**——换模型只会加剧或无效。
+const FALLBACK_TRIGGER_REASONS = new Set(['llm_empty_response', 'unparsed', 'llm_http_404']);
+
+// 备用模型的目标解析：会话级 sessionFallbackModel 优先，其次全局 cfg.fallbackModel。
+function resolveFallbackModel(cfg, state) {
+  const s = state && typeof state === 'object' ? state : {};
+  const sess = String(s.sessionFallbackModel || '').trim();
+  if (sess) return sess;
+  return String(cfg.fallbackModel || '').trim();
+}
+
+// 降级是否可用：需配了备用模型、仅 async 模式、且会话没覆盖端点。
+// - 仅 async：reviewBudgetMs 在 sync 下 = T，"预留子预算"会把 primary 砍到 0.5T，
+//   且 sync 单轮受 Stop 硬超时 320s 约束，切预算会复活「强杀→指针不推进→每轮重审」停滞。
+// - 会话覆盖了 baseUrl：备用模型可能不属于该端点，换 model id 可能无效；且凭据边界
+//   （禁止跨端点带 key）要求跳过。
+function fallbackEligibility(cfg, state, eff) {
+  const model = resolveFallbackModel(cfg, state);
+  if (!model) return { ok: false, reason: 'no_fallback_model' };
+  if (cfg.reviewMode === 'sync') return { ok: false, reason: 'fallback_skipped:sync_mode' };
+  const ovBase = state && state.sessionApi && String(state.sessionApi.baseUrl || '').trim();
+  if (ovBase) return { ok: false, reason: 'fallback_skipped:session_endpoint' };
+  if (model === eff.model) return { ok: false, reason: 'fallback_same_model' };
+  return { ok: true, model };
+}
+
+// 备用模型预留子预算：必须 ≥ 备用模型实测 p90 延迟，否则它在主模型烧完预算后
+// 拿不到足够剩余（最需要它时失效）。取 min(T, max(30s, T/2))。
+// 仅 async 使用（sync 已在 fallbackEligibility 里禁用）。
+function fallbackReserveMs(cfg) {
+  const T = cfg.reviewTimeoutMs;
+  return Math.min(T, Math.max(30000, Math.floor(T / 2)));
+}
+
+async function reviewTurn(cfg, target, userContent, allowMock, opts) {
   if (process.env.ZCODE_ADVISOR_MOCK === '1' && allowMock) {
     const frame = mockFrame(cfg);
     if (!frame) return { error: 'unparsed' };
     return { frame };
   }
+  const o = opts || {};
+  // 可注入的调用器（测试用；生产走真实 callReviewer）。与 probeModel 的 deps 同纪律。
+  const call = o.callReviewer || callReviewer;
   const systemPrompt = cfg.systemPrompt && cfg.systemPrompt.trim() ? cfg.systemPrompt : DEFAULT_SYSTEM_PROMPT;
-  // **整轮共享同一截止时间**（审计报告 A2）：空响应重试复用同一 deadline，预算按模式区分（见 reviewBudgetMs）。
-  const deadline = Date.now() + reviewBudgetMs(cfg);
+  // 整轮总预算 B（按模式区分，见 reviewBudgetMs）。正常单模型路径整轮共享 overallDeadline；
+  // 配了备用模型且候选 eligible 时，给 primary 切成 primaryDeadline 以**预留**备用模型的子预算
+  // （否则主模型烧满 B 后备用模型拿不到剩余 → 最需要它时失效）。
+  const overallDeadline = Date.now() + reviewBudgetMs(cfg);
   const t0 = Date.now();
-  const reviewParams = {
+  const baseParams = {
     baseUrl: target.baseUrl,
-    model: target.model,
     apiKey: target.apiKey,
     systemPrompt,
     userContent,
     maxTokens: cfg.maxTokens,
     temperature: cfg.temperature,
-    timeoutMs: cfg.reviewTimeoutMs,
-    deadline
+    timeoutMs: cfg.reviewTimeoutMs
   };
-  let res = await callReviewer(reviewParams);
 
-  // **空响应重试**（真机实测）：思考型模型有时把预算全用在推理上、
-  // content 为 null 且推理文本里也没有 JSON 帧，导致 llm_empty_response。
-  // 同一次请求重试一次（并追加"只输出 JSON"的强调）能显著提高成功率——
-  // 实测同一输入有时成功（拿到帧）有时失败，属模型不确定性而非代码缺陷。
-  // 空响应重试（最多 2 次，逐步强化）：
-  // 实测思考型模型（hy4-preview-f 等）有一定概率把预算全用在推理上、
-  // content 为 null 且推理文本里也没有 JSON 帧。单纯重复请求成功率低；
-  // 回灌上一步推理并明确要求"只输出 JSON"后显著改善（实测 2/3 → 3/4）。
-  for (let attempt = 0; attempt < 2 && res.error === 'llm_empty_response'; attempt++) {
-    // 剩余预算不足以完成一次重试：直接放弃（避免发起注定超时的请求）。
-    if (deadline - Date.now() < 10000) break;
-    const carry = res.reasoningText
-      ? `\n\n【你上一步的分析（供参考，不要重复）】\n${res.reasoningText.slice(0, 3000)}\n\n请基于以上分析，只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}。不要输出任何其他文字。`
-      : '\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）';
-    // 复用同一 deadline（见上）：重试只花剩余预算，不重新起算
-    res = await callReviewer(Object.assign({}, reviewParams, {
-      userContent: `${userContent}${carry}`,
-      // 重试时温度归零，减少发散
-      temperature: 0
-    }));
+  // 单次尝试的收尾器：跑首调 + 最多 2 次空响应重试（全共享传入 deadline，不重新起算），
+  // **并把「解析成帧」纳入结果**——unparsed 是白名单触发原因之一，只有在解析后才知道，
+  // 所以判定与降级决策必须在同一次尝试的结果上做，不能先看 res.error 再解析。
+  const runAttempt = async (deadline, model, temperature) => {
+    let res = await call(Object.assign({}, baseParams, { model, deadline, temperature }));
+    for (let attempt = 0; attempt < 2 && res.error === 'llm_empty_response'; attempt++) {
+      if (deadline - Date.now() < 10000) break; // 剩余预算不足一次重试：放弃
+      const carry = res.reasoningText
+        ? `\n\n【你上一步的分析（供参考，不要重复）】\n${res.reasoningText.slice(0, 3000)}\n\n请基于以上分析，只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}。不要输出任何其他文字。`
+        : '\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）';
+      res = await call(Object.assign({}, baseParams, {
+        model, deadline, temperature: 0, userContent: `${userContent}${carry}`
+      }));
+    }
+    if (res.error) return { res, error: res.error, frame: null };
+    const frame = parseFrame(res.text, cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
+    if (!frame) return { res, error: 'unparsed', frame: null };
+    return { res, error: '', frame };
+  };
+
+  const fb = fallbackEligibility(cfg, o.state, target);
+  let primaryDeadline = overallDeadline;
+  let fallbackSkipped = '';
+  if (!fb.ok && fb.reason && fb.reason.startsWith('fallback_skipped')) fallbackSkipped = fb.reason;
+  if (fb.ok) {
+    // primary 必须留出 reserve：主模型烧满后备用模型仍有预算（reserve = min(T, max(30s, T/2))）
+    primaryDeadline = overallDeadline - fallbackReserveMs(cfg);
   }
-  const meta = { model: reviewParams.model, ms: Date.now() - t0, requestId: hashId(userContent) };
-  if (res.error) {
-    logReview(cfg, Object.assign({ kind: 'error', error: res.error, hint: res.hint || '' }, meta));
-    return { error: res.error, usage: res.usage, hint: res.hint };
+
+  let attempt = await runAttempt(primaryDeadline, target.model, cfg.temperature);
+  let usedFallback = false;
+  let fallbackModel = '';
+  let primaryFailure = '';
+  let remainingHint = attempt.res && attempt.res.hint;
+
+  // 主模型失败且属白名单可治 → 用剩余预算（overallDeadline，含预留 reserve）切备用模型。
+  if (fb.ok && attempt.error && FALLBACK_TRIGGER_REASONS.has(attempt.error)) {
+    primaryFailure = attempt.error;
+    const left = overallDeadline - Date.now();
+    if (left < 5000) {
+      fallbackSkipped = 'fallback_skipped:insufficient_budget'; // 如实记录，不假装降级过
+    } else {
+      const fbAttempt = await runAttempt(overallDeadline, fb.model, 0);
+      if (!fbAttempt.error) {
+        attempt = fbAttempt;
+        usedFallback = true;
+        fallbackModel = fb.model;
+        remainingHint = '';
+      } else {
+        // 备用也失败：以备用错误为最终结果，但保留主模型失败原因供告警归因
+        attempt = fbAttempt;
+        remainingHint = fbAttempt.res && fbAttempt.res.hint;
+        fallbackSkipped = `fallback_failed:${fbAttempt.error}`;
+      }
+    }
   }
-  const frame = parseFrame(res.text, cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
-  if (!frame) {
-    logReview(cfg, Object.assign({ kind: 'unparsed' }, meta));
-    return { error: 'unparsed', usage: res.usage };
+
+  const meta = { model: usedFallback ? fallbackModel : target.model, ms: Date.now() - t0, requestId: hashId(userContent) };
+  const usage = attempt.res && attempt.res.usage;
+  if (attempt.error) {
+    logReview(cfg, Object.assign({ kind: attempt.error === 'unparsed' ? 'unparsed' : 'error', error: attempt.error, hint: remainingHint || '' }, meta));
+    return {
+      error: attempt.error, usage, hint: remainingHint,
+      primaryFailure: primaryFailure || (FALLBACK_TRIGGER_REASONS.has(attempt.error) ? attempt.error : ''),
+      fallbackSkipped
+    };
   }
+  const frame = attempt.frame;
   logReview(cfg, Object.assign({ kind: 'frame', severity: frame.severity }, meta));
-  return { frame, usage: res.usage };
+  return {
+    frame, usage,
+    usedFallback, fallbackModel,
+    // 主模型曾失败（即便最终经备用恢复）——上层据此维护 primaryFailStreak
+    primaryFailure: primaryFailure || '',
+    fallbackSkipped
+  };
+}
+
+// 单轮审查结果落盘（sync / async worker 共用）。抽出来的原因：这段是 M4「不得静默掩盖」
+// 的核心不变量所在，两条路径各写一遍随时可能漂移（曾经 async 路径就漏了字段）。
+// 调用方负责 reviews 计数、lastActivity、健康信标与指针推进等分支专属工作；
+// 这里只管「按审查结果更新 streak / 降级计数 / history」这部分字段。
+function applyReviewOutcome(s, result, eff, cfg) {
+  if (result.error) {
+    bumpDrop(s, result.error);
+    // 降级（M4）：主模型失败连击单独维护——即便这次 fallback 也失败，
+    // 主模型劣化的证据仍要留下，供降级告警归因。
+    if (result.primaryFailure) bumpPrimaryFailStreak(s, result.primaryFailure);
+    return;
+  }
+  // 降级成功：系统可用（清 failStreak），但主模型劣化未消（primaryFailStreak 不动）。
+  if (result.usedFallback) {
+    s.fallbackUsed = (s.fallbackUsed || 0) + 1;
+    s.fallbackLastAt = new Date().toISOString();
+    s.fallbackLastModel = result.fallbackModel || '';
+    if (result.primaryFailure) bumpPrimaryFailStreak(s, result.primaryFailure);
+    // **必须写 history**：降级告警的可见性依赖 additionalContext 与 M1 角标，
+    // 两者都可能失效；history 是唯一不依赖实时推送通道的持久记录（M4 必做项）。
+    appendHistory({
+      event: 'degraded', sessionId: s.sessionId,
+      primaryModel: eff.model, fallbackModel: result.fallbackModel || '',
+      reason: result.primaryFailure || 'unknown'
+    });
+  }
+  s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
 }
 
 function accumulateUsage(state, result) {
@@ -358,6 +479,23 @@ function onUserPromptSubmit(ctx) {
         s.healthAlertCount = n;
         s.healthNotifiedAt = new Date().toISOString();
       }
+    }
+    // 降级告警（M4）：**独立阶梯**，不与停摆告警共计数——否则两类故障互相压制对方的提醒。
+    // 只在「主模型仍在劣化」时喊：primaryFailStreak 达阈值。fallback 成功会清 failStreak
+    // 但不清它，所以这条恰好在「系统看似正常、实则一直在降级」时提醒用户。
+    const degradeActive = s.enabled === true && s.primaryFailStreak && (s.primaryFailStreak.count || 0) >= FAIL_STREAK_ALERT_THRESHOLD;
+    if (degradeActive && !outageActive) {
+      const prevDeg = s.degradeAlertCount || 0;
+      const lastDeg = Date.parse(s.degradeNotifiedAt || '') || 0;
+      if (!lastDeg || prevDeg <= 0 || Date.now() - lastDeg >= alertRepeatGapMs(prevDeg)) {
+        const n = prevDeg + 1;
+        parts.unshift(degradeAlertLine(s.primaryFailStreak, s.fallbackLastModel, n));
+        s.degradeAlertCount = n;
+        s.degradeNotifiedAt = new Date().toISOString();
+      }
+    } else if (!degradeActive && s.primaryFailStreak && (s.primaryFailStreak.count || 0) < FAIL_STREAK_ALERT_THRESHOLD) {
+      // 主模型恢复（连击被清空或低于阈值）：重置降级告警阶梯，下次劣化从第 1 次提醒开始
+      if (s.degradeNotifiedAt) { s.degradeAlertCount = 0; s.degradeNotifiedAt = ''; }
     }
     if (parts.length > 0) deliver = parts.join('\n\n');
   });
@@ -586,7 +724,7 @@ async function onStopSync(ctx) {
   health.writeAttempt(health.resolveHealthDir(process.env), sessionId, {
     model: eff.model, effectiveModel: eff.model
   });
-  const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir));
+  const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir), { state: current });
 
   // 指针推进策略：只要完成了一次审查尝试就前进——失败同样前进（drop 即放弃，
   // 与 dsh-advisor 的有界积压一致，绝不反复重试拖住主循环）。
@@ -600,9 +738,9 @@ async function onStopSync(ctx) {
 
   if (result.error) {
     finish((s) => {
-      bumpDrop(s, result.error);
       s.reviews = (s.reviews || 0) + 1;
       accumulateUsage(s, result);
+      applyReviewOutcome(s, result, eff, cfg);
       health.writeResult(health.resolveHealthDir(process.env), sessionId, {
         ok: false, reason: result.error, model: eff.model, effectiveModel: eff.model, reviews: s.reviews
       });
@@ -614,9 +752,11 @@ async function onStopSync(ctx) {
   finish((s) => {
     s.reviews = (s.reviews || 0) + 1;
     accumulateUsage(s, result);
-    s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
+    applyReviewOutcome(s, result, eff, cfg);
     health.writeResult(health.resolveHealthDir(process.env), sessionId, {
-      ok: true, model: eff.model, effectiveModel: eff.model, reviews: s.reviews
+      ok: true, model: eff.model,
+      effectiveModel: result.usedFallback ? (result.fallbackModel || eff.model) : eff.model,
+      reviews: s.reviews
     });
     // 恢复信号：告警发过的会话（healthNotifiedAt 非空）恢复后，下一次 UPS 喊一声"已恢复"
     if (s.healthNotifiedAt) s.healthRecoveryPending = true;
@@ -776,7 +916,7 @@ async function handleReviewWorker(args) {
 
     const eff = effectiveApi(cfg, apiKeyInfo, state);
     const userContent = `以下是一轮对话增量（按时间顺序，可能被截断）。请按系统指令输出 JSON 判定。\n\n${rendered.text}`;
-    const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir));
+    const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir), { state });
 
     // 最终落盘：短临界区内重读最新状态、只写自己拥有的字段——
     // 审查期间 UPS/ctl 的修改（清队列、off、model set）不会被旧快照覆盖。
@@ -790,9 +930,9 @@ async function handleReviewWorker(args) {
       s.reviews = (s.reviews || 0) + 1;
       s.lastActivity = new Date().toISOString();
       accumulateUsage(s, result);
+      applyReviewOutcome(s, result, eff, cfg);
 
       if (result.error) {
-        bumpDrop(s, result.error);
         // 健康信标（M1）：审查失败 → down；lastSuccessAt 不更新（保持上次成功时间）。
         health.writeResult(health.resolveHealthDir(process.env), s.sessionId, {
           ok: false, reason: result.error, model: eff.model, effectiveModel: eff.model,
@@ -801,10 +941,11 @@ async function handleReviewWorker(args) {
         return;
       }
 
-      s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
-      // 健康信标（M1）：审查成功 → ok。
+      // 健康信标（M1）：审查成功 → ok。降级成功也算 ok，但 effectiveModel 用实际干活的模型。
       health.writeResult(health.resolveHealthDir(process.env), s.sessionId, {
-        ok: true, model: eff.model, effectiveModel: eff.model, reviews: s.reviews
+        ok: true, model: eff.model,
+        effectiveModel: result.usedFallback ? (result.fallbackModel || eff.model) : eff.model,
+        reviews: s.reviews
       });
       // 恢复信号：告警发过的会话（healthNotifiedAt 非空）恢复后，下一次 UPS 喊一声"已恢复"
       if (s.healthNotifiedAt) s.healthRecoveryPending = true;
@@ -912,6 +1053,20 @@ async function handleCtl(args) {
     lines.push(`  审查次数: ${state.reviews || 0} | steer 记录: ${state.steers || 0}（sync=实际送达；async=入队数） | 冷却剩余: ${state.immuneTurns || 0} 轮`);
     lines.push(`  顺延队列: ${(state.pendingNotes || []).length} 条 | 历史顺延: ${state.deferred || 0}`);
     lines.push(`  Token 累计: 输入 ${state.tokensIn || 0} / 输出 ${state.tokensOut || 0}`);
+    // 降级（M4）可见性：配了备用模型才展示；用 primaryFailStreak 说明"主模型是否在坏"。
+    // 这是「不静默掩盖」在 status 侧的落点——即便降级在兜，用户也能看到主模型有问题。
+    const fbModel = resolveFallbackModel(cfg, state);
+    if (fbModel) {
+      const pf = state.primaryFailStreak;
+      const pfDesc = pf && pf.count
+        ? `主模型连续失败 ${pf.count} 次（原因 ${pf.reason}）`
+        : '主模型最近正常';
+      const usages = state.fallbackUsed
+        ? `已降级 ${state.fallbackUsed} 次${state.fallbackLastModel ? `（最近用 ${state.fallbackLastModel}）` : ''}`
+        : '未降级过';
+      const modeNote = cfg.reviewMode === 'sync' ? '（sync 模式不生效）' : '';
+      lines.push(`  备用模型: ${fbModel}${modeNote} | ${usages} | ${pfDesc}`);
+    }
     const drops = state.dropped || {};
     const dropLine = Object.entries(drops).filter(([, n]) => n > 0).map(([k, n]) => `${k}=${n}`).join(' ');
     if (dropLine) lines.push(`  Dropped: ${dropLine}`);
@@ -1013,20 +1168,22 @@ async function handleCtl(args) {
     if (action === 'set') {
       const rest = args.slice(2).filter(Boolean);
       if (rest.length === 0) {
-        process.stdout.write('advisor: 用法 api set <baseUrl|-> <apiKey|-> [model:<model-id>]；- 表示保留该项现状\n');
+        process.stdout.write('advisor: 用法 api set <baseUrl|-> <apiKey|-> [model:<model-id>] [fallback:<model-id>]；- 表示保留该项现状\n');
         return;
       }
       let baseUrl = '';
       let apiKey = '';
       let model = '';
+      let fallback = '';
       for (const tok of rest) {
         if (/^model:/i.test(tok)) model = tok.slice(6).trim();
+        else if (/^fallback:/i.test(tok)) fallback = tok.slice(9).trim();
         else if (!baseUrl) baseUrl = tok.trim();
         else if (!apiKey) apiKey = tok.trim();
       }
       if (baseUrl === '-' || baseUrl === 'keep') baseUrl = '';
       if (apiKey === '-' || apiKey === 'keep') apiKey = '';
-      if (!baseUrl && !apiKey && !model) {
+      if (!baseUrl && !apiKey && !model && !fallback) {
         process.stdout.write('advisor: 未提供任何要设置的值（- 表示保留现状）。\n');
         return;
       }
@@ -1040,11 +1197,15 @@ async function handleCtl(args) {
         if (normalized) s.sessionApi.baseUrl = normalized;
         if (apiKey) s.sessionApi.apiKey = apiKey;
         if (model) s.sessionModel = model; // 模型覆盖复用既有 sessionModel 通道
+        // 会话级备用模型（M4）：独立字段，不放进 sessionApi（后者是"端点/key 覆盖"语义，
+        // 且 fallbackEligibility 用它判断"是否覆盖了端点"）。
+        if (fallback) s.sessionFallbackModel = fallback;
       });
       const parts = [];
       if (normalized) parts.push(`端点=${normalized}`);
       if (apiKey) parts.push(`key=${maskKey(apiKey)}`);
       if (model) parts.push(`模型=${model}`);
+      if (fallback) parts.push(`备用模型=${fallback}`);
       // 占位符照单全收会让"回显成功"与"实际不生效"分叉：effectiveApi 会把
       // test-*/your-api-key 一类值过滤回落全局 key，这里必须当场点破。
       const placeholderHint = apiKey && isPlaceholderKey(apiKey)
@@ -1191,4 +1352,4 @@ if (require.main === module) {
 }
 
 // 仅供测试导出（test/log-review.test.js）；生产调用方全部走 CLI 入口。
-module.exports = { reviewTurn, logReview, reviewBudgetMs };
+module.exports = { reviewTurn, logReview, reviewBudgetMs, fallbackEligibility, fallbackReserveMs, resolveFallbackModel, applyReviewOutcome, degradeAlertLine, FALLBACK_TRIGGER_REASONS };
