@@ -13,7 +13,7 @@ const { execFileSync } = require('child_process');
 
 const T = require('../tools/companion/install-templates.cjs');
 const { COMPANION_FILES, companionRuntimeFiles } = require('../tools/companion/build-meta.cjs');
-const { makeIco, makeIcns, drawShield, encodePng, ICNS_SIZES } = require('../tools/companion/icon.cjs');
+const { makeIco, makeIcns, drawShield, encodePng, ICNS_SIZES, iconPixels } = require('../tools/companion/icon.cjs');
 
 const { VERSION } = require('../tools/companion/build-meta.cjs');
 
@@ -140,7 +140,8 @@ test('makeIco：ICO 目录头与 2 个条目（32 + 256）', () => {
 
 test('makeIco：32bpp 条目按 BGRA 写入（写反会使红蓝互换）', () => {
   // 回归：早期实现直接拷贝 RGBA 缓冲区，Windows 取 32×32 档时显示成红色盾牌。
-  // 这里按 **BMP 规范**（BGRA）解读像素，并要求结果与 drawShield 的 RGBA 语义一致。
+  // 这里按 **BMP 规范**（BGRA）解读像素，并与 iconPixels(32)（实际像素来源：
+  // assets/icon.png 缩放或盾牌回退）的 RGBA 语义逐通道比对。
   const ico = makeIco();
   // ICO 布局：头 6 字节 + 目录项 16 字节 × 2 条目 = 38 起为第一个条目的数据
   const dataOff = 6 + 16 * 2;
@@ -154,15 +155,13 @@ test('makeIco：32bpp 条目按 BGRA 写入（写反会使红蓝互换）', () =
 
   const b = ico[px], g = ico[px + 1], r = ico[px + 2], a = ico[px + 3];
 
-  // 与 drawShield 的同一像素（RGBA）比对
-  const rgba = drawShield(32);
+  // 与 iconPixels 的同一像素（RGBA）比对——通道序结构断言，与源图内容无关
+  const rgba = iconPixels(32);
   const s = srcRow * 32 * 4 + cx * 4;
   assert.strictEqual(r, rgba[s], 'R 通道应等于源 R');
   assert.strictEqual(g, rgba[s + 1], 'G 通道应等于源 G');
   assert.strictEqual(b, rgba[s + 2], 'B 通道应等于源 B');
   assert.strictEqual(a, rgba[s + 3], 'A 通道应等于源 A');
-  // 该像素位于品牌蓝内盾（37,99,235），若通道写反会变成 R=235（偏红）
-  assert.ok(b > r, `中心像素应为蓝色调（B>R），实际 B=${b} R=${r}`);
 });
 
 test('makeIco：系统工具可识别（macOS sips 交叉校验）', {
