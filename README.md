@@ -220,6 +220,7 @@ dsh 端教训（`ADVISOR-GUARD-REPORT.md`，[issue #102](https://github.com/omds
 | --- | --- |
 | `/advisor-setup` | **交互式配置**：填写 API key、选择模型 → 写入用户级配置 → `ctl doctor --ping` 当场验证（`--model <id>` 可逐个测试候选模型） |
 | `/advisor-status` | 状态：启用/门禁/模式/模型及来源/审查与 steer 计数/Token 累计/顺延队列/`Dropped` 分类/配置问题与警告 |
+| `/advisor-api` | 会话级覆盖端点/key/模型（`api set <baseUrl|-> <apiKey|-> [model:<id>]`、`api show`、`api reset`）；key 明文只落本会话状态文件（0600），状态行只回显掩码 |
 | `/advisor-on` `/advisor-off` | 当前会话启停（临时覆盖；审查在飞时执行也不会被回滚；停用会话仍可用注册行自救） |
 | `/advisor-model` | 查看审查模型及来源；`/advisor-model set <model-id>` 本会话固定（下一轮生效）；`/advisor-model reset` 回落全局默认 |
 

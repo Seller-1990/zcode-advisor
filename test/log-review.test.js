@@ -47,7 +47,7 @@ test('logReview：DEBUG=1 时 reviewTurn 落盘一行 JSONL（kind/severity/mode
       json: async () => ({ choices: [{ message: { content: '{"severity":"concern","note":"n"}' } }] })
     });
     try {
-      const r = await hook.reviewTurn(baseCfg(), { key: 'k', source: 'test' }, '内容', undefined, false);
+      const r = await hook.reviewTurn(baseCfg(), { baseUrl: baseCfg().baseUrl, model: 'test-model', apiKey: 'k', key: 'k', source: 'test' }, '内容', false);
       assert.ok(r.frame, '应产出帧');
       const logPath = path.join(dir, 'review.log');
       assert.ok(fs.existsSync(logPath), '应落盘 review.log');
@@ -74,7 +74,7 @@ test('logReview：未开 DEBUG 时零落盘（默认零常驻 IO）', () => {
       json: async () => ({ choices: [{ message: { content: '{"severity":"none","note":""}' } }] })
     });
     try {
-      const r = await hook.reviewTurn(baseCfg(), { key: 'k', source: 'test' }, '内容', undefined, false);
+      const r = await hook.reviewTurn(baseCfg(), { baseUrl: baseCfg().baseUrl, model: 'test-model', apiKey: 'k', key: 'k', source: 'test' }, '内容', false);
       assert.ok(r.frame);
       assert.ok(!fs.existsSync(path.join(dir, 'review.log')), '不应产生 review.log');
     } finally {
@@ -95,7 +95,7 @@ test('async 预算集成：挂起的 fetch 在 ≈2×timeout（而非 timeout）
   });
   try {
     const t0 = Date.now();
-    const r = await hook.reviewTurn(baseCfg({ reviewTimeoutMs: 600 }), { key: 'k', source: 'test' }, '内容', undefined, false);
+    const r = await hook.reviewTurn(baseCfg({ reviewTimeoutMs: 600 }), { baseUrl: baseCfg({ reviewTimeoutMs: 600 }).baseUrl, model: 'test-model', apiKey: 'k', key: 'k', source: 'test' }, '内容', false);
     const elapsed = Date.now() - t0;
     assert.strictEqual(r.error, 'llm_timeout');
     assert.ok(elapsed >= 1050 && elapsed <= 2600,

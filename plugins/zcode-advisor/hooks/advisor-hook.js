@@ -20,7 +20,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const {
-  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey
+  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey, isPlaceholderKey
 } = require('./lib/config');
 const {
   ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, loadState, mutateStateExclusive,
@@ -77,6 +77,41 @@ function effectiveModel(cfg, state) {
   return { model: cfg.model, source: 'global-default' };
 }
 
+// 会话级 API 覆盖解析：state.sessionApi 三键（baseUrl/apiKey/model）独立可空，
+// 空键回落全局配置（含 apiSource=zcode 已解析出的值）。返回值同时兼容两种消费方：
+// reviewTurn 读扁平的 baseUrl/apiKey/model；gate()/configWarnings() 读 resolveApiKey
+// 约定的 {key, source} 形状（会话覆盖时 source=session-override，状态行用它区分）。
+function effectiveApi(cfg, apiKeyInfo, state) {
+  const ov = state && state.sessionApi && typeof state.sessionApi === 'object' ? state.sessionApi : {};
+  const baseUrl = String(ov.baseUrl || '').trim();
+  const apiKey = String(ov.apiKey || '').trim();
+  const effModel = effectiveModel(cfg, state);
+  // 会话 key 与全局 resolveApiKey 同一占位符纪律：test-*/your-api-key 一类值
+  // 视为未配置，回落全局 key，不放行去打真实请求。
+  const sessionKey = apiKey && !isPlaceholderKey(apiKey) ? apiKey : '';
+  const resolvedKey = sessionKey || (apiKeyInfo ? apiKeyInfo.key : '');
+  return {
+    baseUrl: baseUrl || cfg.baseUrl,
+    apiKey: resolvedKey,
+    key: resolvedKey,
+    source: sessionKey ? 'session-override' : ((apiKeyInfo && apiKeyInfo.source) || ''),
+    model: effModel.model,
+    modelSource: effModel.source,
+    // hasOverride/overrides 按**实际生效**的键算：apiKey 被占位符过滤后不算覆盖，
+    // 否则 status 显示「已覆盖 apiKey」而实际回落全局，排查时自相矛盾。
+    hasOverride: Boolean(baseUrl || sessionKey),
+    overrides: [baseUrl && 'baseUrl', sessionKey && 'apiKey'].filter(Boolean)
+  };
+}
+
+// 门禁按会话生效值评估的统一入口：gate(cfg, ...) 检查第一参的 baseUrl/model 字段，
+// 传全局 cfg 会在「全局配空 + 会话已 set 端点/模型」时误报 missing。所有 gate
+// 调用点（stop/sync/worker/status/on）必须走这里，防止逐点手搓漏改。
+function gateWithSession(cfg, apiKeyInfo, state) {
+  const eff = effectiveApi(cfg, apiKeyInfo, state);
+  return { eff, reasons: gate({ baseUrl: eff.baseUrl, model: eff.model }, eff) };
+}
+
 function isStopHookActive(input) {
   if (!input) return false;
   const v = input.stop_hook_active != null ? input.stop_hook_active : input.stopHookActive;
@@ -88,7 +123,7 @@ function isStopHookActive(input) {
 function controlLines(cfg, apiKeyInfo, stateDir, file) {
   const eff = effectiveModel(cfg, null);
   const lines = [];
-  lines.push(`[advisor] 审查副模型已挂载：模型=${eff.model}，模式=${cfg.reviewMode}。控制命令：/advisor-status、/advisor-setup、/advisor-on、/advisor-off、/advisor-model。脚本：${SCRIPT_PATH}；状态文件：${file}。`);
+  lines.push(`[advisor] 审查副模型已挂载：模型=${eff.model}，模式=${cfg.reviewMode}。控制命令：/advisor-status、/advisor-setup、/advisor-on、/advisor-off、/advisor-model、/advisor-api（会话级端点/key 覆盖）。脚本：${SCRIPT_PATH}；状态文件：${file}。`);
   if (process.env.ZCODE_ADVISOR_MOCK === '1' && !mockAllowed(stateDir)) {
     lines.push('[advisor] 配置警告：检测到 ZCODE_ADVISOR_MOCK=1，但 state 目录缺少 .mock-allowed 文件——mock 未生效，将发起真实 API 调用。');
   }
@@ -149,7 +184,7 @@ function reviewBudgetMs(cfg) {
   return cfg.reviewMode === 'sync' ? cfg.reviewTimeoutMs : cfg.reviewTimeoutMs * 2;
 }
 
-async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock) {
+async function reviewTurn(cfg, target, userContent, allowMock) {
   if (process.env.ZCODE_ADVISOR_MOCK === '1' && allowMock) {
     const frame = mockFrame(cfg);
     if (!frame) return { error: 'unparsed' };
@@ -160,9 +195,9 @@ async function reviewTurn(cfg, apiKeyInfo, userContent, modelOverride, allowMock
   const deadline = Date.now() + reviewBudgetMs(cfg);
   const t0 = Date.now();
   const reviewParams = {
-    baseUrl: cfg.baseUrl,
-    model: modelOverride || cfg.model,
-    apiKey: apiKeyInfo.key,
+    baseUrl: target.baseUrl,
+    model: target.model,
+    apiKey: target.apiKey,
     systemPrompt,
     userContent,
     maxTokens: cfg.maxTokens,
@@ -302,8 +337,9 @@ function onStopAsync(ctx) {
     return;
   }
 
-  const gateReasons = gate(cfg, apiKeyInfo);
   const current = loadState(file);
+  // 门禁按会话级生效值评估：全局 key/端点/模型任一缺失但本会话已覆盖时照常审查。
+  const { reasons: gateReasons } = gateWithSession(cfg, apiKeyInfo, current);
   if (!current || !current.enabled || gateReasons.length > 0) {
     mutateStateExclusive(file, (s) => {
       s.lastActivity = new Date().toISOString();
@@ -418,7 +454,8 @@ async function onStopSync(ctx) {
   const current = loadState(file);
   if (!current || !current.enabled) return;
 
-  const gateReasons = gate(cfg, apiKeyInfo);
+  // 门禁按会话级生效值评估（与 async 路径同一口径）。
+  const gateReasons = gateWithSession(cfg, apiKeyInfo, current).reasons;
   if (gateReasons.length > 0) {
     mutateStateExclusive(file, (s) => {
       s.disabledReason = gateReasons.join(',');
@@ -465,9 +502,9 @@ async function onStopSync(ctx) {
     return;
   }
 
-  const eff = effectiveModel(cfg, current);
+  const eff = effectiveApi(cfg, apiKeyInfo, current);
   const userContent = `以下是一轮对话增量（按时间顺序，可能被截断）。请按系统指令输出 JSON 判定。\n\n${rendered.text}`;
-  const result = await reviewTurn(cfg, apiKeyInfo, userContent, eff.model, mockAllowed(stateDir));
+  const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir));
 
   // 指针推进策略：只要完成了一次审查尝试就前进——失败同样前进（drop 即放弃，
   // 与 dsh-advisor 的有界积压一致，绝不反复重试拖住主循环）。
@@ -588,7 +625,8 @@ async function handleReviewWorker(args) {
     const stateDir = path.dirname(file);
 
     if (!state.enabled) return;
-    const gateReasons = gate(cfg, apiKeyInfo);
+    // 门禁按会话级生效值评估：全局 key 缺失但本会话已覆盖 key 时照常审查。
+    const gateReasons = gateWithSession(cfg, apiKeyInfo, state).reasons;
     if (gateReasons.length > 0) {
       mutateStateExclusive(file, (s) => {
         s.disabledReason = gateReasons.join(',');
@@ -645,9 +683,9 @@ async function handleReviewWorker(args) {
       return;
     }
 
-    const eff = effectiveModel(cfg, state);
+    const eff = effectiveApi(cfg, apiKeyInfo, state);
     const userContent = `以下是一轮对话增量（按时间顺序，可能被截断）。请按系统指令输出 JSON 判定。\n\n${rendered.text}`;
-    const result = await reviewTurn(cfg, apiKeyInfo, userContent, eff.model, mockAllowed(stateDir));
+    const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir));
 
     // 最终落盘：短临界区内重读最新状态、只写自己拥有的字段——
     // 审查期间 UPS/ctl 的修改（清队列、off、model set）不会被旧快照覆盖。
@@ -750,8 +788,7 @@ async function handleCtl(args) {
   if (sub === 'status') {
     const state = loadState(file);
     const apiKeyInfo = resolveApiKey(cfg, process.env);
-    const gateReasons = gate(cfg, apiKeyInfo);
-    const eff = effectiveModel(cfg, state);
+    const { eff, reasons: gateReasons } = gateWithSession(cfg, apiKeyInfo, state);
     const lines = [];
     lines.push('advisor 状态');
     lines.push(`  会话: ${state.sessionId || '(未知)'}`);
@@ -760,9 +797,14 @@ async function handleCtl(args) {
       lines.push(`  门禁: 未满足 → ${gateReasons.join(',')}（审查不会运行）`);
     }
     lines.push(`  模式: ${cfg.reviewMode}`);
-    lines.push(`  模型: ${eff.model}（${eff.source === 'session-override' ? '本会话覆盖' : '全局默认'}）`);
+    lines.push(`  模型: ${eff.model}（${eff.modelSource === 'session-override' ? '本会话覆盖' : '全局默认'}）`);
     lines.push(`  API 来源: ${cfg.apiSourceLabel || (cfg.apiSource === 'zcode' ? 'ZCode 已维护' : '手动维护')}`);
-    lines.push(`  端点: ${cfg.baseUrl}`);
+    // 会话级覆盖详情：哪些键被本会话覆盖、生效 key 的掩码（state 里的 key 不回显明文）
+    if (eff.hasOverride) {
+      lines.push(`  会话覆盖: ${eff.overrides.join(' + ')}（/advisor-api reset 恢复全局）`);
+    }
+    lines.push(`  端点: ${eff.baseUrl}`);
+    lines.push(`  生效 key: ${eff.apiKey ? maskKey(eff.apiKey) : '（无）'}`);
     lines.push(`  审查次数: ${state.reviews || 0} | steer 记录: ${state.steers || 0}（sync=实际送达；async=入队数） | 冷却剩余: ${state.immuneTurns || 0} 轮`);
     lines.push(`  顺延队列: ${(state.pendingNotes || []).length} 条 | 历史顺延: ${state.deferred || 0}`);
     lines.push(`  Token 累计: 输入 ${state.tokensIn || 0} / 输出 ${state.tokensOut || 0}`);
@@ -796,7 +838,9 @@ async function handleCtl(args) {
     for (const h of hints) lines.push(`  提示: ${h}`);
 
     for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
-    for (const w of configWarnings(cfg, apiKeyInfo)) lines.push(`  配置警告: ${w}`);
+    // 告警按会话生效端点评估：会话把端点覆盖成 http:// 或把官方 key 指到第三方时
+    // 必须能告警出来；全局告警也不应误报到已被覆盖的配置上。
+    for (const w of configWarnings({ baseUrl: eff.baseUrl }, eff)) lines.push(`  配置警告: ${w}`);
     if (state.lastAction) lines.push(`  最近动作: ${state.lastAction}`);
     lines.push(`  最后活动: ${state.lastActivity || '(无)'}`);
     process.stdout.write(lines.join('\n') + '\n');
@@ -804,17 +848,21 @@ async function handleCtl(args) {
   }
 
   if (sub === 'on') {
+    // 门禁在临界区内按重读后的状态重算：锁外用旧快照算好再写回，并发
+    // /advisor-api set 改了 sessionApi 时会用过期结果覆盖 disabledReason。
+    let reasons = [];
+    let enabledModel = '';
     mutateStateExclusive(file, (s) => {
       s.enabled = true;
-      const reasons = gate(cfg, resolveApiKey(cfg, process.env));
+      const r = gateWithSession(cfg, resolveApiKey(cfg, process.env), s);
+      reasons = r.reasons;
+      enabledModel = r.eff.model;
       s.disabledReason = reasons.length > 0 ? reasons.join(',') : '';
     });
-    const state = loadState(file);
-    const reasons = gate(cfg, resolveApiKey(cfg, process.env));
     if (reasons.length > 0) {
-      process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 advisor.config.json 或环境变量。\n`);
+      process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 advisor.config.json、环境变量，或用 /advisor-api set 为本会话单独配置。\n`);
     } else {
-      process.stdout.write(`advisor: 本会话已启用（模式 ${cfg.reviewMode}，模型 ${effectiveModel(cfg, state).model}）。\n`);
+      process.stdout.write(`advisor: 本会话已启用（模式 ${cfg.reviewMode}，模型 ${enabledModel}）。\n`);
     }
     return;
   }
@@ -854,7 +902,71 @@ async function handleCtl(args) {
     return;
   }
 
-  process.stdout.write(`advisor: 未知子命令 ${sub}。可用：status | on | off | model [set <id>|reset] | doctor [--ping] [--model <id>]\n`);
+  // 会话级 API 覆盖：set <baseUrl> <apiKey> [model:<id>]（键顺序可换，model: 前缀标识模型；
+  // 两值缺省写 - 表示保留该项）| show | reset。key 只落 state 文件（0600），状态行只回显掩码。
+  if (sub === 'api') {
+    const action = args[1] || 'show';
+    if (action === 'set') {
+      const rest = args.slice(2).filter(Boolean);
+      if (rest.length === 0) {
+        process.stdout.write('advisor: 用法 api set <baseUrl|-> <apiKey|-> [model:<model-id>]；- 表示保留该项现状\n');
+        return;
+      }
+      let baseUrl = '';
+      let apiKey = '';
+      let model = '';
+      for (const tok of rest) {
+        if (/^model:/i.test(tok)) model = tok.slice(6).trim();
+        else if (!baseUrl) baseUrl = tok.trim();
+        else if (!apiKey) apiKey = tok.trim();
+      }
+      if (baseUrl === '-' || baseUrl === 'keep') baseUrl = '';
+      if (apiKey === '-' || apiKey === 'keep') apiKey = '';
+      if (!baseUrl && !apiKey && !model) {
+        process.stdout.write('advisor: 未提供任何要设置的值（- 表示保留现状）。\n');
+        return;
+      }
+      // 归一化端点路径（与 reviewer.js 的 normalizeChatEndpoint 同规则）：填 /v1 基地址也能直接用
+      const trimmed = baseUrl.replace(/\/+$/, '');
+      const normalized = trimmed && !/\/chat\/completions$/i.test(trimmed) && !/\/messages$/i.test(trimmed)
+        ? `${trimmed}/chat/completions`
+        : trimmed;
+      mutateStateExclusive(file, (s) => {
+        if (!s.sessionApi || typeof s.sessionApi !== 'object') s.sessionApi = { baseUrl: '', apiKey: '', model: '' };
+        if (normalized) s.sessionApi.baseUrl = normalized;
+        if (apiKey) s.sessionApi.apiKey = apiKey;
+        if (model) s.sessionModel = model; // 模型覆盖复用既有 sessionModel 通道
+      });
+      const parts = [];
+      if (normalized) parts.push(`端点=${normalized}`);
+      if (apiKey) parts.push(`key=${maskKey(apiKey)}`);
+      if (model) parts.push(`模型=${model}`);
+      // 占位符照单全收会让"回显成功"与"实际不生效"分叉：effectiveApi 会把
+      // test-*/your-api-key 一类值过滤回落全局 key，这里必须当场点破。
+      const placeholderHint = apiKey && isPlaceholderKey(apiKey)
+        ? `。注意：该 key 形似占位符，审查时会回落全局 key（与 resolveApiKey 同一纪律）`
+        : '';
+      process.stdout.write(`advisor: 本会话已覆盖 ${parts.join('，')}（下一轮审查起生效；/advisor-api reset 恢复全局）${placeholderHint}。\n`);
+      return;
+    }
+    if (action === 'reset') {
+      mutateStateExclusive(file, (s) => {
+        s.sessionApi = { baseUrl: '', apiKey: '', model: '' };
+      });
+      process.stdout.write('advisor: 已清除本会话的端点/key 覆盖，恢复跟随全局配置（模型覆盖用 /advisor-model reset 单独清除）。\n');
+      return;
+    }
+    const state = loadState(file);
+    const eff = effectiveApi(cfg, resolveApiKey(cfg, process.env), state);
+    if (!eff.hasOverride) {
+      process.stdout.write(`advisor: 本会话未覆盖端点/key，跟随全局配置（端点 ${cfg.baseUrl}，key ${eff.apiKey ? maskKey(eff.apiKey) : '（无）'}）。修改：api set <baseUrl|-> <apiKey|-> [model:<id>] | reset\n`);
+      return;
+    }
+    process.stdout.write(`advisor: 本会话覆盖：${eff.overrides.join(' + ')}。生效端点 ${eff.baseUrl}，key ${eff.apiKey ? maskKey(eff.apiKey) : '（无）'}。修改：api set … | reset\n`);
+    return;
+  }
+
+  process.stdout.write(`advisor: 未知子命令 ${sub}。可用：status | on | off | model [set <id>|reset] | api [set <baseUrl|-> <apiKey|-> [model:<id>]|show|reset] | doctor [--ping] [--model <id>]\n`);
 }
 
 // 体检：展示配置解析链、key 来源（脱敏）、门禁与警告；--ping 用 max_tokens=1 的
