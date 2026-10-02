@@ -48,6 +48,73 @@ function readHistory(limit) {
   }
 }
 
+// —— 健康信标读取（M1）——
+// 同样内联（发行包不含 hooks/，无法 require hooks/lib/health.js）。
+// 路径解析与 hooks/lib/health.js 的 resolveHealthDir 必须一致（含 STATE_DIR 隔离），
+// 且 deriveHealth 的判定语义必须与 health.js 一致——两侧漂移会让角标说谎。测试锁住。
+function resolveHealthDir() {
+  if (process.env.ZCODE_ADVISOR_HEALTH_DIR) return process.env.ZCODE_ADVISOR_HEALTH_DIR;
+  if (process.env.ZCODE_ADVISOR_STATE_DIR) return process.env.ZCODE_ADVISOR_STATE_DIR;
+  return path.join(os.homedir(), '.zcode');
+}
+const HEALTH_DIR = resolveHealthDir();
+
+function staleThresholdMs(reviewBudgetMs) {
+  const b = Number.isFinite(reviewBudgetMs) && reviewBudgetMs > 0 ? reviewBudgetMs : 480000;
+  return Math.max(600000, b * 2);
+}
+
+// 与 health.js:deriveHealth 同语义。**无数据/陈旧一律 unknown，绝不回 ok**。
+function deriveHealth(beacon, opts) {
+  const o = opts || {};
+  const now = Number.isFinite(o.now) ? o.now : Date.now();
+  const staleMs = Number.isFinite(o.staleMs) ? o.staleMs : staleThresholdMs(o.reviewBudgetMs);
+  if (!beacon || typeof beacon !== 'object') return 'unknown';
+  const attempt = Date.parse(beacon.lastAttemptAt || '') || 0;
+  const success = Date.parse(beacon.lastSuccessAt || '') || 0;
+  if (!attempt) return 'unknown';
+  if (now - attempt > staleMs) return 'unknown';
+  const successFresh = success > 0 && (now - success) <= staleMs;
+  if (successFresh && beacon.state === 'ok') return 'ok';
+  if (beacon.state === 'degraded') return 'degraded';
+  return 'down';
+}
+
+// 读全部信标，取「最近活动」的一个（多会话并存时；不按 mtime 猜当前会话——
+// controller 无从得知用户在哪个会话，故返回该条并附 sessionId 供 UI 标注）。
+function readHealth(reviewBudgetMs) {
+  try {
+    if (!fs.existsSync(HEALTH_DIR)) return { state: 'unknown', beacon: null, candidates: 0 };
+    const files = fs.readdirSync(HEALTH_DIR).filter((f) => /^advisor-health-.*\.json$/.test(f));
+    const beacons = [];
+    for (const f of files) {
+      try {
+        const b = JSON.parse(fs.readFileSync(path.join(HEALTH_DIR, f), 'utf8'));
+        if (b && typeof b === 'object') beacons.push(b);
+      } catch (_) { /* 跳过坏文件 */ }
+    }
+    if (beacons.length === 0) return { state: 'unknown', beacon: null, candidates: 0 };
+    beacons.sort((a, b) => (Date.parse(b.lastAttemptAt || 0) || 0) - (Date.parse(a.lastAttemptAt || 0) || 0));
+    const top = beacons[0];
+    return {
+      state: deriveHealth(top, { reviewBudgetMs }),
+      beacon: {
+        sessionId: top.sessionId || '',
+        model: top.model || '',
+        effectiveModel: top.effectiveModel || top.model || '',
+        lastAttemptAt: top.lastAttemptAt || '',
+        lastSuccessAt: top.lastSuccessAt || '',
+        reason: top.reason || '',
+        reviews: Number.isFinite(top.reviews) ? top.reviews : null
+      },
+      candidates: beacons.length
+    };
+  } catch (_) {
+    return { state: 'unknown', beacon: null, candidates: 0 };
+  }
+}
+
+
 const HOME = os.homedir();
 const USER_CONFIG = process.env.ZCODE_ADVISOR_USER_CONFIG || path.join(HOME, '.zcode', 'advisor.config.json');
 const COMPANION_CONFIG = process.env.ZCODE_ADVISOR_COMPANION_CONFIG || path.join(HOME, '.zcode', 'advisor-companion.json');
@@ -666,6 +733,22 @@ function startApi(cdpPort, apiPort, token) {
       if (req.method === 'GET' && req.url === '/api/history') {
         return done(200, { ok: true, history: readHistory(50), file: HISTORY_FILE });
       }
+      // 健康态（M1）：读信标派生 ok/degraded/down/unknown，供顶部角标着色。
+      // 无信标 = unknown（绝不回 ok）；reviewBudgetMs 取自用户配置，与 hook 侧同算式。
+      if (req.method === 'GET' && req.url === '/api/health') {
+        const c = readUserConfig();
+        const timeoutMs = Number.isFinite(c.reviewTimeoutMs) && c.reviewTimeoutMs > 0 ? c.reviewTimeoutMs : 240000;
+        const reviewBudgetMs = (c.reviewMode === 'sync') ? timeoutMs : timeoutMs * 2;
+        const h = readHealth(reviewBudgetMs);
+        return done(200, {
+          ok: true,
+          state: h.state,
+          beacon: h.beacon,
+          candidates: h.candidates,
+          dir: HEALTH_DIR,
+          staleMs: staleThresholdMs(reviewBudgetMs)
+        });
+      }
       return done(404, { ok: false, error: 'not_found' });
     } catch (err) {
       return done(500, { ok: false, error: String(err).slice(0, 200) });
@@ -755,4 +838,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, effectiveTarget };
+module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi };

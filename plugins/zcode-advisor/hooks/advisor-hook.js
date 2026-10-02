@@ -36,6 +36,7 @@ const {
   decideAction, decideActionAsync, prefixFor, applyDeliveryToState, enqueueNote
 } = require('./lib/route');
 const { appendHistory } = require('./lib/history');
+const health = require('./lib/health');
 
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const SCRIPT_PATH = path.join(__dirname, 'advisor-hook.js');
@@ -441,6 +442,15 @@ function onStopAsync(ctx) {
     s.lastActivity = new Date().toISOString();
   });
 
+  // 健康信标（M1）：父进程必然会执行到此，记「本轮尝试了审查」。
+  // worker 被强杀时只有这条会更新，lastSuccessAt 停留 → 读取侧可判 down（而非假绿）。
+  {
+    const effAttempt = effectiveApi(cfg, apiKeyInfo, current);
+    health.writeAttempt(health.resolveHealthDir(process.env), sessionId, {
+      model: effAttempt.model, effectiveModel: effAttempt.model
+    });
+  }
+
   // —— 转录快照（ZCode 宿主契约适配）——
   // ZCode 给 hook 的 transcript_path 是**每轮临时快照**（/var/folders/.../T/zcode-*-hook-*/），
   // Stop 返回后即被清理。async 的 worker 在 hook 退出后才读 → 必然 no_transcript
@@ -571,6 +581,11 @@ async function onStopSync(ctx) {
 
   const eff = effectiveApi(cfg, apiKeyInfo, current);
   const userContent = `以下是一轮对话增量（按时间顺序，可能被截断）。请按系统指令输出 JSON 判定。\n\n${rendered.text}`;
+
+  // 健康信标（M1）：sync 路径无分发 worker，attempt 在审查发起前写。
+  health.writeAttempt(health.resolveHealthDir(process.env), sessionId, {
+    model: eff.model, effectiveModel: eff.model
+  });
   const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir));
 
   // 指针推进策略：只要完成了一次审查尝试就前进——失败同样前进（drop 即放弃，
@@ -588,6 +603,9 @@ async function onStopSync(ctx) {
       bumpDrop(s, result.error);
       s.reviews = (s.reviews || 0) + 1;
       accumulateUsage(s, result);
+      health.writeResult(health.resolveHealthDir(process.env), sessionId, {
+        ok: false, reason: result.error, model: eff.model, effectiveModel: eff.model, reviews: s.reviews
+      });
     });
     return;
   }
@@ -597,6 +615,9 @@ async function onStopSync(ctx) {
     s.reviews = (s.reviews || 0) + 1;
     accumulateUsage(s, result);
     s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
+    health.writeResult(health.resolveHealthDir(process.env), sessionId, {
+      ok: true, model: eff.model, effectiveModel: eff.model, reviews: s.reviews
+    });
     // 恢复信号：告警发过的会话（healthNotifiedAt 非空）恢复后，下一次 UPS 喊一声"已恢复"
     if (s.healthNotifiedAt) s.healthRecoveryPending = true;
   });
@@ -772,10 +793,19 @@ async function handleReviewWorker(args) {
 
       if (result.error) {
         bumpDrop(s, result.error);
+        // 健康信标（M1）：审查失败 → down；lastSuccessAt 不更新（保持上次成功时间）。
+        health.writeResult(health.resolveHealthDir(process.env), s.sessionId, {
+          ok: false, reason: result.error, model: eff.model, effectiveModel: eff.model,
+          reviews: s.reviews
+        });
         return;
       }
 
       s.failStreak = null; // 审查成功：清零失败连击（4a 健康告警的恢复信号）
+      // 健康信标（M1）：审查成功 → ok。
+      health.writeResult(health.resolveHealthDir(process.env), s.sessionId, {
+        ok: true, model: eff.model, effectiveModel: eff.model, reviews: s.reviews
+      });
       // 恢复信号：告警发过的会话（healthNotifiedAt 非空）恢复后，下一次 UPS 喊一声"已恢复"
       if (s.healthNotifiedAt) s.healthRecoveryPending = true;
 

@@ -19,6 +19,9 @@
       const old = document.getElementById(id);
       if (old) old.remove();
     }
+    // 旧脚本的健康轮询用的是过期令牌（一律 403 → unknown），会与新脚本的新令牌轮询
+    // 互相打架（灯在 ok/未知间闪）；清掉旧定时器，只留新脚本的。
+    if (window.__zcaHealthTimer) { clearInterval(window.__zcaHealthTimer); window.__zcaHealthTimer = null; }
   }
   window.__zcodeAdvisorInjected = true;
   window.__zcodeAdvisorToken = TOKEN;
@@ -26,7 +29,7 @@
   const css = `
 /* 角标：锚定在输入框工具栏右侧，与 zcode+ 的 ✨ 并列，而非悬浮遮挡内容。
    内联到工具栏容器里，尺寸与原生图标按钮一致（28px 高），视觉更精简。 */
-.zca-badge{display:inline-flex;align-items:center;justify-content:center;
+.zca-badge{display:inline-flex;align-items:center;justify-content:center;position:relative;
  width:28px;height:28px;padding:0;margin:0;border-radius:8px;cursor:pointer;
  background:transparent;color:currentColor;border:1px solid transparent;opacity:.72;
  transition:opacity .15s,background-color .15s,transform .12s;user-select:none;flex:0 0 auto}
@@ -42,6 +45,20 @@
 .zca-badge.zca-topbar-badge{width:auto;height:28px;padding:0 10px;border-radius:8px;gap:6px;
  border:1px solid rgba(127,127,127,.28);background:rgba(127,127,127,.10);opacity:.9;font-size:12px}
 .zca-badge.zca-topbar-badge .zca-label-text{font-weight:500;letter-spacing:.2px}
+/* 健康指示点（M1）：角标上的状态灯。颜色由 /api/health 轮询结果决定。
+   默认灰=未知；**代码里不存在"取不到数据就显示绿"的分支**——
+   指示器失效必须显示未知，否则用户会把"灯坏了"误读成"顾问健康"。 */
+.zca-hdot{position:absolute;top:-2px;right:-2px;width:8px;height:8px;border-radius:50%;
+ background:#8b94a3;flex:0 0 auto;transition:background .2s}
+.zca-badge.zca-topbar-badge .zca-hdot{position:static;top:auto;right:auto}
+.zca-badge.zca-h-ok .zca-hdot{background:#10b981}
+.zca-badge.zca-h-degraded .zca-hdot{background:#f59e0b}
+.zca-badge.zca-h-down .zca-hdot{background:#ef4444;animation:zca-pulse 1.6s ease-out infinite}
+.zca-badge.zca-h-unknown .zca-hdot{background:#8b94a3;opacity:.55}
+/* 异常态整体染色：顶部 tab 一眼可见（用户诉求"出问题 tab 变红"） */
+.zca-badge.zca-h-down{border-color:rgba(239,68,68,.65);background:rgba(239,68,68,.14);opacity:1;color:#fca5a5}
+.zca-badge.zca-h-degraded{border-color:rgba(245,158,11,.55);background:rgba(245,158,11,.12);opacity:1;color:#fcd34d}
+@keyframes zca-pulse{0%{box-shadow:0 0 0 0 rgba(239,68,68,.55)}70%{box-shadow:0 0 0 7px rgba(239,68,68,0)}100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}}
 .zca-panel{position:fixed;width:320px;max-height:76vh;overflow:auto;z-index:2147483001;
  right:16px;bottom:140px;
  background:#1c1f26;color:#e6e8ec;border:1px solid #333842;border-radius:14px;padding:12px 14px 14px;
@@ -200,6 +217,47 @@
       });
     } catch (e) {
       box.innerHTML = `<div class="zca-history-empty">读取失败：${String(e).slice(0, 80)}</div>`;
+    }
+  }
+
+  // 健康轮询（M1）：读 controller 的 /api/health（信标派生）给角标状态灯着色。
+  // 纪律：**只有明确收到 'ok' 才显绿**；网络失败/无信标/陈旧一律 unknown（灰）。
+  // 绝不写「取不到数据就当健康」的分支——那会让灯坏了被误读成顾问正常。
+  const HEALTH_STATES = { ok: 1, degraded: 1, down: 1, unknown: 1 };
+  const HEALTH_TEXT = {
+    ok: '顾问正常', degraded: '顾问降级（部分审查失败）',
+    down: '顾问异常：审查未成功返回', unknown: '顾问状态未知（尚未运行或数据过期）'
+  };
+  let healthState = 'unknown';
+  let healthDetail = '';
+
+  function paintHealth(state, detail) {
+    const b = document.getElementById('zca-badge');
+    if (!b) return;
+    const s = HEALTH_STATES[state] ? state : 'unknown';
+    healthState = s;
+    healthDetail = detail || '';
+    for (const k of Object.keys(HEALTH_STATES)) b.classList.toggle('zca-h-' + k, k === s);
+    // 顶部条模式下角标自带文字，把健康态写成 title 提示；图标模式也写 title
+    b.title = `ZCode Advisor｜${HEALTH_TEXT[s]}${healthDetail ? '｜' + healthDetail : ''}（点击打开设置）`;
+  }
+
+  async function pollHealth() {
+    try {
+      const r = await api('/api/health');
+      if (!r || !r.ok) { paintHealth('unknown', ''); return; }
+      const b = r.beacon || null;
+      let detail = '';
+      if (b && b.lastSuccessAt) {
+        detail = '上次成功 ' + String(b.lastSuccessAt).replace('T', ' ').slice(5, 16);
+      } else if (b && b.lastAttemptAt) {
+        detail = '上次尝试 ' + String(b.lastAttemptAt).replace('T', ' ').slice(5, 16) + '（未成功）';
+      }
+      if (b && b.reason) detail += '｜' + String(b.reason).slice(0, 40);
+      paintHealth(r.state, detail);
+    } catch (_) {
+      // 外挂未运行 / 网络错误：不能装作正常，显示未知
+      paintHealth('unknown', '');
     }
   }
 
@@ -623,14 +681,20 @@
     const svg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" '
       + 'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
       + '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>';
+    const dot = el('span', 'zca-hdot');
+    dot.id = 'zca-hdot';
     if (ANCHOR_MODE === 'topbar') {
       // 顶部模式带宽高，可带文字标签，比纯图标更好认
       b.classList.add('zca-topbar-badge');
       b.innerHTML = `${svg}<span class="zca-label-text">顾问</span>`;
+      b.appendChild(dot);
     } else {
       // 输入框工具栏模式：只放图标，与相邻的原生图标按钮尺寸一致
       b.innerHTML = svg;
+      b.appendChild(dot);
     }
+    // 初始态默认灰（未知）：不能在建角标时就假定健康
+    b.classList.add('zca-h-unknown');
 
     let panel = null;
     const toggle = () => {
@@ -657,6 +721,8 @@
       if (!b) {
         // 角标被整体移除（容器重建）：重新创建
         buildBadge();
+        // 重建后立刻恢复上一次已知健康态，避免灯在下一个轮询周期前闪回灰色
+        paintHealth(healthState, healthDetail);
         return;
       }
       // 角标还在但已脱离锚点（如父容器被替换）：重挂
@@ -675,6 +741,12 @@
     ensureStyles();
     buildBadge();
     watchComposer();
+    // 健康轮询（M1）：角标状态灯必须**持续**反映后端，而不是只在打开面板时拉一次。
+    // 首次立即拉，之后每 5s；单次失败不改变其它逻辑，只把灯置未知。
+    pollHealth();
+    if (!window.__zcaHealthTimer) {
+      window.__zcaHealthTimer = setInterval(pollHealth, 5000);
+    }
   }
   boot();
 })();

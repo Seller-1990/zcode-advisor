@@ -181,7 +181,7 @@ function runInject(opts) {
 
   const fn = new Function(
     'document', 'window', 'setTimeout', 'console', 'fetch', '__API_PORT__', '__TOKEN__',
-    'MutationObserver', 'requestAnimationFrame',
+    'MutationObserver', 'requestAnimationFrame', 'setInterval', 'clearInterval',
     source
   );
   const fetchStub = o.fetch || (async () => ({ json: async () => ({ ok: false }) }));
@@ -192,9 +192,24 @@ function runInject(opts) {
     observe(target, opts) { this.observed = { target, opts }; }
     disconnect() { this.observed = null; }
   }
-  fn(dom.document, win, (f) => f(), console, fetchStub, port, token, MOStub, (f) => f());
+  // setInterval 桩：真实定时器会吊住 node --test 的进程不退出（健康轮询每 5s 一次），
+  // 且脚本是注入到页面里的、测试不需要真跑定时器。这里只记录回调与 id，
+  // 由测试按需手动触发（intervals 暴露给用例）。
+  const intervals = [];
+  const setIntervalStub = (cb, ms) => {
+    const id = intervals.length + 1;
+    intervals.push({ id, cb, ms });
+    return id;
+  };
+  const clearIntervalStub = (id) => {
+    const i = intervals.findIndex((x) => x.id === id);
+    if (i >= 0) intervals.splice(i, 1);
+  };
+  fn(dom.document, win, (f) => f(), console, fetchStub, port, token, MOStub, (f) => f(),
+    setIntervalStub, clearIntervalStub);
   dom.fetch = fetchStub;
   dom.observers = observers;
+  dom.intervals = intervals;
   return dom;
 }
 
@@ -696,4 +711,93 @@ test('inject.js：zcode 服务商列表不含合格项时给出占位提示（�
   const psel = dom.byId.get('zca-zcode-provider');
   assert.match(psel.children[0].textContent, /暂无 OpenAI 兼容服务商/);
   assert.strictEqual(psel.value, '');
+});
+
+// ---------------- 健康指示灯（M1） ----------------
+// 角标上的状态灯读 /api/health 着色。核心不变量：**只有明确 ok 才显绿**，
+// 网络失败/无数据一律 unknown。若哪天有人加了"取不到数据就当健康"的分支，
+// 用户会把"灯坏了"误读成"顾问正常"——比没有灯更糟。
+
+function healthDom(state, beacon) {
+  const fetchStub = async (url) => ({
+    json: async () => (String(url).includes('/api/health')
+      ? { ok: true, state, beacon: beacon || null }
+      : { ok: false })
+  });
+  return runInject({ fetch: fetchStub });
+}
+
+test('inject.js：/api/health 轮询已注册（角标不只在开面板时才有状态）', () => {
+  const dom = runInject();
+  assert.ok(dom.intervals.length > 0, '应注册健康轮询定时器');
+  assert.strictEqual(dom.intervals[0].ms, 5000, '轮询间隔应为 5s');
+});
+
+test('inject.js：state=ok → 角标带 zca-h-ok', async () => {
+  const dom = healthDom('ok', { lastSuccessAt: '2030-01-01T00:00:00.000Z' });
+  await new Promise((r) => setTimeout(r, 10));
+  const b = dom.byId.get('zca-badge');
+  assert.ok(b.classList.contains('zca-h-ok'), 'ok 应显绿灯类');
+  assert.ok(!b.classList.contains('zca-h-unknown'), '不应同时残留未知类');
+});
+
+test('inject.js：state=down → 角标带 zca-h-down 且提示含原因', async () => {
+  const dom = healthDom('down', { lastAttemptAt: '2030-01-01T00:00:00.000Z', reason: 'llm_http_401' });
+  await new Promise((r) => setTimeout(r, 10));
+  const b = dom.byId.get('zca-badge');
+  assert.ok(b.classList.contains('zca-h-down'), 'down 应显红灯类');
+  assert.match(b.title, /异常/, 'title 应说明异常');
+  assert.match(b.title, /llm_http_401/, 'title 应带失败原因，便于排查');
+});
+
+test('inject.js：state=degraded → 角标带 zca-h-degraded（区别于 ok 与 down）', async () => {
+  const dom = healthDom('degraded', { lastSuccessAt: '2030-01-01T00:00:00.000Z' });
+  await new Promise((r) => setTimeout(r, 10));
+  const b = dom.byId.get('zca-badge');
+  assert.ok(b.classList.contains('zca-h-degraded'));
+  assert.ok(!b.classList.contains('zca-h-ok'), '降级不得显示为正常');
+});
+
+test('inject.js：接口失败/无数据 → unknown（绝不显绿）', async () => {
+  // 后端返回 ok:false（例如 controller 未就绪）
+  const domFail = runInject({ fetch: async () => ({ json: async () => ({ ok: false }) }) });
+  await new Promise((r) => setTimeout(r, 10));
+  const b1 = domFail.byId.get('zca-badge');
+  assert.ok(b1.classList.contains('zca-h-unknown'), 'ok:false 应为未知态');
+  assert.ok(!b1.classList.contains('zca-h-ok'), 'ok:false 绝不能显绿');
+
+  // 网络层抛错（外挂未运行）
+  const domThrow = runInject({ fetch: async () => { throw new Error('ECONNREFUSED'); } });
+  await new Promise((r) => setTimeout(r, 10));
+  const b2 = domThrow.byId.get('zca-badge');
+  assert.ok(b2.classList.contains('zca-h-unknown'), '网络失败应为未知态');
+  assert.ok(!b2.classList.contains('zca-h-ok'), '网络失败绝不能显绿');
+
+  // state='unknown'（信标陈旧）也必须是未知
+  const domUnknown = healthDom('unknown', null);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(domUnknown.byId.get('zca-badge').classList.contains('zca-h-unknown'));
+});
+
+test('inject.js：初始态为未知（未拿到数据前不得假定健康）', () => {
+  // fetch 永不 resolve：模拟健康接口尚未返回
+  const dom = runInject({ fetch: () => new Promise(() => {}) });
+  const b = dom.byId.get('zca-badge');
+  assert.ok(b.classList.contains('zca-h-unknown'), '建角标时默认未知，不能默认绿');
+});
+
+test('inject.js：角标重建后保留上一次已知健康态（不在轮询间隙闪回灰）', async () => {
+  const dom = healthDom('ok', { lastSuccessAt: '2030-01-01T00:00:00.000Z' });
+  await new Promise((r) => setTimeout(r, 10));
+  const b = dom.byId.get('zca-badge');
+  assert.ok(b.classList.contains('zca-h-ok'));
+
+  // 容器重建：角标被移除 → MutationObserver 回调触发重建
+  b.remove();
+  const mo = dom.observers[0];
+  assert.ok(mo && mo.cb, '应有 MutationObserver 回调');
+  mo.cb();
+  const rebuilt = dom.byId.get('zca-badge');
+  assert.ok(rebuilt, '应重建角标');
+  assert.ok(rebuilt.classList.contains('zca-h-ok'), '重建后应立即恢复已知的 ok 态，不闪回灰');
 });
