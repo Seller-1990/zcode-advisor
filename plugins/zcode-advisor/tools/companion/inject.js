@@ -73,8 +73,11 @@
  background:#1c1f26;color:#e6e8ec;border:1px solid #333842;border-radius:14px;padding:12px 14px 14px;
  box-shadow:0 14px 40px rgba(0,0,0,.45);font:12.5px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
 .zca-panel h3{margin:0 0 8px;font-size:13.5px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
-.zca-close{cursor:pointer;color:#8b94a3;font-size:15px;line-height:1;padding:4px 6px;border-radius:6px}
+.zca-close{cursor:pointer;color:#8b94a3;font-size:15px;line-height:1;padding:4px 6px;border-radius:6px;
+ background:transparent;border:0;font-family:inherit}
 .zca-close:hover{background:rgba(127,127,127,.16);color:#e6e8ec}
+.zca-close:focus-visible{outline:2px solid #3b82f6;outline-offset:1px}
+.zca-history-head:focus-visible{outline:2px solid #3b82f6;outline-offset:2px;border-radius:6px}
 .zca-label{display:block;margin:8px 0 3px;color:#8b94a3;font-size:12px}
 .zca-panel input,.zca-panel select{width:100%;box-sizing:border-box;padding:6px 8px;border-radius:8px;
  border:1px solid #333842;background:#242833;color:#e6e8ec;font-size:12.5px;outline:none}
@@ -126,6 +129,14 @@
 .zca-history-item[class*="ev-dropped"] .h-sev{color:#fca5a5}
 .zca-history-empty{color:#6b7280;font-size:12px;padding:4px 0}
 .zca-hint{color:#6b7280;font-size:11px;margin-top:8px}
+/* 健康图例：状态含义常驻可见，不让用户靠 hover 才知道灯的意思 */
+.zca-legend{display:flex;flex-wrap:wrap;gap:2px 10px;margin:0 0 8px}
+.zca-leg-item{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;color:#5f6774}
+.zca-leg-item.on{color:#e6e8ec}
+.zca-leg-dot{width:7px;height:7px;border-radius:50%;background:#8b94a3;opacity:.55;flex:0 0 auto}
+.zca-leg-ok .zca-leg-dot{background:#10b981;opacity:1}
+.zca-leg-degraded .zca-leg-dot{background:#f59e0b;opacity:1}
+.zca-leg-down .zca-leg-dot{background:#ef4444;opacity:1}
 /* 面板在窗口较矮时上移到输入框上方，避免被裁掉 */
 @media (max-height: 620px){.zca-panel{bottom:auto;top:64px;max-height:calc(100vh - 96px)}}
 `;
@@ -220,9 +231,13 @@
       }
       // 正文取用顺序：note 正文 > delivered 计数占位 > 事件名。
       const noteOf = (it) => String(it.note || (it.event === 'delivered' ? `已送达 ${it.count || ''} 条意见` : it.event || ''));
+      // ts/sev 也做 HTML 转义（不只 note）：二者虽来自本地 controller 固定产出，
+      // 但既然走 innerHTML 拼接，就不该默认「来源一定干净」——注入链防线应一致。
+      const escHtml = (v) => String(v).replace(/[&<>"']/g, (c) => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
       box.innerHTML = items.map((it) => {
-        const ts = fmtTs(it.ts);
-        const sev = it.severity || it.event || '-';
+        const ts = escHtml(fmtTs(it.ts));
+        const sev = escHtml(it.severity || it.event || '-');
         const cls = it.event === 'delivered' ? 'ev-delivered' : (String(it.event).startsWith('dropped') ? 'ev-dropped' : 'ev-queued');
         return `<div class="zca-history-item ${cls}">`
           + `<span class="h-ts">${ts}</span> <span class="h-sev">${sev}</span>`
@@ -253,8 +268,23 @@
   };
   // 非颜色编码：给每种状态一个字形，色觉障碍用户不依赖红/绿也能分辨。
   const HEALTH_GLYPH = { ok: '✓', degraded: '!', down: '✕', unknown: '?' };
+  // 短标签（图例用）：一个词的量级，比 HEALTH_TEXT 长句省地方
+  const HEALTH_SHORT = { ok: '正常', degraded: '降级', down: '异常', unknown: '未知' };
   let healthState = 'unknown';
   let healthDetail = '';
+
+  // 可见图例：把状态含义常驻在面板里，而不是只藏在角标 title（键盘/触屏用户拿不到 tooltip）。
+  // 当前态高亮，其余保持暗色——既解释「这盏灯什么意思」，又不喧宾夺主。
+  function paintLegend(state) {
+    const box = document.getElementById('zca-legend');
+    if (!box) return;
+    const s = HEALTH_STATES[state] ? state : 'unknown';
+    box.innerHTML = Object.keys(HEALTH_STATES).map((k) =>
+      `<span class="zca-leg-item${k === s ? ' on' : ''} zca-leg-${k}">`
+      + `<span class="zca-leg-dot"></span>${HEALTH_GLYPH[k]} ${HEALTH_SHORT[k]}</span>`
+    ).join('');
+    box.setAttribute('aria-label', `健康状态图例；当前：${HEALTH_SHORT[s]}`);
+  }
 
   function paintHealth(state, detail) {
     const b = document.getElementById('zca-badge');
@@ -270,6 +300,8 @@
     b.title = `ZCode Advisor｜${HEALTH_TEXT[s]}${healthDetail ? '｜' + healthDetail : ''}（点击打开设置）`;
     // 辅助技术：aria-label 必须携带健康态，否则屏幕阅读器用户对本次功能全无感知。
     b.setAttribute('aria-label', `ZCode Advisor 设置；健康状态：${HEALTH_TEXT[s]}${healthDetail ? '，' + healthDetail : ''}`);
+    // 面板内可见图例同步当前态（面板未开时为空操作）
+    paintLegend(s);
   }
 
   async function pollHealth() {
@@ -317,8 +349,8 @@
     apiSource = mode === 'zcode' ? 'zcode' : 'manual';
     const segZ = document.getElementById('zca-src-zcode');
     const segM = document.getElementById('zca-src-manual');
-    if (segZ) segZ.className = apiSource === 'zcode' ? 'on' : '';
-    if (segM) segM.className = apiSource === 'manual' ? 'on' : '';
+    if (segZ) { segZ.className = apiSource === 'zcode' ? 'on' : ''; segZ.setAttribute('aria-pressed', String(apiSource === 'zcode')); }
+    if (segM) { segM.className = apiSource === 'manual' ? 'on' : ''; segM.setAttribute('aria-pressed', String(apiSource === 'manual')); }
     const zsec = document.getElementById('zca-zcode-sec');
     const msec = document.getElementById('zca-manual-sec');
     if (zsec) zsec.style.display = apiSource === 'zcode' ? 'block' : 'none';
@@ -602,13 +634,14 @@
     const p = el('div', 'zca-panel');
     p.id = 'zca-panel';
     p.style.display = 'none';
-    // 对话框语义：屏幕阅读器需要知道这是模态面板，且 Esc 可关闭、打开时焦点进入。
+    // 对话框语义：屏幕阅读器需要知道这是设置面板，且 Esc 可关闭、打开时焦点进入。
+    // 不用 aria-modal="true"：本面板无遮罩、无焦点陷阱、背景仍可交互，宣称模态会误导 AT 用户。
     p.setAttribute('role', 'dialog');
-    p.setAttribute('aria-modal', 'true');
     p.setAttribute('aria-label', 'ZCode Advisor 顾问设置');
     p.innerHTML = `
-      <h3><span>顾问设置</span><span class="zca-close" id="zca-close">✕</span></h3>
-      <div class="zca-status" id="zca-status">读取中…</div>
+      <h3><span>顾问设置</span><button type="button" class="zca-close" id="zca-close" aria-label="关闭">✕</button></h3>
+      <div class="zca-status" id="zca-status" role="status" aria-live="polite">读取中…</div>
+      <div class="zca-legend" id="zca-legend" title="健康灯含义"></div>
       <div class="zca-toggle-row">
         <label class="zca-switch" title="新会话是否自动启用审查">
           <input type="checkbox" id="zca-enabled">
@@ -616,53 +649,54 @@
           <span class="zca-switch-text">启用顾问</span>
         </label>
       </div>
-      <label class="zca-label">API 来源</label>
-      <div class="zca-seg" id="zca-apiSource">
-        <button type="button" id="zca-src-zcode" title="读取并使用 ZCode 设置里已维护的第三方 API，一处维护两处生效">ZCode 已维护</button>
-        <button type="button" id="zca-src-manual" title="在本面板手动维护端点 / key / 模型">手动维护</button>
+      <label class="zca-label" title="顾问用哪个 API 做审查：复用 ZCode 里已维护的，或在本面板单独填">API 来源</label>
+      <div class="zca-seg" id="zca-apiSource" role="group" aria-label="API 来源">
+        <button type="button" id="zca-src-zcode" aria-pressed="false" title="复用 ZCode 设置里已维护的服务商，一处维护两处生效">ZCode 已维护</button>
+        <button type="button" id="zca-src-manual" aria-pressed="false" title="在本面板单独填写端点 / key / 模型">手动维护</button>
       </div>
       <div id="zca-zcode-sec" style="display:none">
-        <label class="zca-label">服务商（来自 ZCode 设置）</label>
+        <label class="zca-label" title="来自 ZCode 设置里已维护的服务商">服务商</label>
         <select id="zca-zcode-provider"><option value="">（载入中…）</option></select>
         <label class="zca-label">模型</label>
         <select id="zca-zcode-model"><option value="">（选择服务商后填充）</option></select>
         <div class="zca-hint" id="zca-zcode-endpoint"></div>
       </div>
       <div id="zca-manual-sec">
-        <label class="zca-label">端点（OpenAI 兼容，支持第三方）</label>
+        <label class="zca-label" title="服务商给你的 OpenAI 兼容接口地址">端点</label>
         <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">
         <label class="zca-label">API key</label>
         <input id="zca-apiKey" type="password" placeholder="留空 = 不修改已保存的 key">
-        <div class="zca-hint">清除已保存的 key 不在本面板：请到 zcode-advisor 源码目录打开本地配置面板（Windows 双击「配置面板.cmd」，macOS 运行 node tools/setup-server.js），再点「清除 API key」</div>
-        <label class="zca-label">审查模型（先点「拉取模型」，或直接手动输入）</label>
+        <label class="zca-label" title="点「拉取模型」自动列出；拉不到就手动填">审查模型</label>
         <select id="zca-model">
           <option value="">（尚未拉取，请在下方手动输入）</option>
         </select>
-        <input id="zca-model-manual" placeholder="或手动输入模型 id（拉取不到时用）" style="margin-top:6px">
+        <input id="zca-model-manual" placeholder="模型 id（拉不到列表时手填）" style="margin-top:6px">
       </div>
       <details class="zca-adv" id="zca-adv">
-        <summary>高级（审查模式 · max_tokens）</summary>
-        <label class="zca-label">审查模式</label>
-        <select id="zca-reviewMode">
-          <option value="async">async（默认：意见随下一条消息送达）</option>
-          <option value="sync">sync（当轮打断：concern/blocker 立即送达）</option>
+        <summary>高级</summary>
+        <label class="zca-label" title="意见何时送达：下一轮附带，或当轮立即打断">审查模式</label>
+        <select id="zca-reviewMode" title="async：意见随下一条消息送达（默认）｜sync：concern/blocker 当轮立即打断">
+          <option value="async">async</option>
+          <option value="sync">sync</option>
         </select>
-        <label class="zca-label">max_tokens（思考型模型建议 4096）</label>
+        <div class="zca-hint">async：随下一条消息送达（默认）｜sync：concern/blocker 当轮打断</div>
+        <label class="zca-label" title="单次审查输出的上限；思考型模型建议 4096">max_tokens</label>
         <input id="zca-maxTokens" type="number" min="64" max="16384">
+        <div class="zca-hint">清除已保存的 key 不在此面板：请用项目里的「配置面板」（macOS：node tools/setup-server.js），再点「清除 API key」</div>
       </details>
       <div class="zca-row">
         <button class="zca-btn" id="zca-save">保存</button>
-        <button class="zca-btn alt" id="zca-ping">Ping</button>
+        <button class="zca-btn alt" id="zca-ping" title="测一下当前配置的端点能否正常返回">测试连接</button>
         <button class="zca-btn alt" id="zca-models">拉取模型</button>
       </div>
-      <div class="zca-msg" id="zca-msg"></div>
+      <div class="zca-msg" id="zca-msg" role="status" aria-live="polite"></div>
       <div class="zca-history" id="zca-history">
-        <div class="zca-history-head" id="zca-history-head">
-          <span>📜 顾问意见记录</span><span id="zca-history-arrow">▸</span>
+        <div class="zca-history-head" id="zca-history-head" role="button" tabindex="0" aria-expanded="false" title="展开/收起最近的顾问意见">
+          <span>顾问意见记录</span><span id="zca-history-arrow">▸</span>
         </div>
         <div class="zca-history-body" id="zca-history-body"></div>
       </div>
-      <div class="zca-hint" style="margin-top:8px">保存后下一轮审查即生效；意见以 [advisor:*] 前缀随下一条消息送达。</div>
+      <div class="zca-hint" style="margin-top:8px" title="意见会以下一条消息附带的形式送达，供参考">保存后下一轮生效</div>
     `;
     document.body.appendChild(p);
     const closePanel = () => { p.style.display = 'none'; };
@@ -681,11 +715,17 @@
     const body = p.querySelector('#zca-history-body');
     const arrow = p.querySelector('#zca-history-arrow');
     let historyLoaded = false;
-    head.addEventListener('click', () => {
+    const toggleHistory = () => {
       const open = body.style.display === 'block';
       body.style.display = open ? 'none' : 'block';
       arrow.textContent = open ? '▸' : '▾';
+      head.setAttribute('aria-expanded', String(!open));
       if (!open && !historyLoaded) { historyLoaded = true; fetchHistory(); }
+    };
+    head.addEventListener('click', toggleHistory);
+    // 键盘可达：头部是 role=button + tabindex=0，Enter/Space 必须等价于点击（否则键盘用户开不了历史）
+    head.addEventListener('keydown', (ev) => {
+      if (ev && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); toggleHistory(); }
     });
     return p;
   }
@@ -768,6 +808,8 @@
       panel.style.display = show ? 'block' : 'none';
       if (show) {
         refreshStatus();
+        // 打开面板时把已知健康态同步到图例（图例元素此时才存在）
+        paintLegend(healthState);
         // 焦点管理：打开时把焦点移入面板首个可聚焦控件，键盘用户不必 Tab 穿越宿主 UI
         const first = panel.querySelector('#zca-enabled') || panel.querySelector('#zca-close');
         if (first && typeof first.focus === 'function') { try { first.focus(); } catch (_) {} }

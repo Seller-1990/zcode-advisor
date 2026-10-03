@@ -75,18 +75,34 @@ function makeDom() {
     set innerHTML(html) {
       this._html = String(html);
       this._qsa = null;   // innerHTML 变了，类选择器缓存作废
-      const re = /<(\w+)([^>]*\bid="([^"]+)"[^>]*)>/g;
+      // 解析带 id 的标签，并把它的全部属性落到桩节点上（不只 id）——
+      // 否则 aria-*/role/title 这类属性在桩里不可见，相关断言测不到真东西。
+      const attrRe = /([\w:-]+)(?:="([^"]*)")?/g;
+      const tagRe = /<(\w+)([^>]*)>/g;
       let m;
-      while ((m = re.exec(this._html)) !== null) {
+      while ((m = tagRe.exec(this._html)) !== null) {
         const tag = m[1];
-        const id = m[3];
+        const attrs = m[2] || '';
+        const parsed = {};
+        let a;
+        attrRe.lastIndex = 0;
+        while ((a = attrRe.exec(attrs)) !== null) {
+          if (a[1] && a[1] !== '/') parsed[a[1]] = a[2] === undefined ? '' : a[2];
+        }
+        const id = parsed.id;
+        if (!id) continue;
         if (!byId.has(id)) {
           const child = new El(tag);
-          child.id = id;
           child._parent = this;
           this.children.push(child);
           byId.set(id, child);
         }
+        const child = byId.get(id);
+        for (const [k, v] of Object.entries(parsed)) {
+          child.setAttribute(k, v);
+        }
+        // setAttribute 已处理 id/class；tagName 也保真（脚本按 tagName 区分控件类型）
+        child.tagName = String(tag).toUpperCase();
       }
     }
     get innerHTML() { return this._html || ''; }
@@ -978,4 +994,65 @@ test('inject.js：令牌轮换时断开旧 MutationObserver（防跨代叠加回
   dom.window.__zcodeAdvisorToken = 'stale-token';
   const dom2 = runInject({ reuse: dom, token: 'new-token' });
   assert.ok(firstObserver.observed === null, '旧 observer 必须被 disconnect，否则会回写旧状态');
+});
+
+// ---------------- UI 精简（文案压缩 + 悬浮说明 + a11y 补齐） ----------------
+// 用户诉求：面板尽量简洁、说明文字精简、可挪到悬浮显示。但「改悬浮」不能以
+// a11y 为代价——title 对键盘/触屏/屏幕阅读器不可靠，故关键语义必须有非 hover 载体。
+// 这三条锁住本次精简的底线。
+
+test('inject.js：高级区把 async/sync 差异做成常驻 hint（不只藏在 option/title 里）', () => {
+  const dom = runInject();
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  const p = dom.byId.get('zca-panel');
+  // option 文本已精简为纯 async/sync；差异说明必须在可见处（原生 select 不渲染 option title）
+  const opt = p.innerHTML.match(/<option value="async"[^>]*>([^<]*)<\/option>/);
+  assert.ok(opt, 'async 选项应存在');
+  assert.strictEqual(opt[1].trim(), 'async', 'option 文本应精简为纯 async');
+  assert.match(p.innerHTML, /zca-hint[^>]*>async：随下一条消息送达/, '差异说明应常驻可见（非 hover）');
+});
+
+test('inject.js：面板含可见健康图例（不让用户靠 hover 才知道灯的含义）', async () => {
+  const dom = runInject();
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  await new Promise((r2) => setTimeout(r2, 10));
+  const legend = dom.byId.get('zca-legend');
+  assert.ok(legend, '面板应有 #zca-legend 图例容器');
+  // 打开面板即渲染一次图例（paintLegend），四态短标签必须齐备且常驻可见
+  const html = legend.innerHTML || '';
+  for (const w of ['正常', '降级', '异常', '未知']) {
+    assert.match(html, new RegExp(w), `图例应含「${w}」（状态含义不能只藏在 title 里）`);
+  }
+});
+
+test('inject.js：历史区头部键盘可达（role/aria-expanded + Enter 可展开）', async () => {
+  const dom = historyDom([
+    { ts: '2030-01-01T02:03:04.000Z', event: 'delivered', count: 1, note: 'x' }
+  ]);
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  await new Promise((r2) => setTimeout(r2, 10));
+  const head = dom.byId.get('zca-history-head');
+  assert.strictEqual(head.getAttribute('role'), 'button', '历史头部应有 button 语义');
+  assert.strictEqual(head.getAttribute('aria-expanded'), 'false', '初始 aria-expanded=false');
+  const kd = head._listeners.keydown && head._listeners.keydown[0];
+  assert.ok(kd, '历史头部应支持键盘事件');
+  kd({ key: 'Enter', preventDefault() {} });
+  assert.strictEqual(head.getAttribute('aria-expanded'), 'true', 'Enter 展开后 aria-expanded 应为 true');
+});
+
+test('inject.js：分段控件带 aria-pressed（屏幕阅读器可知当前来源）', async () => {
+  const dom = runInject();
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  await new Promise((r2) => setTimeout(r2, 10));
+  const z = dom.byId.get('zca-src-zcode');
+  const m = dom.byId.get('zca-src-manual');
+  assert.ok(z.getAttribute('aria-pressed') !== null && m.getAttribute('aria-pressed') !== null,
+    '两个分段按钮都应带 aria-pressed 属性');
+  // 切到 zcode：两按钮 aria-pressed 必须互斥（切换后 SR 才知道当前来源）
+  z._listeners.click[0]();
+  assert.strictEqual(z.getAttribute('aria-pressed'), 'true', '选中项 aria-pressed=true');
+  assert.strictEqual(m.getAttribute('aria-pressed'), 'false', '未选中项 aria-pressed=false');
+  m._listeners.click[0]();
+  assert.strictEqual(z.getAttribute('aria-pressed'), 'false', '切回后原选中项应变 false');
+  assert.strictEqual(m.getAttribute('aria-pressed'), 'true', '新选中项应变 true');
 });
