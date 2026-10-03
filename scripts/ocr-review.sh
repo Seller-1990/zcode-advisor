@@ -42,7 +42,7 @@ if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
     HOLD_PID=""
     [ -f "$LOCK_INFO" ] && HOLD_PID="$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)"
     if [ -n "$HOLD_PID" ] && kill -0 "$HOLD_PID" 2>/dev/null; then
-      echo "[ocr-review] 已有评审在进行（pid $HOLD_PID），本次跳过以免重复消耗。"
+      echo "[ocr-review] 已有评审在进行（pid ${HOLD_PID}），本次跳过以免重复消耗。"
       echo "[ocr-review] 已有报告：$REPO_ROOT/.git/ocr-review-last.txt"
       echo "[ocr-review] 如需强制并行，设 OCR_REVIEW_FORCE=1"
       exit 0
@@ -122,7 +122,7 @@ fi
 
 # 代理当前模型：仅作避让提示（避免评审与编码代理抢同一个模型配额）
 AGENT_MODEL="$(tr -d '[:space:]' < "$AGENT_MODEL_FILE" 2>/dev/null || true)"
-[ -n "$AGENT_MODEL" ] && echo "（编码代理当前模型：$AGENT_MODEL，评审将优先使用其他 provider）"
+[ -n "$AGENT_MODEL" ] && echo "（编码代理当前模型：${AGENT_MODEL}，评审将优先使用其他 provider）"
 
 # 三级降级链：逐个尝试，第一个**产出有效 JSON** 的即采用
 CHAIN=(
@@ -187,7 +187,7 @@ for entry in "${CHAIN[@]}"; do
   provider="${entry%%|*}"
   model="${entry##*|}"
   if [ -n "$AGENT_MODEL" ] && [ "$model" = "$AGENT_MODEL" ]; then
-    echo "  跳过 $provider（$model 正被编码代理占用）"
+    echo "  跳过 ${provider}（$model 正被编码代理占用）"
     SKIPPED=$((SKIPPED + 1))
     [ "$SKIPPED" -eq "${#CHAIN[@]}" ] && SKIPPED_ALL=1
     continue
@@ -215,7 +215,7 @@ done
 
 if [ -z "$CHOSEN" ]; then
   if [ "$SKIPPED_ALL" = "1" ]; then
-    echo "错误：所有 provider 都因与编码代理同模型被跳过（agent-model=$AGENT_MODEL）。" >&2
+    echo "错误：所有 provider 都因与编码代理同模型被跳过（agent-model=${AGENT_MODEL}）。" >&2
     echo "      可临时指定：ocr review --provider <p> --model <m>" >&2
   else
     echo "错误：三级 provider 全部失败，未产生有效评审结果。" >&2
