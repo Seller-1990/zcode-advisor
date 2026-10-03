@@ -206,11 +206,13 @@ test('配置写入：含 apiKey 的落盘收紧到 0600', () => {
   assert.match(body, /0o600|0o700/, 'saveUserConfig 应设置 0o600/0o700（配置含明文 apiKey）');
 });
 
-test('面板开关：refreshStatus 回填 zca-enabled（防"保存即静默关闭顾问"）', () => {
+test('面板开关：refreshStatus 回填会话启用开关（防"打开面板即误关"）', () => {
   const src = read('tools/companion/inject.js');
   const fnStart = src.indexOf('async function refreshStatus');
   const body = src.slice(fnStart, src.indexOf('\n  }', fnStart));
-  assert.match(body, /zca-enabled/, 'refreshStatus 必须回填顾问总开关，否则默认未勾选会被保存为 false');
+  // 0.2.15 起开关是会话级（zca-session-enabled，初始态来自 /api/session）——
+  // 不变量不变：必须回填，否则默认未勾选会被一次误触停用。
+  assert.match(body, /zca-session-enabled/, 'refreshStatus 必须回填会话启用开关');
 });
 
 test('配置锁协议：config-bridge 与 controller 的 vendored 双副本一致（防协议漂移复活丢更新）', () => {

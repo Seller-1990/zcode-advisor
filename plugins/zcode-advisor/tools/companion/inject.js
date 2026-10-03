@@ -102,19 +102,8 @@
 .zca-switch input:checked ~ .zca-track{background:#2563eb}
 .zca-switch input:checked ~ .zca-track .zca-thumb{left:15px}
 .zca-switch-text{font-size:12.5px;font-weight:500;color:#e6e8ec}
-/* API 来源分段切换：ZCode 已维护 / 手动维护 */
-.zca-seg{display:flex;background:#242833;border-radius:8px;padding:2px;gap:2px;margin-top:2px}
-.zca-seg button{flex:1;padding:6px 0;border:0;border-radius:6px;background:transparent;color:#8b94a3;
- font-size:12px;cursor:pointer;transition:background .12s,color .12s}
-.zca-seg button.on{background:#2563eb;color:#fff}
-.zca-seg button:not(.on):hover{color:#e6e8ec;background:rgba(127,127,127,.12)}
-/* 高级区折叠：审查模式/max_tokens 低频项，折起以压缩默认占地 */
-.zca-adv{margin-top:10px;border-top:1px solid #333842;padding-top:6px}
-.zca-adv summary{cursor:pointer;color:#8b94a3;font-size:12px;user-select:none;list-style:none}
-.zca-adv summary::-webkit-details-marker{display:none}
-.zca-adv summary::before{content:'▸ ';}
-.zca-adv[open] summary::before{content:'▾ ';}
-.zca-adv summary:hover{color:#e6e8ec}
+/* API 来源分段（zca-seg）与高级折叠（zca-adv）样式已随全局配置控件移入
+   tools/companion/panel.cjs（0.2.15 角标瘦身）——本页只保留会话级控制。 */
 /* 历史记录区：折叠展示，展开后只读最近若干条 */
 .zca-history{margin-top:10px;border-top:1px solid #333842;padding-top:8px}
 .zca-history-head{display:flex;justify-content:space-between;align-items:center;cursor:pointer;color:#8b94a3;font-size:12px;user-select:none}
@@ -229,7 +218,7 @@
     if (!box) return;
     try {
       const r = await api('/api/history');
-      const items = (r && r.ok && Array.isArray(r.history)) ? r.history : [];
+      const items = (r && r.ok && Array.isArray(r.history)) ? r.history.slice(0, 10) : []; // 0.2.15 精简：只看最近 10 条
       if (items.length === 0) {
         box.innerHTML = '<div class="zca-history-empty">暂无记录——顾问意见产生后会出现在这里</div>';
         return;
@@ -342,115 +331,11 @@
     }
   }
 
-  // 面板运行期状态：
-  // curCfg — refreshStatus 拉到的已存配置（zcode 模式下服务商/模型预选的依据）
-  // zcodeProviders — /api/zcode-providers 缓存；null = 尚未拉取
-  // apiSource — 当前「API 来源」分段选择（manual | zcode）
+  // 面板运行期状态（0.2.15 瘦身后只保留会话级控制）：
+  // curCfg — /api/config 的已存**全局**配置（状态行展示用，不再提供编辑控件）
+  // session — /api/session 的最近活动会话快照（enabled / sessionModel）
   let curCfg = null;
-  let zcodeProviders = null;
-  let apiSource = 'manual';
-
-  function setApiSource(mode) {
-    apiSource = mode === 'zcode' ? 'zcode' : 'manual';
-    const segZ = document.getElementById('zca-src-zcode');
-    const segM = document.getElementById('zca-src-manual');
-    if (segZ) { segZ.className = apiSource === 'zcode' ? 'on' : ''; segZ.setAttribute('aria-pressed', String(apiSource === 'zcode')); }
-    if (segM) { segM.className = apiSource === 'manual' ? 'on' : ''; segM.setAttribute('aria-pressed', String(apiSource === 'manual')); }
-    const zsec = document.getElementById('zca-zcode-sec');
-    const msec = document.getElementById('zca-manual-sec');
-    if (zsec) zsec.style.display = apiSource === 'zcode' ? 'block' : 'none';
-    if (msec) msec.style.display = apiSource === 'manual' ? 'block' : 'none';
-    const modelsBtn = document.getElementById('zca-models');
-    if (modelsBtn) modelsBtn.style.display = apiSource === 'manual' ? '' : 'none';
-    // zcode 模式首次进入才拉服务商列表（之后用缓存；切回再进也不重复请求）
-    if (apiSource === 'zcode' && !zcodeProviders) loadProviders();
-  }
-
-  async function loadProviders() {
-    const sel = document.getElementById('zca-zcode-provider');
-    if (!sel) return;
-    try {
-      const r = await api('/api/zcode-providers');
-      const list = (r && r.ok && Array.isArray(r.providers)) ? r.providers : [];
-      zcodeProviders = list;
-      const eligible = list.filter((p) => p.eligible);
-      sel.innerHTML = '';
-      if (list.length === 0) {
-        const o = document.createElement('option');
-        o.value = '';
-        o.textContent = '（ZCode 里暂无服务商）';
-        sel.appendChild(o);
-      } else {
-        // 列出**全部**服务商（含非 OpenAI 兼容）——此前只列 eligible 的会让人以为
-        // "我维护的模型少了很多"（实测 40 个模型只显示 24 个）。不可用的标灰并注明原因，
-        // 让用户看到全貌、理解为什么某些不能选，而不是静默消失。
-        for (const p of list) {
-          const o = document.createElement('option');
-          o.value = p.id;
-          const md = `${p.models.length} 模型`;
-          if (p.eligible) {
-            o.textContent = p.name ? `${p.name}（${md}）` : `${p.id}（${md}）`;
-          } else {
-            o.textContent = `${p.name || p.id}（${md} · 不支持：${p.kind || '未知协议'}）`;
-            o.disabled = true;   // 不可选：审查通道仅支持 OpenAI 兼容端点
-          }
-          sel.appendChild(o);
-        }
-      }
-      const want = curCfg && curCfg.zcodeProvider;
-      if (want && eligible.some((p) => p.id === want)) {
-        sel.value = want;
-      } else if (want && list.some((p) => p.id === want)) {
-        // 已存 provider 存在但非 OpenAI 兼容（被改成不支持协议）：提示但不静默改选。
-        sel.value = '';
-        msg('已存服务商在 ZCode 里不是 OpenAI 兼容协议，审查通道用不了。未替你改选；'
-          + '请重新选择服务商，或切回「手动维护」。', false);
-      } else if (want) {
-        // 已存 provider 不在 eligible 列表（被改成非兼容协议/已删除/仅 name 命中）：
-        // 保留空选项并提示，绝不静默改选别的服务商——否则用户只想改个模式，
-        // 保存时 formValues() 就会把新 provider 写回覆盖原选择。审查侧此时
-        // 会按 applyZcodeSource 回退手动配置，两边口径一致。
-        sel.value = '';
-        msg('已存服务商在 ZCode 里不可用（非 OpenAI 兼容或已删除）。未替你改选；'
-          + '请手动选择服务商，或切回「手动维护」。', false);
-      } else {
-        sel.value = eligible.length > 0 ? eligible[0].id : '';
-      }
-      fillZcodeModels();
-    } catch (e) {
-      msg(`服务商列表载入失败：${e && e.message ? e.message : e}`, false);
-    }
-  }
-
-  function selectedProvider() {
-    const sel = document.getElementById('zca-zcode-provider');
-    const id = sel ? String(sel.value || '').trim() : '';
-    return (zcodeProviders || []).find((p) => p.id === id) || null;
-  }
-
-  function fillZcodeModels() {
-    const msel = document.getElementById('zca-zcode-model');
-    const hint = document.getElementById('zca-zcode-endpoint');
-    if (!msel) return;
-    const p = selectedProvider();
-    msel.innerHTML = '';
-    for (const id of (p ? p.models : [])) {
-      const o = document.createElement('option');
-      o.value = id;
-      o.textContent = id;
-      msel.appendChild(o);
-    }
-    if (!p || p.models.length === 0) {
-      const o = document.createElement('option');
-      o.value = '';
-      o.textContent = '（该服务商未配置模型）';
-      msel.appendChild(o);
-    }
-    const want = curCfg && curCfg.zcodeModel;
-    if (want && p && p.models.includes(want)) msel.value = want;
-    else if (p && p.models.length > 0) msel.value = p.models[0]; // 显式设首项：真实 DOM 会自动选中，但显式赋值让行为不依赖该默认
-    if (hint) hint.textContent = p ? `端点：${p.baseURL || '（该服务商未配置 baseURL）'}` : '先在 ZCode 设置里添加 OpenAI 兼容服务商';
-  }
+  let session = null;
 
   async function refreshStatus() {
     try {
@@ -468,169 +353,61 @@
         );
         return;
       }
-      const c = r.config;
-      curCfg = c;
+      curCfg = r.config;
+      // 会话快照失败不阻断状态行（旧版 controller 无此接口时按未知处理）
+      try {
+        const s = await api('/api/session');
+        session = (s && s.ok) ? s : null;
+      } catch (_) { session = null; }
+      const c = curCfg;
       const st = document.getElementById('zca-status');
-      // zcode 模式下实际生效的是服务商端点/模型/key（审查通道按 apiSource 解析），
-      // 展示手动字段会误导（手动 key 常为「未设置」，但审查照样能用服务商 key）。
+      // 状态行只读展示：当前生效模型 + 归属（会话覆盖 > 全局）+ API 来源 + 会话标注。
+      // 多会话并行的归属语义：session 是「最近活动的会话」，controller 感知不到焦点，
+      // 必须把会话 id 短码亮出来，避免用户把别的会话的开关/模型当成自己的。
       if (st) {
         const zcode = c.apiSource === 'zcode';
-        const modelShown = zcode ? (c.zcodeModel || '（服务商默认）') : (c.model || '（默认）');
-        const keyShown = zcode ? '服务商 key' : c.keyMasked;
-        st.textContent = `模型 ${modelShown} ｜ key ${keyShown} ｜ 模式 ${c.reviewMode || 'async'} ｜ 来源 ${zcode ? 'ZCode' : '手动'}`;
+        const globalModel = zcode ? (c.zcodeModel || '（服务商默认）') : (c.model || '（默认）');
+        const sessionModel = session && session.hasSession ? String(session.sessionModel || '') : '';
+        const modelShown = sessionModel ? `${sessionModel}（本会话覆盖）` : globalModel;
+        const srcShown = zcode ? 'ZCode 已维护' : '手动';
+        const sid = session && session.hasSession && session.sessionId
+          ? ` ｜ 会话 ${String(session.sessionId).replace(/^sess_/, '').slice(0, 8)}` : '';
+        st.textContent = `模型 ${modelShown} ｜ 模式 ${c.reviewMode || 'async'} ｜ 来源 ${srcShown}${sid}`;
       }
-      const f = fill();
-      if (f) {
-        // 模型值回填到下拉框：若 select 里没有该 id（尚未拉取或列表不含它），
-        // 就补一个条目，保证当前配置可见且保存时不会被静默改掉。
-        if (c.model) {
-          const sel = f.model;
-          if (sel && !Array.from(sel.options || []).some((o) => o.value === c.model)) {
-            const o = document.createElement('option');
-            o.value = c.model;
-            o.textContent = c.model;
-            sel.appendChild(o);
-          }
-          if (sel) sel.value = c.model;
-        }
-        if (c.baseUrl) f.baseUrl.value = c.baseUrl;
-        if (c.reviewMode) f.reviewMode.value = c.reviewMode;
-        if (c.maxTokens) f.maxTokens.value = c.maxTokens;
-        // 回填顾问总开关：**必须回填**——checkbox 默认未勾选，
-        // 若不回填，用户打开面板看到"未启用"、一点保存就把顾问静默关掉。
-        const enEl = document.getElementById('zca-enabled');
-        if (enEl) enEl.checked = c.enabled !== false;
+      // 会话启用开关初始态：必须回填，否则用户打开面板看到"未启用"、一点就静默停用
+      const en = document.getElementById('zca-session-enabled');
+      if (en) en.checked = session ? session.enabled !== false : true;
+      // 开关旁的会话标注：无会话数据时置灰提示
+      const hint = document.getElementById('zca-session-hint');
+      if (hint) {
+        hint.textContent = (!session || !session.hasSession)
+          ? '暂无活动会话（先在 ZCode 里跑一轮对话）'
+          : (session.sessionModel ? `本会话已临时换模型：/advisor-model set <id> 可更改，reset 恢复全局` : '全局配置与模型请点「完整配置」；会话临时换模型用 /advisor-model set <id>');
       }
-      // API 来源分段 + zcode 服务商/模型预选（loadProviders 异步取 curCfg，先赋值再切换）
-      setApiSource(c.apiSource === 'zcode' ? 'zcode' : 'manual');
     } catch (err) {
       // 网络层失败才可能是"外挂未运行"；此时把原因也带上，便于排查
       msg(`无法连接本机 controller（外挂未运行？）：${err && err.message ? err.message : err}`, false);
     }
   }
 
-  function fill() {
-    const g = (id) => document.getElementById(id);
-    if (!g('zca-baseUrl')) return null;
-    return { baseUrl: g('zca-baseUrl'), apiKey: g('zca-apiKey'), model: g('zca-model'),
-      reviewMode: g('zca-reviewMode'), maxTokens: g('zca-maxTokens') };
-  }
-
-  // 当前选中的审查模型 id：以下拉框为准，回落到手动输入框。
-  // 两个控件并存是因为 <select> 只能列出已拉取到的模型，而用户也可能想手填
-  // 一个列表里没有的 id（该端点不支持 /models 时只能手填）。
-  function currentModelId() {
-    const sel = document.getElementById('zca-model');
-    const manual = document.getElementById('zca-model-manual');
-    const fromSelect = sel && sel.value ? String(sel.value).trim() : '';
-    const fromManual = manual && manual.value ? String(manual.value).trim() : '';
-    return fromSelect || fromManual;
-  }
-
-  function formValues() {
-    const out = { apiSource };
-    const f = fill();
-    // 审查模式 / max_tokens 与 API 来源无关：两个模式下都保存
-    if (f) {
-      const mt = parseInt(f.maxTokens.value, 10);
-      if (Number.isFinite(mt)) out.maxTokens = mt;
-      const rm = String(f.reviewMode.value || '').trim();
-      if (rm) out.reviewMode = rm;
+  async function toggleSession(checked) {
+    try {
+      const r = await api('/api/session-toggle', { enabled: checked });
+      if (r && r.ok) {
+        msg(checked
+          ? '本会话已启用（自下一轮审查起生效）'
+          : '本会话已停用（不影响其他会话；重新开启用本开关或 /advisor-on）', true);
+      } else {
+        msg('切换失败：' + (r && (r.hint || r.error) || '未知'), false);
+        // 失败回滚开关到真实状态
+        const en = document.getElementById('zca-session-enabled');
+        if (en) en.checked = !checked;
+      }
+    } catch (e) {
+      msg('切换失败：' + (e && e.message ? e.message : e), false);
+      const en = document.getElementById('zca-session-enabled');
+      if (en) en.checked = !checked;
     }
-    if (apiSource === 'manual') {
-      if (f) {
-        const baseUrl = f.baseUrl.value.trim();
-        if (baseUrl) out.baseUrl = baseUrl;
-        const key = f.apiKey.value.trim();
-        if (key) out.apiKey = key;
-        // 模型取自 select（或手动输入兜底）
-        const model = currentModelId();
-        if (model) out.model = model;
-      }
-    } else {
-      // zcode 模式：不回传手动字段（保留既有手动配置，回切时仍可用）
-      const pv = document.getElementById('zca-zcode-provider');
-      const mv = document.getElementById('zca-zcode-model');
-      if (pv && String(pv.value || '').trim()) out.zcodeProvider = String(pv.value).trim();
-      if (mv && String(mv.value || '').trim()) out.zcodeModel = String(mv.value).trim();
-    }
-    const en = document.getElementById('zca-enabled');
-    if (en) out.startEnabled = en.checked;
-    return out;
-  }
-
-  async function save() {
-    try {
-      const r = await api('/api/config', formValues());
-      msg(r.ok ? `已保存（${r.file}）—— 下一轮审查即生效` : `保存失败：${r.error}`, r.ok);
-      refreshStatus();
-    } catch (e) { msg('保存失败：' + e, false); }
-  }
-
-  async function ping() {
-    try {
-      msg('Ping 中…', true);
-      const r = await api('/api/ping', formValues());
-      msg(r.ok ? `Ping OK（${r.ms}ms）— 端点可达、认证与模型有效${r.note || ''}` : `Ping 失败 → ${r.error}${r.hint ? '：' + r.hint : ''}`, r.ok);
-    } catch (e) { msg('Ping 失败：' + e, false); }
-  }
-
-  async function fetchModels() {
-    // zcode 模式的模型清单来自服务商数据（打开分段时已填充），不请求端点 /models
-    if (apiSource === 'zcode') return;
-    try {
-      msg('拉取模型列表…', true);
-      const f = fill();
-      // fill() 在所有面板字段缺失时返回 null；任一字段缺失也会让后续 .value 抛错。
-      // 早期实现直接展开使用，一旦面板被宿主部分重置就报 "Cannot read properties of undefined"。
-      if (!f || !f.baseUrl || !f.apiKey) {
-        msg('拉取失败：面板未正确初始化，请关闭后重新打开设置面板', false);
-        return;
-      }
-      const r = await api('/api/models', { baseUrl: f.baseUrl.value.trim(), apiKey: f.apiKey.value.trim() });
-      if (!r.ok) {
-        msg(`拉取失败：${r.error} —— 该端点可能不提供 /models，请在下方“或手动输入”里填写模型 id`, false);
-        return;
-      }
-      // 模型控件是原生 <select>。为什么不用 <input list=datalist>：
-      // 实测 Chromium 对 datalist 的下拉只能由**真实用户手势**触发
-      // （程序化 input.showPicker() 报 NotAllowedError: requires a user gesture），
-      // 且下拉提示很弱，用户表现为"点不动/拉不下来"。原生 select 点击必定展开。
-      const sel = document.getElementById('zca-model');
-      if (!sel) {
-        msg('拉取失败：模型控件缺失（面板未正确初始化）', false);
-        return;
-      }
-      const current = currentModelId();
-      sel.innerHTML = '';
-      for (const id of r.models) {
-        const o = document.createElement('option');
-        o.value = id;
-        o.textContent = id;
-        sel.appendChild(o);
-      }
-      // 当前模型不在拉取到的列表里（例如手动填过、或端点的 /models 不含它）时：
-      // 把它作为首项保留并**选中它**，不能改用列表首项——否则用户已配置的模型
-      // 会被静默替换掉（保存后审查模型就变了）。此时也不清空手动输入，避免两边不一致。
-      const preserved = current && !r.models.includes(current);
-      if (preserved) {
-        const o = document.createElement('option');
-        o.value = current;
-        o.textContent = `${current}（当前，不在列表中）`;
-        sel.insertBefore(o, sel.firstChild);
-      }
-      sel.value = preserved ? current : (r.models.includes(current) ? current : (r.models[0] || ''));
-      if (!preserved) {
-        const manual = document.getElementById('zca-model-manual');
-        if (manual) manual.value = '';
-      }
-      msg(
-        preserved
-          ? `已拉取 ${r.models.length} 个模型，但当前模型 ${current} 不在列表中，已保留原选择`
-          : `已拉取 ${r.models.length} 个模型，请在上方下拉框中选择`,
-        true
-      );
-    } catch (e) { msg('拉取失败：' + e, false); }
   }
 
   function buildPanel() {
@@ -644,56 +421,19 @@
     p.setAttribute('role', 'dialog');
     p.setAttribute('aria-label', 'ZCode Advisor 顾问设置');
     p.innerHTML = `
-      <h3><span>顾问设置</span><button type="button" class="zca-close" id="zca-close" aria-label="关闭">✕</button></h3>
+      <h3><span>顾问</span><button type="button" class="zca-close" id="zca-close" aria-label="关闭">✕</button></h3>
       <div class="zca-status" id="zca-status" role="status" aria-live="polite">读取中…</div>
       <div class="zca-legend" id="zca-legend" title="健康灯含义"></div>
       <div class="zca-toggle-row">
-        <label class="zca-switch" title="新会话是否自动启用审查">
-          <input type="checkbox" id="zca-enabled">
+        <label class="zca-switch" title="只作用于最近活动的会话，不影响其他会话">
+          <input type="checkbox" id="zca-session-enabled">
           <span class="zca-track"><span class="zca-thumb"></span></span>
-          <span class="zca-switch-text">启用顾问</span>
+          <span class="zca-switch-text">启用顾问（本会话）</span>
         </label>
       </div>
-      <label class="zca-label" title="顾问用哪个 API 做审查：复用 ZCode 里已维护的，或在本面板单独填">API 来源</label>
-      <div class="zca-seg" id="zca-apiSource" role="group" aria-label="API 来源">
-        <button type="button" id="zca-src-zcode" aria-pressed="false" title="复用 ZCode 设置里已维护的服务商，一处维护两处生效">ZCode 已维护</button>
-        <button type="button" id="zca-src-manual" aria-pressed="false" title="在本面板单独填写端点 / key / 模型">手动维护</button>
-      </div>
-      <div id="zca-zcode-sec" style="display:none">
-        <label class="zca-label" title="来自 ZCode 设置里已维护的服务商">服务商</label>
-        <select id="zca-zcode-provider"><option value="">（载入中…）</option></select>
-        <label class="zca-label">模型</label>
-        <select id="zca-zcode-model"><option value="">（选择服务商后填充）</option></select>
-        <div class="zca-hint" id="zca-zcode-endpoint"></div>
-      </div>
-      <div id="zca-manual-sec">
-        <label class="zca-label" title="服务商给你的 OpenAI 兼容接口地址">端点</label>
-        <input id="zca-baseUrl" placeholder="https://…/v1 或 …/chat/completions">
-        <label class="zca-label">API key</label>
-        <input id="zca-apiKey" type="password" placeholder="留空 = 不修改已保存的 key">
-        <label class="zca-label" title="点「拉取模型」自动列出；拉不到就手动填">审查模型</label>
-        <select id="zca-model">
-          <option value="">（尚未拉取，请在下方手动输入）</option>
-        </select>
-        <input id="zca-model-manual" placeholder="模型 id（拉不到列表时手填）" style="margin-top:6px">
-      </div>
-      <details class="zca-adv" id="zca-adv">
-        <summary>高级</summary>
-        <div class="zca-hint" title="仅当前会话生效，优先于这里的全局模型；reset 恢复全局模型">会话级临时换模型：在会话里运行 /advisor-model set &lt;模型id&gt;（reset 恢复全局）</div>
-        <label class="zca-label" title="意见何时送达：下一轮附带，或当轮立即打断">审查模式</label>
-        <select id="zca-reviewMode" title="async：意见随下一条消息送达（默认）｜sync：concern/blocker 当轮立即打断">
-          <option value="async">async</option>
-          <option value="sync">sync</option>
-        </select>
-        <div class="zca-hint">async：随下一条消息送达（默认）｜sync：concern/blocker 当轮打断</div>
-        <label class="zca-label" title="单次审查输出的上限；思考型模型建议 4096">max_tokens</label>
-        <input id="zca-maxTokens" type="number" min="64" max="16384">
-        <div class="zca-hint">清除已保存的 key 不在此面板：请用项目里的「配置面板」（macOS：node tools/setup-server.js），再点「清除 API key」</div>
-      </details>
+      <div class="zca-hint" id="zca-session-hint" style="margin-top:6px"></div>
       <div class="zca-row">
-        <button class="zca-btn" id="zca-save">保存</button>
-        <button class="zca-btn alt" id="zca-ping" title="测一下当前配置的端点能否正常返回">测试连接</button>
-        <button class="zca-btn alt" id="zca-models">拉取模型</button>
+        <button class="zca-btn" id="zca-fullpanel" title="全局配置（API 来源 / 端点 / key / 全局模型 / 拉取模型 / Ping）在浏览器中打开">完整配置…</button>
       </div>
       <div class="zca-msg" id="zca-msg" role="status" aria-live="polite"></div>
       <div class="zca-history" id="zca-history">
@@ -709,12 +449,12 @@
     p.querySelector('#zca-close').addEventListener('click', closePanel);
     // Esc 关闭（对话框惯例）：键盘用户不必去够右上角小叉
     p.addEventListener('keydown', (ev) => { if (ev && ev.key === 'Escape') closePanel(); });
-    p.querySelector('#zca-save').addEventListener('click', save);
-    p.querySelector('#zca-ping').addEventListener('click', ping);
-    p.querySelector('#zca-models').addEventListener('click', fetchModels);
-    p.querySelector('#zca-src-zcode').addEventListener('click', () => setApiSource('zcode'));
-    p.querySelector('#zca-src-manual').addEventListener('click', () => setApiSource('manual'));
-    p.querySelector('#zca-zcode-provider').addEventListener('change', fillZcodeModels);
+    p.querySelector('#zca-session-enabled').addEventListener('change', (ev) => toggleSession(!!(ev && ev.target && ev.target.checked)));
+    // 完整配置：全局配置的唯一 GUI 载体（宿主不渲染插件设置表单，见 panel.cjs 头注释）。
+    // 令牌经 URL hash 传递：不进服务器日志、不落 referer（GET /panel 本身不含敏感数据）。
+    p.querySelector('#zca-fullpanel').addEventListener('click', () => {
+      try { window.open(`${API}/panel#${encodeURIComponent(TOKEN)}`); } catch (_) {}
+    });
 
     // 历史区：默认折叠；首次展开才拉取（后续展开用缓存，点头部可强制刷新）
     const head = p.querySelector('#zca-history-head');
@@ -832,7 +572,7 @@
         // 打开面板时把已知健康态同步到图例（图例元素此时才存在）
         paintLegend(healthState);
         // 焦点管理：打开时把焦点移入面板首个可聚焦控件，键盘用户不必 Tab 穿越宿主 UI
-        const first = panel.querySelector('#zca-enabled') || panel.querySelector('#zca-close');
+        const first = panel.querySelector('#zca-session-enabled') || panel.querySelector('#zca-close');
         if (first && typeof first.focus === 'function') { try { first.focus(); } catch (_) {} }
       }
     };

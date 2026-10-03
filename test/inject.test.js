@@ -323,14 +323,36 @@ test('inject.js：点击角标创建面板，面板带 zca-panel class', () => {
   assert.strictEqual(panel.className, 'zca-panel', '面板必须带 zca-panel class');
 });
 
-test('inject.js：面板含配置字段与操作按钮（端点/key/模型/模式/max_tokens + 保存/Ping/拉取）', () => {
+test('panel.cjs：完整配置面板接管全局配置控件（0.2.15 从角标迁出）', () => {
+  // 0.2.15 角标瘦身：全局配置（API 来源/端点/key/模型/模式/max_tokens/保存/Ping/拉取）
+  // 的 GUI 载体迁到 controller 的 GET /panel（tools/companion/panel.cjs）。
+  const PANEL = require('../tools/companion/panel.cjs');
+  for (const id of ['baseUrl', 'apiKey', 'model', 'modelManual', 'reviewMode', 'maxTokens',
+    'save', 'ping', 'fetchModels', 'zprovider', 'zmodel', 'zrefresh', 'zfetch',
+    'removeKey', 'msg', 'st', 'hist']) {
+    assert.ok(PANEL.includes(`id="${id}"`), `panel 应包含 #${id}`);
+  }
+  // 关键功能点：刷新服务商列表、从端点拉取模型（登记清单可能远小于端点真实可用集）、
+  // 令牌经 hash 传入（不进服务器日志）、会话级命令指引
+  assert.ok(PANEL.includes('/api/zcode-providers'), 'panel 应拉取服务商列表');
+  assert.ok(PANEL.includes('zcodeFetch'), 'panel 应支持从端点实时拉取模型');
+  assert.ok(PANEL.includes('location.hash'), 'panel 令牌应从 URL hash 读取');
+  assert.ok(PANEL.includes('/advisor-model'), 'panel 应给出会话级换模型命令指引');
+});
+
+test('inject.js：角标面板已瘦身（只含会话控制，不含全局配置控件）', () => {
   const dom = runInject();
   dom.byId.get('zca-badge')._listeners.click[0]();
   const panel = dom.byId.get('zca-panel');
   const html = panel.innerHTML;
+  for (const id of ['zca-status', 'zca-legend', 'zca-session-enabled', 'zca-session-hint',
+    'zca-fullpanel', 'zca-msg', 'zca-history', 'zca-close']) {
+    assert.ok(html.includes(id), `角标面板应包含 #${id}`);
+  }
+  // 瘦身断言：这些全局配置控件必须不在角标面板里（防止旧形态回潮）
   for (const id of ['zca-baseUrl', 'zca-apiKey', 'zca-model', 'zca-reviewMode', 'zca-maxTokens',
-    'zca-save', 'zca-ping', 'zca-models', 'zca-msg', 'zca-status', 'zca-close']) {
-    assert.ok(html.includes(id), `面板应包含 #${id}`);
+    'zca-save', 'zca-ping', 'zca-models', 'zca-apiSource']) {
+    assert.ok(!html.includes(id), `角标面板不应再包含 #${id}（已迁往 /panel 完整配置）`);
   }
 });
 
@@ -384,70 +406,7 @@ test('inject.js：API 地址与令牌由占位符注入（与 controller 的替�
 
 // ---------------- 模型下拉（datalist）回归 ----------------
 
-test('inject.js：fetchModels 把候选写入原生 select（回归：下拉拉不下来）', async () => {
-  // 回归背景一：早期实现把 <option> 塞进 <input list=datalist> 的 input 自身
-  //   —— input 不渲染子元素，候选从未生效。
-  // 回归背景二：改用 datalist 后仍不可用——实测 Chromium 对 datalist 的下拉
-  //   只能由真实用户手势触发（程序化 input.showPicker() 报
-  //   NotAllowedError: requires a user gesture），用户表现为"点不动"。
-  // 最终方案：原生 <select>（点击必定展开）+ 手动输入兜底。
-  const models = ['deepseek-v4.1-flash', 'glm-5.3'];
-  const fetchStub = async (url) => ({
-    json: async () => (String(url).includes('/api/models')
-      ? { ok: true, models }
-      : { ok: false })
-  });
 
-  const dom = runInject({ fetch: fetchStub });
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  const panel = dom.byId.get('zca-panel');
-
-  const btn = panel.querySelector('#zca-models');
-  assert.ok(btn, '面板应有拉取按钮');
-  await btn._listeners.click[0]();
-
-  // 关键断言：select 被填充为可选项，且是 SELECT 元素
-  const sel = dom.byId.get('zca-model');
-  assert.ok(sel, '应存在 #zca-model');
-  assert.strictEqual(sel.tagName, 'SELECT', '模型控件必须是原生 SELECT（datalist 下拉不可靠）');
-  const options = sel.children.filter((c) => c.tagName === 'OPTION');
-  assert.strictEqual(options.length, models.length, '候选应写入 select 的 option');
-  assert.deepStrictEqual(options.map((o) => o.value), models);
-
-  // 选中值应为候选之一
-  assert.ok(models.includes(sel.value), `select 值应为候选之一，实际 ${sel.value}`);
-
-  // 手动输入框应被清空（避免两个来源冲突）
-  const manual = dom.byId.get('zca-model-manual');
-  assert.ok(manual, '应保留手动输入兜底控件');
-  assert.strictEqual(manual.value, '', '拉取成功后手动输入应清空');
-});
-
-test('inject.js：手动输入的模型 id 会进入保存载荷（端点不支持 /models 时的兜底）', async () => {
-  const saved = [];
-  // 直接注入带记录能力的 fetch：保存请求走 /api/config
-  const fetchStub = async (url, opt) => {
-    if (String(url).includes('/api/config')) {
-      saved.push(JSON.parse(opt.body));
-      return { json: async () => ({ ok: true, file: '/tmp/x.json' }) };
-    }
-    return { json: async () => ({ ok: false, error: 'http_404' }) };
-  };
-
-  const dom = runInject({ fetch: fetchStub });
-  dom.byId.get('zca-badge')._listeners.click[0]();   // 打开面板
-  const panel = dom.byId.get('zca-panel');
-
-  // 模拟"端点不支持 /models"：手动填写模型 id
-  dom.byId.get('zca-model-manual').value = 'my-custom-model';
-
-  const saveBtn = panel.querySelector('#zca-save');
-  assert.ok(saveBtn, '应有保存按钮');
-  await saveBtn._listeners.click[0]();
-
-  assert.ok(saved.length > 0, '应发出保存请求');
-  assert.strictEqual(saved[0].model, 'my-custom-model', '手动输入的模型 id 应进入保存载荷');
-});
 
 test('inject.js：refreshStatus 在 403 bad_token 时给出可操作提示（回归：卡在"读取中…"）', async () => {
   // 回归背景：r.ok===false 被静默 return，面板永久停在"读取中…"，用户毫无线索。
@@ -470,55 +429,7 @@ test('inject.js：refreshStatus 在 403 bad_token 时给出可操作提示（回
   assert.ok(!/读取中/.test(st.textContent), '不应停留在"读取中"，应给出失败原因');
 });
 
-test('inject.js：当前模型不在拉取列表时保留原选择（不静默改成列表首项）', async () => {
-  // 回归（advisor 指出）：早期实现插入「（当前）」条目后却把 sel.value 设为 r.models[0]，
-  // 并把手动输入清空——用户已配置的模型被静默替换，保存后审查模型就变了。
-  const models = ['aaa-flash', 'bbb-flash'];   // 不含用户当前模型
-  const fetchStub = async (url) => ({
-    json: async () => (String(url).includes('/api/models')
-      ? { ok: true, models }
-      : { ok: false })
-  });
 
-  const dom = runInject({ fetch: fetchStub });
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  const panel = dom.byId.get('zca-panel');
-
-  // 用户先手动填一个不在列表里的模型
-  dom.byId.get('zca-model-manual').value = 'my-special-model';
-
-  await panel.querySelector('#zca-models')._listeners.click[0]();
-
-  const sel = dom.byId.get('zca-model');
-  assert.strictEqual(sel.value, 'my-special-model', '应保留用户当前模型，而不是改成列表首项');
-  assert.strictEqual(dom.byId.get('zca-model-manual').value, 'my-special-model',
-    '保留选择时不应清空手动输入（否则两边不一致）');
-  // 保留项应作为首项出现且标注
-  const first = sel.children[0];
-  assert.strictEqual(first.value, 'my-special-model');
-  assert.match(first.textContent, /当前/);
-});
-
-test('inject.js：当前模型在列表内时正常选中该模型并清空手动输入', async () => {
-  const models = ['aaa-flash', 'bbb-flash'];
-  const fetchStub = async (url) => ({
-    json: async () => (String(url).includes('/api/models')
-      ? { ok: true, models }
-      : { ok: false })
-  });
-
-  const dom = runInject({ fetch: fetchStub });
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  const panel = dom.byId.get('zca-panel');
-
-  dom.byId.get('zca-model-manual').value = 'bbb-flash';   // 当前模型在列表内
-  await panel.querySelector('#zca-models')._listeners.click[0]();
-
-  const sel = dom.byId.get('zca-model');
-  assert.strictEqual(sel.value, 'bbb-flash');
-  assert.strictEqual(dom.byId.get('zca-model-manual').value, '', '在列表内时应清空手动输入');
-  assert.strictEqual(sel.children.length, models.length, '不应额外插入保留项');
-});
 
 // ---------------- UI 锚定（本次 UI/UX 优化） ----------------
 
@@ -669,29 +580,6 @@ test('controller / reviewer 的端点归一化规则一致（修复 Ping 404）'
 
 // ---------------- 顾问总开关（startEnabled 往返） ----------------
 
-test('inject.js：面板含顾问开关，且随保存载荷提交 startEnabled', async () => {
-  const saved = [];
-  const fetchStub = async (url, opt) => {
-    if (String(url).includes('/api/config')) {
-      saved.push(JSON.parse((opt && opt.body) || '{}'));
-      return { json: async () => ({ ok: true, file: '/tmp/x.json' }) };
-    }
-    return { json: async () => ({ ok: false }) };
-  };
-  const dom = runInject({ fetch: fetchStub });
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  const panel = dom.byId.get('zca-panel');
-
-  const en = dom.byId.get('zca-enabled');
-  assert.ok(en, '面板应有顾问开关 #zca-enabled');
-  en.checked = false;   // 关闭
-  await panel.querySelector('#zca-save')._listeners.click[0]();
-  // /api/config 会被多次调用（refreshStatus 与 save 都走它），
-  // 带非空 body 的那次才是保存请求——不能断言 saved[0]。
-  const savePayloads = saved.filter((p) => Object.keys(p).length > 0);
-  assert.ok(savePayloads.length > 0, '应发出保存请求');
-  assert.strictEqual(savePayloads[savePayloads.length - 1].startEnabled, false, '关闭状态应进入保存载荷');
-});
 
 test('inject.js：发行包 payload 与 auto-enable 脚本就位（自动启用载体）', () => {
   const fs2 = require('fs');
@@ -710,118 +598,10 @@ test('inject.js：发行包 payload 与 auto-enable 脚本就位（自动启用�
 
 // ---------------- API 来源（zcode / manual）与面板结构重构 ----------------
 
-test('inject.js：启用开关在面板正文首行（不在 h3 标题栏内），API 来源分段与高级折叠区齐备', () => {
-  const dom = runInject();
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  const html = dom.byId.get('zca-panel').innerHTML;
-  // 回归：旧版把启用 checkbox 嵌在 h3 里，紧挨关闭按钮——难点中、位置不对
-  const h3 = html.slice(html.indexOf('<h3'), html.indexOf('</h3>'));
-  assert.ok(!h3.includes('zca-enabled'), 'h3 标题栏不应包含启用开关');
-  assert.ok(html.includes('zca-toggle-row'), '启用开关应有独立行容器');
-  assert.ok(html.indexOf('zca-toggle-row') < html.indexOf('zca-apiSource'), '开关行应位于 API 来源分段之前');
-  for (const id of ['zca-apiSource', 'zca-src-zcode', 'zca-src-manual', 'zca-zcode-provider',
-    'zca-zcode-model', 'zca-zcode-sec', 'zca-manual-sec', 'zca-zcode-endpoint', 'zca-adv']) {
-    assert.ok(html.includes(id), `面板应包含 #${id}`);
-  }
-});
 
-test('inject.js：zcode 模式保存载荷带服务商/模型，不回传手动端点字段', async () => {
-  const saved = [];
-  const providers = [{
-    id: 'p1', name: '内网网关', kind: 'openai-compatible',
-    baseURL: 'http://10.0.0.8:8088/v1', models: ['m-a', 'm-b'], eligible: true, hasApiKey: true
-  }];
-  const fetchStub = async (url, opt) => {
-    const u = String(url);
-    if (u.includes('/api/config')) {
-      saved.push(JSON.parse(opt.body));
-      return { json: async () => ({ ok: true, file: '/tmp/x.json' }) };
-    }
-    if (u.includes('/api/zcode-providers')) return { json: async () => ({ ok: true, providers }) };
-    return { json: async () => ({ ok: false }) };
-  };
-  const dom = runInject({ fetch: fetchStub });
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 10));
-  // 切到 zcode 模式 → loadProviders 异步拉取 → 服务商/模型下拉被填充
-  dom.byId.get('zca-src-zcode')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 10));
-  const psel = dom.byId.get('zca-zcode-provider');
-  assert.strictEqual(psel.value, 'p1', '唯一合格服务商应被选中');
-  const msel = dom.byId.get('zca-zcode-model');
-  assert.strictEqual(msel.value, 'm-a', '模型默认取列表首项');
-  msel.value = 'm-b';
-  await dom.byId.get('zca-save')._listeners.click[0]();
-  const payload = saved[saved.length - 1];
-  assert.strictEqual(payload.apiSource, 'zcode');
-  assert.strictEqual(payload.zcodeProvider, 'p1');
-  assert.strictEqual(payload.zcodeModel, 'm-b');
-  assert.strictEqual(payload.baseUrl, undefined, 'zcode 模式不回传手动端点（保留既有手动配置）');
-  assert.strictEqual(payload.model, undefined, 'zcode 模式不回传手动模型字段');
-});
 
-test('inject.js：手动模式保存载荷与旧行为一致（apiSource=manual）', async () => {
-  const saved = [];
-  const fetchStub = async (url, opt) => {
-    if (String(url).includes('/api/config')) {
-      saved.push(JSON.parse(opt.body));
-      return { json: async () => ({ ok: true, file: '/tmp/x.json' }) };
-    }
-    return { json: async () => ({ ok: false }) };
-  };
-  const dom = runInject({ fetch: fetchStub });
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  dom.byId.get('zca-baseUrl').value = 'http://manual.example/v1';
-  dom.byId.get('zca-model-manual').value = 'm-manual';
-  await dom.byId.get('zca-save')._listeners.click[0]();
-  const payload = saved[saved.length - 1];
-  assert.strictEqual(payload.apiSource, 'manual');
-  assert.strictEqual(payload.baseUrl, 'http://manual.example/v1');
-  assert.strictEqual(payload.model, 'm-manual');
-  assert.strictEqual(payload.zcodeProvider, undefined);
-});
 
-test('inject.js：非 OpenAI 兼容服务商仍列出但标灰禁用（不静默消失）', async () => {
-  const fetchStub = async (url) => ({
-    json: async () => (String(url).includes('/api/zcode-providers')
-      ? { ok: true, providers: [
-        { id: 'ant', name: 'Anthropic 中转', kind: 'anthropic', baseURL: 'https://r', models: ['c'], eligible: false },
-        { id: 'ok1', name: '内网网关', kind: 'openai-compatible', baseURL: 'http://x', models: ['m'], eligible: true }
-      ] }
-      : { ok: false })
-  });
-  const dom = runInject({ fetch: fetchStub });
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 10));
-  dom.byId.get('zca-src-zcode')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 10));
-  const psel = dom.byId.get('zca-zcode-provider');
-  // 回归：此前只列 eligible 的，导致用户以为"我维护的模型少了很多"（实测 40→24）
-  const opts = psel.children;
-  assert.strictEqual(opts.length, 2, '两个服务商都应列出（含不兼容的）');
-  const anthropicOpt = opts.find((o) => o.value === 'ant');
-  assert.ok(anthropicOpt, '不兼容服务商必须出现，不能静默消失');
-  assert.strictEqual(anthropicOpt.disabled, true, '不兼容协议应禁用不可选');
-  assert.match(anthropicOpt.textContent, /不支持/, '应注明不支持原因');
-  // 默认选中唯一合格项
-  assert.strictEqual(psel.value, 'ok1');
-});
 
-test('inject.js：ZCode 里完全无服务商时给出占位提示', async () => {
-  const fetchStub = async (url) => ({
-    json: async () => (String(url).includes('/api/zcode-providers')
-      ? { ok: true, providers: [] }
-      : { ok: false })
-  });
-  const dom = runInject({ fetch: fetchStub });
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 10));
-  dom.byId.get('zca-src-zcode')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 10));
-  const psel = dom.byId.get('zca-zcode-provider');
-  assert.match(psel.children[0].textContent, /暂无服务商/);
-  assert.strictEqual(psel.value, '');
-});
 
 // ---------------- 顾问意见历史（内容可回看 + 本地时区） ----------------
 
@@ -879,7 +659,75 @@ test('inject.js：设置面板标题不含 🛡️（用户要求去掉该处图
   const p = dom.byId.get('zca-panel');
   assert.ok(p, '面板应存在');
   assert.ok(!p.innerHTML.includes('🛡'), '面板标题不应再有盾牌 emoji');
-  assert.match(p.innerHTML, /顾问设置/, '标题文字保留');
+  assert.match(p.innerHTML, /<span>顾问<\/span>/, '标题文字为「顾问」（0.2.15 瘦身后）');
+});
+
+// ---------------- 会话级控制（0.2.15 角标瘦身的核心功能） ----------------
+
+test('inject.js：会话开关初始态回填自 /api/session，切换请求发 /api/session-toggle', async () => {
+  const toggles = [];
+  const fetchStub = async (url, opt) => {
+    const u = String(url);
+    if (u.includes('/api/session-toggle')) {
+      toggles.push(JSON.parse((opt && opt.body) || '{}'));
+      return { json: async () => ({ ok: true, enabled: false, sessionId: 'sess_x1' }) };
+    }
+    if (u.includes('/api/session')) {
+      return { json: async () => ({ ok: true, hasSession: true, sessionId: 'sess_x1', enabled: true, sessionModel: '' }) };
+    }
+    if (u.includes('/api/config')) return { json: async () => ({ ok: true, config: { model: 'glm-5.3-flash', reviewMode: 'async', apiSource: 'manual' } }) };
+    return { json: async () => ({ ok: false }) };
+  };
+  const dom = runInject({ fetch: fetchStub });
+  dom.byId.get('zca-badge')._listeners.click[0]();   // 打开面板 → refreshStatus
+  await new Promise((r) => setTimeout(r, 20));
+
+  const en = dom.byId.get('zca-session-enabled');
+  assert.ok(en, '面板应有会话启用开关 #zca-session-enabled');
+  assert.strictEqual(en.checked, true, '初始态应回填 /api/session 的 enabled=true');
+  // 状态行应带会话短码标注（多会话归属可见）
+  const st = dom.byId.get('zca-status');
+  assert.match(st.textContent, /会话 x1/, '状态行应标注会话 id 短码');
+
+  en.checked = false;
+  en._listeners.change[0]({ target: { checked: false } });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(toggles.length, 1, '应发出会话切换请求');
+  assert.strictEqual(toggles[0].enabled, false, '载荷应带 enabled=false');
+  const msgEl = dom.byId.get('zca-msg');
+  assert.match(msgEl.textContent, /已停用/, '应提示本会话已停用');
+});
+
+test('inject.js：会话覆盖模型优先展示（sessionModel 非空时标注「本会话覆盖」）', async () => {
+  const fetchStub = async (url) => {
+    const u = String(url);
+    if (u.includes('/api/session')) {
+      return { json: async () => ({ ok: true, hasSession: true, sessionId: 'sess_y2', enabled: true, sessionModel: 'kimi-k3' }) };
+    }
+    if (u.includes('/api/config')) {
+      return { json: async () => ({ ok: true, config: { model: 'glm-5.3-flash', reviewMode: 'async', apiSource: 'manual' } }) };
+    }
+    return { json: async () => ({ ok: false }) };
+  };
+  const dom = runInject({ fetch: fetchStub });
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 20));
+  const st = dom.byId.get('zca-status');
+  assert.match(st.textContent, /kimi-k3（本会话覆盖）/, '会话覆盖模型应优先于全局展示');
+  const hint = dom.byId.get('zca-session-hint');
+  assert.match(hint.textContent, /\/advisor-model set/, '应给出会话换模型命令指引');
+});
+
+test('inject.js：完整配置按钮以 hash 令牌打开 /panel（全局配置唯一 GUI 入口）', async () => {
+  const opened = [];
+  const dom = runInject();
+  dom.window.open = (url) => { opened.push(String(url)); };
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  const btn = dom.byId.get('zca-panel').querySelector('#zca-fullpanel');
+  assert.ok(btn, '面板应有「完整配置」按钮');
+  btn._listeners.click[0]();
+  assert.strictEqual(opened.length, 1, '应调用 window.open 一次');
+  assert.match(opened[0], /\/panel#test-token$/, '应打开 /panel 并经 hash 携带令牌');
 });
 
 
@@ -1043,16 +891,6 @@ test('inject.js：令牌轮换时断开旧 MutationObserver（防跨代叠加回
 // a11y 为代价——title 对键盘/触屏/屏幕阅读器不可靠，故关键语义必须有非 hover 载体。
 // 这三条锁住本次精简的底线。
 
-test('inject.js：高级区把 async/sync 差异做成常驻 hint（不只藏在 option/title 里）', () => {
-  const dom = runInject();
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  const p = dom.byId.get('zca-panel');
-  // option 文本已精简为纯 async/sync；差异说明必须在可见处（原生 select 不渲染 option title）
-  const opt = p.innerHTML.match(/<option value="async"[^>]*>([^<]*)<\/option>/);
-  assert.ok(opt, 'async 选项应存在');
-  assert.strictEqual(opt[1].trim(), 'async', 'option 文本应精简为纯 async');
-  assert.match(p.innerHTML, /zca-hint[^>]*>async：随下一条消息送达/, '差异说明应常驻可见（非 hover）');
-});
 
 test('inject.js：面板含可见健康图例（不让用户靠 hover 才知道灯的含义）', async () => {
   const dom = runInject();
@@ -1082,19 +920,3 @@ test('inject.js：历史区头部键盘可达（role/aria-expanded + Enter 可�
   assert.strictEqual(head.getAttribute('aria-expanded'), 'true', 'Enter 展开后 aria-expanded 应为 true');
 });
 
-test('inject.js：分段控件带 aria-pressed（屏幕阅读器可知当前来源）', async () => {
-  const dom = runInject();
-  dom.byId.get('zca-badge')._listeners.click[0]();
-  await new Promise((r2) => setTimeout(r2, 10));
-  const z = dom.byId.get('zca-src-zcode');
-  const m = dom.byId.get('zca-src-manual');
-  assert.ok(z.getAttribute('aria-pressed') !== null && m.getAttribute('aria-pressed') !== null,
-    '两个分段按钮都应带 aria-pressed 属性');
-  // 切到 zcode：两按钮 aria-pressed 必须互斥（切换后 SR 才知道当前来源）
-  z._listeners.click[0]();
-  assert.strictEqual(z.getAttribute('aria-pressed'), 'true', '选中项 aria-pressed=true');
-  assert.strictEqual(m.getAttribute('aria-pressed'), 'false', '未选中项 aria-pressed=false');
-  m._listeners.click[0]();
-  assert.strictEqual(z.getAttribute('aria-pressed'), 'false', '切回后原选中项应变 false');
-  assert.strictEqual(m.getAttribute('aria-pressed'), 'true', '新选中项应变 true');
-});

@@ -87,6 +87,9 @@ function writeAttempt(dir, sessionId, info) {
   const i = info || {};
   return mergeBeacon(beaconPath(dir, sessionId), {
     sessionId: String(sessionId || ''),
+    // stateDir 随信标下发：角标 controller 借此定位同一会话的状态文件，
+    // 实现跨进程的会话级开关/模型覆盖展示（controller 与 hook 无共享模块）。
+    stateDir: String(dir || ''),
     lastAttemptAt: new Date().toISOString(),
     model: String(i.model || ''),
     effectiveModel: String(i.effectiveModel || i.model || '')
@@ -102,6 +105,7 @@ function writeResult(dir, sessionId, result) {
   const r = result || {};
   const patch = {
     sessionId: String(sessionId || ''),
+    stateDir: String(dir || ''),
     state: r.degraded ? 'degraded' : (r.ok ? 'ok' : 'down'),
     reason: String(r.reason || ''),
     model: String(r.model || ''),

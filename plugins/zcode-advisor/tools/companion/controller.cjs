@@ -19,6 +19,8 @@ const crypto = require('crypto');
 const { spawn, spawnSync, execSync } = require('child_process');
 const { modelsUrl, parseModels } = require('./lib.cjs');
 const { detectZcodePath, missingHint } = require('./zcode-path.cjs');
+// 完整配置面板（GET /panel 返回；全局配置的 GUI 载体，见 panel.cjs 头注释）
+const PANEL_HTML = require('./panel.cjs');
 
 // —— 顾问意见历史读取 ——
 // 为什么不复用 hooks/lib/history：发行包只随带 companion 四个文件（hooks/ 不存在），
@@ -111,6 +113,7 @@ function readHealth(reviewBudgetMs, cap) {
       state: deriveHealth(top, { reviewBudgetMs }),
       beacon: {
         sessionId: top.sessionId || '',
+        stateDir: top.stateDir || '',
         model: top.model || '',
         effectiveModel: top.effectiveModel || top.model || '',
         lastAttemptAt: top.lastAttemptAt || '',
@@ -815,6 +818,140 @@ function effectiveTarget(body) {
   };
 }
 
+// —— 会话级状态（跨进程读写 hook 侧状态文件）——
+// 信标带 stateDir + sessionId（hooks/lib/health.js writeAttempt/writeResult 下发），
+// 据此定位 hook 的状态文件 sess-<id>.json，支撑角标的「本会话启用开关 / 当前模型（含会话覆盖）」。
+// 多会话归属：controller 无从得知用户当前在哪个会话，取「最近活动」信标并在 UI 标注
+// （与 /api/health 同一语义）；多会话并行时的开关作用于最近活动的那一个。
+function sanitizeSessionIdForState(sessionId) {
+  const s = String(sessionId || '').trim();
+  const cleaned = s.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 80);
+  return cleaned || 'default';
+}
+
+function locateLatestSessionBeacon() {
+  try {
+    if (!fs.existsSync(HEALTH_DIR)) return null;
+    const files = fs.readdirSync(HEALTH_DIR).filter((f) => /^advisor-health-.*\.json$/.test(f));
+    const withMtime = files.map((f) => {
+      const full = path.join(HEALTH_DIR, f);
+      let mtime = 0;
+      try { mtime = fs.statSync(full).mtimeMs; } catch (_) {}
+      return { full, mtime };
+    }).sort((a, b) => b.mtime - a.mtime);
+    for (const { full } of withMtime.slice(0, 20)) {
+      try {
+        const b = JSON.parse(fs.readFileSync(full, 'utf8'));
+        if (b && b.sessionId && b.stateDir) return b;
+      } catch (_) { /* 跳过坏文件/旧格式信标 */ }
+    }
+  } catch (_) {}
+  return null;
+}
+
+// 读取最近活动会话的状态快照（enabled / sessionModel），供角标展示与开关初始态。
+function readSessionSnapshot() {
+  const b = locateLatestSessionBeacon();
+  if (!b) return { ok: true, hasSession: false };
+  const stateFile = path.join(String(b.stateDir), `sess-${sanitizeSessionIdForState(b.sessionId)}.json`);
+  let st = null;
+  try { st = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch (_) {}
+  return {
+    ok: true,
+    hasSession: Boolean(st && typeof st === 'object'),
+    sessionId: String(b.sessionId || ''),
+    stateFile,
+    enabled: st ? st.enabled !== false : true,
+    sessionModel: st ? String(st.sessionModel || '') : ''
+  };
+}
+
+// 切换最近活动会话的启用开关。与 hook 的 ctl on/off（mutateStateExclusive）同款
+// <file>.wrlock 锁协议互斥：wx 抢建、陈旧接管（10s）、属主校验——两侧不会互相覆盖。
+// hook 侧语义对齐：off 只置 enabled=false（不写 disabledReason，门禁原因由审查链自算）。
+function toggleSessionEnabled(enabled) {
+  const want = enabled !== false;
+  const b = locateLatestSessionBeacon();
+  if (!b) {
+    return { ok: false, error: 'no_session', hint: '没有可操作的会话——先在 ZCode 里打开一个会话并让它跑起来（信标尚不存在）' };
+  }
+  const stateFile = path.join(String(b.stateDir), `sess-${sanitizeSessionIdForState(b.sessionId)}.json`);
+  const lock = `${stateFile}.wrlock`;
+  const myPid = String(process.pid);
+  let got = false;
+  for (let i = 0; i < 40 && !got; i++) {
+    try {
+      fs.writeFileSync(lock, myPid, { flag: 'wx' });
+      got = true;
+    } catch (_) {
+      try {
+        const st = fs.statSync(lock);
+        if (Date.now() - st.mtimeMs > 10000) { try { fs.unlinkSync(lock); } catch (_) {} }
+      } catch (_) {}
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); } catch (_) {}
+    }
+  }
+  if (!got) return { ok: false, error: 'lock_timeout', hint: '会话状态正被审查进程写入，请稍后重试' };
+  const ownLock = () => { try { return fs.readFileSync(lock, 'utf8').trim() === myPid; } catch (_) { return false; } };
+  try {
+    if (!ownLock()) return { ok: false, error: 'lock_timeout', hint: '会话状态正被审查进程写入，请稍后重试' };
+    let st;
+    try {
+      st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    } catch (_) {
+      return { ok: false, error: 'state_unreadable', hint: '会话状态文件不可读（可能尚未生成）：' + stateFile };
+    }
+    if (!st || typeof st !== 'object') {
+      return { ok: false, error: 'state_unreadable', hint: '会话状态文件内容异常：' + stateFile };
+    }
+    st.enabled = want;
+    if (want) st.disabledReason = '';
+    const tmp = `${stateFile}.tmp-${process.pid}`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(st, null, 2), { encoding: 'utf8', mode: 0o600 });
+      fs.renameSync(tmp, stateFile);
+    } catch (err) {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+      return { ok: false, error: 'state_write_failed', hint: String(err && err.message || err).slice(0, 120) };
+    }
+    return { ok: true, enabled: want, sessionId: String(b.sessionId || ''), sessionModel: String(st.sessionModel || '') };
+  } finally {
+    try { if (fs.readFileSync(lock, 'utf8').trim() === myPid) fs.unlinkSync(lock); } catch (_) {}
+  }
+}
+
+// 清除用户级配置的 apiKey（完整面板「清除 API key」入口）。语义与 config-bridge 的
+// removeUserConfigKeys 一致：走同一把配置锁；损坏/非对象报失败（绝不静默重建蒸发键）；
+// 键不存在 = 幂等成功。controller 与 config-bridge 是跨目录独立副本（发行包无 hooks/）。
+function removeApiKeyFromUserConfig() {
+  fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true, mode: 0o700 });
+  const outcome = withConfigLock(USER_CONFIG, () => {
+    let existing;
+    try {
+      existing = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
+    } catch (err) {
+      if (err && err.code === 'ENOENT') return { changed: false, removed: [] };
+      return { changed: false, removed: [], error: '配置文件已损坏，无法安全删除；请手动检查 ' + USER_CONFIG };
+    }
+    if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
+      return { changed: false, removed: [], error: '配置文件不是 JSON 对象，无法安全删除' };
+    }
+    if (!Object.prototype.hasOwnProperty.call(existing, 'apiKey')) return { changed: false, removed: [] };
+    const rebuilt = {};
+    for (const k of Object.keys(existing)) {
+      if (k === '__proto__' || k === 'apiKey') continue;
+      rebuilt[k] = existing[k];
+    }
+    const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(rebuilt, null, 2), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmp, USER_CONFIG);
+    try { fs.chmodSync(USER_CONFIG, 0o600); } catch (_) {}
+    return { changed: true, removed: ['apiKey'] };
+  });
+  if (outcome === false) return { changed: false, lockTimeout: true, removed: [] };
+  return outcome;
+}
+
 // —— 本机 API ——
 // CORS 放行任意来源：真正的访问控制是共享令牌（X-Advisor-Token，只存在于注入脚本
 // 与 controller 内存中）。这样无论 ZCode 页面用 file:// 还是自定义协议都能访问面板 API。
@@ -884,6 +1021,41 @@ async function fetchModels(body) {
   const t = effectiveTarget(body);
   // zcode 模式：模型列表直接来自 ZCode provider 数据，无需请求端点 /models。
   if (t.apiSource === 'zcode') {
+    // zcodeFetch=true：绕过 ZCode 配置里的**静态登记清单**，直接请求服务商端点的
+    // /models 实时列表。背景（用户实测）：登记清单可能远小于端点真实可用集
+    // （8788 网关登记 2 个、实际 23 个），且 ZCode 侧改配置后这里不会自动同步。
+    if (body && body.zcodeFetch) {
+      if (!t.providerUsable) {
+        const hints = {
+          provider_missing: 'ZCode 配置里找不到所选服务商，请刷新列表或重新选择',
+          provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+          provider_incomplete: 'provider 的 baseURL/apiKey 缺一，无法向端点拉取模型'
+        };
+        return { ok: false, error: t.providerError, hint: hints[t.providerError] || '' };
+      }
+      const url = modelsUrl(t.baseUrl);
+      if (!url) return { ok: false, error: 'baseUrl 为空' };
+      let r;
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 12000);
+      try {
+        r = await fetch(url, { headers: { Authorization: `Bearer ${t.apiKey}` }, signal: ctl.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      try {
+        if (!r.ok) {
+          const hint = r.status === 401 || r.status === 403 ? '服务商 key 无效' : '该端点可能不提供 /models';
+          return { ok: false, error: `http_${r.status}`, hint };
+        }
+        const parsed = parseModels(await r.json());
+        if (!parsed.ok && parsed.error === 'unexpected_envelope') parsed.hint = '响应信封无法识别';
+        return parsed;
+      } catch (err) {
+        const aborted = err && (err.name === 'AbortError' || String(err).includes('abort'));
+        return { ok: false, error: aborted ? 'models_timeout' : 'models_error', hint: '拉取失败：' + (err && err.message || err).slice(0, 80) };
+      }
+    }
     if (!t.providerUsable) {
       const hints = {
         provider_missing: 'ZCode 配置里找不到所选服务商，请重新选择',
@@ -928,6 +1100,14 @@ function startApi(cdpPort, apiPort, token) {
     cors(res);
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
     const done = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
+    // 完整配置面板（全局配置的 GUI 载体：API 来源/端点/key/模型/刷新/拉取/Ping/保存）。
+    // 本身不含敏感数据、不校验令牌；页面 JS 从 URL hash 读令牌调 API——hash 不进
+    // 服务器日志、不落 referer，令牌仍只在本机浏览器进程内流转。
+    if (req.method === 'GET' && (req.url === '/panel' || req.url === '/panel/')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(PANEL_HTML);
+      return;
+    }
     // 共享令牌校验：令牌只存在于注入的页面脚本与 controller 内存中，
     // 防止本机其他网页（无令牌）驱动本接口改写配置。
     if ((req.headers['x-advisor-token'] || '') !== token) return done(403, { ok: false, error: 'bad_token' });
@@ -974,6 +1154,23 @@ function startApi(cdpPort, apiPort, token) {
       if (req.method === 'POST' && req.url === '/api/models') {
         const body = await readBody();
         return done(200, await fetchModels(body));
+      }
+      // 最近活动会话的快照（enabled / sessionModel）：角标面板展示与开关初始态。
+      // 注意归属语义：是「最近活动的会话」，不一定是用户正看着的那个（controller 无法
+      // 感知焦点）；多会话并行时 UI 必须标注会话 id，避免把另一个会话的开关当自己的。
+      if (req.method === 'GET' && req.url === '/api/session') {
+        return done(200, readSessionSnapshot());
+      }
+      if (req.method === 'POST' && req.url === '/api/session-toggle') {
+        const body = await readBody();
+        return done(200, toggleSessionEnabled(body && body.enabled));
+      }
+      // 清除已保存的 apiKey（完整面板入口；与配置面板「清除 API key」同一落点）。
+      if (req.method === 'POST' && req.url === '/api/remove-key') {
+        const r = removeApiKeyFromUserConfig();
+        if (r.lockTimeout) return done(503, { ok: false, error: '配置文件被占用，请稍后重试' });
+        if (r.error) return done(500, { ok: false, error: r.error });
+        return done(200, { ok: true, changed: r.changed });
       }
       if (req.method === 'POST' && req.url === '/api/ping') {
         const body = await readBody();
@@ -1107,5 +1304,6 @@ if (require.main === module) {
 }
 
 module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi,
+  readSessionSnapshot, toggleSessionEnabled,
   // 供单测直接验证单实例锁与主实例探测（不启动进程）
   _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, exitCodeFor, classifySpawnError, RETRY_EXIT_CODE, SUPERVISED, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS } };

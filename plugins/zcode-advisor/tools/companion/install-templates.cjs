@@ -120,6 +120,17 @@ else
   echo "[提示] 包内未找到插件 payload，审查功能需手动安装插件（见 README）"
 fi
 
+# 把 auto-enable.cjs 与 plugin payload 复制进 $SUPPORT：controller 每次启动都会从
+# __dirname 找 auto-enable.cjs 重新执行（0.2.13 起的既有设计），但本脚本此前没有把
+# 这两样复制过来——导致 .app 升级时插件永远停在旧版本（复审无情行者/实跑定位）。
+# 复制后即闭环：每次点开「ZCode Advisor」→ controller 启动 → auto-enable 按
+# 「不降级」判据把插件升到包内版本（DMG 自包含 .app 已有同样布局，无需改动）。
+if [ -f "$SRC/auto-enable.cjs" ] && [ -d "$SRC/plugin" ]; then
+  cp -f "$SRC/auto-enable.cjs" "$SUPPORT/" || echo "[提示] auto-enable 复制失败（后续升级需手动跑 plugins update）"
+  rm -rf "$SUPPORT/plugin"
+  cp -R "$SRC/plugin" "$SUPPORT/plugin" || echo "[提示] plugin payload 复制失败（后续升级需手动跑 plugins update）"
+fi
+
 # Node 运行时：优先用包内内嵌，其次回退系统 node（并明确告知）。
 # 注意：set -e 对 cp 在命令替换赋值位置并不总是生效，故显式校验结果，
 # 避免复制失败却仍写出指向缺失文件的启动器、最后打印"安装成功"。

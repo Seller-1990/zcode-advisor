@@ -35,13 +35,27 @@ function guiValuesFromEnv(env) {
     ZCODE_ADVISOR_CFG_API_KEY: 'apiKey',
     ZCODE_ADVISOR_CFG_MODEL: 'model',
     ZCODE_ADVISOR_CFG_BASE_URL: 'baseUrl',
-    ZCODE_ADVISOR_CFG_REVIEW_MODE: 'reviewMode'
+    ZCODE_ADVISOR_CFG_REVIEW_MODE: 'reviewMode',
+    ZCODE_ADVISOR_CFG_API_SOURCE: 'apiSource',
+    ZCODE_ADVISOR_CFG_MAX_TOKENS: 'maxTokens'
   };
   for (const [envKey, cfgKey] of Object.entries(map)) {
     const v = String(env[envKey] || '').trim();
     // 宿主可能把未填字段展开为字面模板串——同样跳过。
     if (!v || v.includes('${')) continue;
     if (cfgKey === 'baseUrl' && v === LEGACY_DEFAULT_BASE_URL) continue;
+    // apiSource 只认白名单（非法值落盘会坏审查通道的来源解析）
+    if (cfgKey === 'apiSource') {
+      const s = v.toLowerCase();
+      if (s === 'manual' || s === 'zcode') out[cfgKey] = s;
+      continue;
+    }
+    // max_tokens：default 0 = 表单未干预；0/非法/越界一律跳过（与面板保存语义一致）
+    if (cfgKey === 'maxTokens') {
+      const mt = parseInt(v, 10);
+      if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) out[cfgKey] = mt;
+      continue;
+    }
     out[cfgKey] = v;
   }
   return out;

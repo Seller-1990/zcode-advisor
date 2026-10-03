@@ -312,6 +312,17 @@ test('makeIco：AND 掩码与 32px 档 alpha 对齐（透明像素置 1）', () 
 
 // ---------------- 依赖闭包（B1 回归防线） ----------------
 
+test('MAC_INSTALL_SH：auto-enable.cjs 与 plugin payload 复制进 $SUPPORT（升级链路闭环）', () => {
+  // 回归（0.2.15）：install.sh 此前只把 auto-enable 执行了一次，没复制进 $SUPPORT——
+  // controller 启动时从 __dirname 找 auto-enable.cjs 找不到，「每次启动自动升级插件」
+  // 静默失效（实跑发现：DMG 升级后插件停在 0.2.13）。tar.gz 路径必须补齐两样东西。
+  const sh = T.MAC_INSTALL_SH(['controller.cjs']);
+  assert.match(sh, /cp -f "\$SRC\/auto-enable\.cjs" "\$SUPPORT\//, 'auto-enable.cjs 应复制进 $SUPPORT（controller 启动时可见）');
+  assert.match(sh, /cp -R "\$SRC\/plugin" "\$SUPPORT\/plugin"/, 'plugin payload 应复制进 $SUPPORT（auto-enable 的 payload 查找候选）');
+  // 复制前先清旧 payload：防止插件目录残留旧文件（升级半途失败时混装）
+  assert.match(sh, /rm -rf "\$SUPPORT\/plugin"/, '复制前应清理旧 payload');
+});
+
 test('companionRuntimeFiles：闭包包含 controller 的全部相对依赖（含 zcode-path.cjs）', () => {
   // 回归：发行包曾漏掉 zcode-path.cjs，导致安装后 controller require 失败直接崩溃。
   // 这里从源码推导闭包，任何新增的相对 require 都会自动纳入；漏项即失败。
