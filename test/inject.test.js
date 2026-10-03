@@ -179,6 +179,9 @@ function makeDom() {
       }
       return null;
     }
+    // findAnchor 的可见性守卫用 rect 面积判断「挂上去能不能看见」。
+    // 默认可见（非零面积，保持既有用例行为）；需要模拟隐藏容器时给元素覆写 _rect。
+    getBoundingClientRect() { return this._rect || { width: 100, height: 28, top: 0, left: 0 }; }
   }
 
   const body = new El('body');
@@ -186,8 +189,15 @@ function makeDom() {
 
   // 锚点容器：脚本会把角标挂到 .chat-composer-input-surface 内的工具栏上。
   // 桩提供最小可用的类名索引，使「锚定到工具栏」这条路径可被测试（含兜底分支）。
-  const anchorEls = new Map();   // selector -> element
-  const registerAnchor = (selector, el) => { anchorEls.set(selector, el); return el; };
+  // 同一选择器可注册多个元素（真实 querySelectorAll 按文档序返回全部；
+  // findAnchor 逐个做可见性校验取第一个可见者）——模拟「隐藏祖先排在前」的场景。
+  const anchorEls = new Map();   // selector -> element[]
+  const registerAnchor = (selector, el) => {
+    const list = anchorEls.get(selector) || [];
+    list.push(el);
+    anchorEls.set(selector, list);
+    return el;
+  };
 
   const document = {
     body,
@@ -196,8 +206,8 @@ function makeDom() {
     readyState: 'complete',
     createElement: (t) => { const e = new El(t); created.push(e); return e; },
     getElementById: (id) => byId.get(id) || null,
-    querySelector: (sel) => anchorEls.get(sel) || null,
-    querySelectorAll: () => [],
+    querySelector: (sel) => (anchorEls.get(sel) || [])[0] || null,
+    querySelectorAll: (sel) => anchorEls.get(sel) || [],
     addEventListener: () => {}
   };
 
@@ -533,6 +543,38 @@ test('inject.js：找不到锚点时退回悬浮兜底（仍可用）', () => {
   assert.ok(badge, '应创建角标');
   assert.strictEqual(badge.parentNode, dom.body, '无锚点时应挂到 body');
   assert.ok(String(badge.className).includes('zca-floating'), '应加浮动兜底类，保证仍可见可用');
+});
+
+test('inject.js：不可见的子串候选被跳过，全部不可见时仍走悬浮兜底（复审回归）', () => {
+  // 场景：宿主改类名前缀后，子串选择器 [class*="composer-input-surface"] 命中的是
+  // 隐藏的预渲染/失活容器（rect 面积为 0）。旧实现会把角标挂进 display:none 子树——
+  // 面板入口整个消失且悬浮兜底被「找到锚点」封死。守卫必须跳过不可见候选。
+  const dom = makeDom();
+  const hidden = dom.document.createElement('div');
+  hidden._rect = { width: 0, height: 0, top: 0, left: 0 };   // 模拟隐藏
+  dom.registerAnchor('[class*="composer-input-surface"]', hidden);
+  runInject({ reuse: dom });
+
+  const badge = dom.byId.get('zca-badge');
+  assert.ok(badge, '应创建角标');
+  assert.strictEqual(badge.parentNode, dom.body, '不可见候选应被跳过、挂到 body');
+  assert.ok(String(badge.className).includes('zca-floating'), '应走悬浮兜底（可见可用的降级）');
+});
+
+test('inject.js：同选择器多个候选取第一个可见者（文档序 + 可见性过滤）', () => {
+  // 真实 querySelectorAll 按文档序返回全部匹配；外层容器（含子串）排在前、
+  // 工具栏排在后。正确行为是跳过隐藏的外层容器、挂进可见的工具栏。
+  const dom = makeDom();
+  const hiddenOuter = dom.document.createElement('div');
+  hiddenOuter._rect = { width: 0, height: 0, top: 0, left: 0 };
+  const toolbar = dom.document.createElement('div');
+  dom.registerAnchor('.chat-composer-input-surface .flex.items-center.justify-between', hiddenOuter);
+  dom.registerAnchor('.chat-composer-input-surface .flex.items-center.justify-between', toolbar);
+  runInject({ reuse: dom });
+
+  const badge = dom.byId.get('zca-badge');
+  assert.ok(badge, '应创建角标');
+  assert.strictEqual(badge.parentNode, toolbar, '应跳过排前的隐藏候选、挂进可见的工具栏');
 });
 
 test('inject.js：注册了 MutationObserver 监听容器重建（角标被移除后自动重建）', () => {

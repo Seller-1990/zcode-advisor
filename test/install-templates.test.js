@@ -262,6 +262,32 @@ test('assets/icon.png：已透明化——有 alpha 通道且四角透明、中�
   assert.strictEqual(alphaAt(Math.floor(width / 2), Math.floor(height / 2)), 255, '中心应不透明');
 });
 
+test('assets/icon.png：行连续性——每行的不透明区是单一连续区间（描迹法前提）', () => {
+  // 逐行描迹生成 alpha 的隐含前提：每行暗区是单一连续区间（lo/hi 两边界）。
+  // 若未来换图出现行内断裂（徽章外独立装饰点、盾尖与主体断行），描迹会把断裂区
+  // 涂成不透明背景、白底杂边原样回归——四角/中心 5 点采样抓不住这种缺陷，
+  // 因此这里做全图行扫描（tools/icon-alpha.cjs 头注释的适用前提 1）。
+  const src = loadSourceIcon();
+  assert.ok(src, 'assets/icon.png 应可解码');
+  const { width, height, rgba } = src;
+  for (let y = 0; y < height; y += 3) {   // 步进 3 采样，全图 ~42 万像素足够敏感且不拖慢
+    let seenOpaque = false;
+    let seenTransparentAfterOpaque = false;
+    for (let x = 0; x < width; x++) {
+      const a = rgba[(y * width + x) * 4 + 3];
+      if (a > 0) {
+        if (seenTransparentAfterOpaque) {
+          assert.fail(`第 ${y} 行不透明区断裂（x=${x} 前后出现透明洞）——换图后需重跑 tools/icon-alpha.cjs 或调整描迹前提`);
+        }
+        seenOpaque = true;
+      } else if (seenOpaque) {
+        seenTransparentAfterOpaque = true;
+      }
+    }
+    assert.ok(seenOpaque || !seenTransparentAfterOpaque, `第 ${y} 行应为「连续不透明区间或全透明」`);
+  }
+});
+
 test('makeIco：AND 掩码与 32px 档 alpha 对齐（透明像素置 1）', () => {
   // AND 掩码位=1 表示透明；部分旧渲染路径只读掩码不读 alpha——掩码全 0 会把
   // 已透明的四角画成杂边。布局：目录 6 + 目录项 16×2 = 38 起，BMP 头 40 + XOR 32*32*4。

@@ -738,11 +738,26 @@
 
   // 找到当前可用的锚点。ZCode 是 React 应用，容器会在切换任务/会话时重建，
   // 因此必须每次挂载时重新查找，不能缓存节点。
+  // 候选必须**可见**（rect 有面积）：子串选择器可能命中隐藏预渲染树/失活会话容器，
+  // 挂进去角标会消失、而「找到了锚点」会封死悬浮兜底（复审前端击穿点）。
+  // 不可见候选一律跳过；全部不可见时返回 null → mountBadge 走 zca-floating 悬浮
+  // （可见可用的降级路径，优于不可见的错误挂载）。
+  function anchorVisible(el) {
+    try {
+      const r = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+      return !!(r && r.width > 0 && r.height > 0);
+    } catch (_) {
+      return false;
+    }
+  }
+
   function findAnchor() {
+    const hasQSA = typeof document.querySelectorAll === 'function';
     for (const sel of ANCHOR_SELECTORS) {
       try {
-        const el2 = document.querySelector(sel);
-        if (el2) return el2;
+        const list = hasQSA ? Array.from(document.querySelectorAll(sel) || []) : [];
+        const hit = list.find(anchorVisible);
+        if (hit) return hit;
       } catch (_) { /* 选择器不兼容时跳过 */ }
     }
     return null;

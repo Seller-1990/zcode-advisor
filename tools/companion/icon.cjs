@@ -2,6 +2,11 @@
 
 // 图标生成（零依赖）：优先用 assets/icon.png（用户自定义源图）缩放出各档位；
 // 源图不存在或格式不支持时回退到程序化盾牌。ICO/ICNS 的拼装结构保持不变。
+//
+// **源图规格（换图必读，生成脚本见 tools/icon-alpha.cjs）**：
+//   - 8-bit、非隔行、灰度 0 / RGB 2 / RGBA 6（调色板/16-bit 会**静默回退盾牌**而非报错）；
+//   - 透明化由 tools/icon-alpha.cjs 逐行描迹生成（适用前提见该文件头注释）；
+//     测试 install-templates.test.js 锁四角 alpha=0、AND 掩码对齐、行连续性三项属性。
 
 const fs = require('fs');
 const path = require('path');

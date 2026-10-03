@@ -68,3 +68,27 @@ test('桥接 stderr：表单模型与已保存等值 → 稳态无提示', (t) =
   const r = runBridge({ ZCODE_ADVISOR_CFG_MODEL: 'kimi-k3' }, file);
   assert.doesNotMatch(r.stderr, /已作为全局模型写入/, `等值不应误报：\n${r.stderr}`);
 });
+
+test('桥接 stderr：损坏文件 → 拒绝写入并提示，绝不静默重建蒸发 apiKey', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-stderr-'));
+  const file = path.join(dir, 'advisor.config.json');
+  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
+  fs.writeFileSync(file, '{"apiKey": "saved-key",,,', 'utf8');
+
+  const r = runBridge({ ZCODE_ADVISOR_CFG_MODEL: 'kimi-k3' }, file);
+  assert.match(r.stderr, /已损坏/, `应提示损坏：\n${r.stderr}`);
+  assert.doesNotMatch(r.stderr, /已作为全局模型写入/, '损坏路径决不能报覆盖成功：\n' + r.stderr);
+  // 文件原样保留：半截 JSON 不被「仅表单值」的重建替换掉
+  assert.match(fs.readFileSync(file, 'utf8'), /apiKey/, '损坏文件不应被改写');
+});
+
+test('桥接 stderr：model 覆盖与 apiKey 冲突同时成立 → 两行提示并存（互斥链回归）', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-stderr-'));
+  const file = path.join(dir, 'advisor.config.json');
+  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
+  fs.writeFileSync(file, JSON.stringify({ apiKey: 'saved-key', model: 'glm-5.3-flash' }), 'utf8');
+
+  const r = runBridge({ ZCODE_ADVISOR_CFG_MODEL: 'kimi-k3', ZCODE_ADVISOR_CFG_API_KEY: 'form-key' }, file);
+  assert.match(r.stderr, /已作为全局模型写入/, `应有 model 覆盖提示：\n${r.stderr}`);
+  assert.match(r.stderr, /apiKey 与已保存配置不一致/, 'model 提示不得吞掉 apiKey 提示：\n' + r.stderr);
+});

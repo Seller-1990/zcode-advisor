@@ -177,14 +177,32 @@ function writeUserConfig(guiValues, file, opts) {
   const conflicts = opts && Array.isArray(opts.conflicts) ? opts.conflicts : [];
   const overwrites = opts && Array.isArray(opts.overwrites) ? opts.overwrites : [];
   const outcome = withConfigLock(target, () => {
-    let existing = {};
+    let existing = null;
     try {
       existing = JSON.parse(fs.readFileSync(target, 'utf8'));
-    } catch (_) {}
-    const merged = mergeUserConfig(existing, values, Object.assign({}, opts, { conflicts, overwrites }));
+    } catch (err) {
+      if (err && err.code === 'ENOENT') existing = null; // 首次写入，正常路径
+      else {
+        // 损坏/不可读 → 拒绝写入：静默拿空 base 重建会把盘上的 apiKey/maxTokens
+        // 等全部蒸发（401 同构事故）。对齐 removeUserConfigKeys 的红线：损坏必须报失败。
+        return {
+          changed: false, file: target, conflicts, overwrites,
+          error: `配置文件已损坏或不可读（${(err && err.code) || 'parse'}），拒绝自动写入以免丢失已有配置；请修复或删除该文件：${target}`
+        };
+      }
+    }
+    if (existing !== null && (typeof existing !== 'object' || Array.isArray(existing))) {
+      // 合法 JSON 但不是对象（如数组/数字）：同样拒绝——mergeUserConfig 会把非对象
+      // base 当空处理，写盘等于清空重建。
+      return {
+        changed: false, file: target, conflicts, overwrites,
+        error: `配置文件内容不是 JSON 对象，拒绝自动写入以免丢失已有配置；请修复或删除该文件：${target}`
+      };
+    }
+    const merged = mergeUserConfig(existing || {}, values, Object.assign({}, opts, { conflicts, overwrites }));
     // 无实际变化就不落盘：桥接进程每次会话启动都跑一遍，无谓改写会污染 mtime
     // 并让用户误以为配置被改动（排查 401 时正是靠 mtime 定位到本缺陷）。
-    if (JSON.stringify(merged) === JSON.stringify(existing)) {
+    if (JSON.stringify(merged) === JSON.stringify(existing || {})) {
       return { changed: false, file: target, conflicts, overwrites };
     }
     writeJsonAtomic(target, JSON.stringify(merged, null, 2));
@@ -337,27 +355,41 @@ function main() {
     result = writeUserConfig(guiValuesFromEnv(process.env), undefined,
       { fillMissingOnly: true, forceKeys: ['model'], conflicts, overwrites });
   } catch (err) {
+    // 关键：conflicts/overwrites 与 result 共享同一数组引用，merge 阶段可能已填充——
+    // 异常路径必须整体重置 result，否则下方「已作为全局模型写入」会在**写盘失败**的
+    // 同一进程里照打不误（假成功，复审后端对抗者击穿点）。
+    result = { changed: false, file: USER_CONFIG, conflicts: [], overwrites: [] };
     try { process.stderr.write(`[advisor-bridge] 落盘失败: ${err && err.message}\n`); } catch (_) {}
   }
   if (process.env.ZCODE_ADVISOR_BRIDGE_VERBOSE === '1') {
     try { process.stderr.write(`[advisor-bridge] ${JSON.stringify(result)}\n`); } catch (_) {}
+  } else if (result.error) {
+    // 损坏/不可读文件：拒绝写入的失败必须可见（否则用户不知道兜底失效了）
+    try { process.stderr.write(`[advisor-bridge] ${result.error}\n`); } catch (_) {}
   } else if (result.lockTimeout) {
-    try { process.stderr.write('[advisor-bridge] 配置文件被其他进程占用，本次跳过兜底写入\n'); } catch (_) {}
-  } else if (Array.isArray(result.overwrites) && result.overwrites.includes('model')) {
-    // 表单模型覆盖了本地配置里已有的非空模型：这是 forceKeys 的预期行为，但用户
-    // 可能不知道两头入口在互相顶（面板刚改的模型被下次会话启动的表单值压回）。
-    // 指明优先关系与退出方式，不猜哪边是对的。
-    try {
-      process.stderr.write('[advisor-bridge] 提示：插件设置页表单的「模型」已作为全局模型写入（覆盖了本地配置此前保存的值）。'
-        + '若想以本地配置面板/角标面板为准，请清空插件设置页的模型字段并保存\n');
-    } catch (_) {}
-  } else if (Array.isArray(result.conflicts) && result.conflicts.includes('apiKey')) {
-    // 环境变量表单值与已保存 key 不同：用户在面板改过 key、宿主还在发旧表单默认时的
-    // 典型征兆。桥接是只填补语义，不会覆盖；这里只指路，不猜哪边是对的。
-    try {
-      process.stderr.write('[advisor-bridge] 提示：环境变量表单里的 apiKey 与已保存配置不一致，'
-        + '以配置文件为准；如需更换请在配置面板重新保存，或在插件设置页更新\n');
-    } catch (_) {}
+    // 归因留两种可能：锁被占用是暂时性，EROFS/ENOSPC 是永久性——旧文案只说前者会误导排障
+    try { process.stderr.write('[advisor-bridge] 无法获取配置文件锁（被其他进程占用，或文件系统只读/已满），本次跳过写入\n'); } catch (_) {}
+  } else {
+    // 两条提示独立判断（可并存）：互斥 else-if 会在 model 覆盖与 apiKey 冲突同时成立时
+    // 吞掉后者的指路行（复审后端对抗者击穿点）。changed 守卫：写盘失败/未写入时
+    // 决不报「已写入」。
+    if (result.changed && Array.isArray(result.overwrites) && result.overwrites.includes('model')) {
+      // 表单模型覆盖了本地配置里已有的非空模型：这是 forceKeys 的预期行为，但用户
+      // 可能不知道两头入口在互相顶（面板刚改的模型被下次会话启动的表单值压回）。
+      // 指明优先关系与退出方式，不猜哪边是对的。
+      try {
+        process.stderr.write('[advisor-bridge] 提示：插件设置页表单的「模型」已作为全局模型写入（覆盖了本地配置此前保存的值）。'
+          + '若想以本地配置面板/角标面板为准，请清空插件设置页的模型字段并保存\n');
+      } catch (_) {}
+    }
+    if (Array.isArray(result.conflicts) && result.conflicts.includes('apiKey')) {
+      // 环境变量表单值与已保存 key 不同：用户在面板改过 key、宿主还在发旧表单默认时的
+      // 典型征兆。桥接是只填补语义，不会覆盖；这里只指路，不猜哪边是对的。
+      try {
+        process.stderr.write('[advisor-bridge] 提示：环境变量表单里的 apiKey 与已保存配置不一致，'
+          + '以配置文件为准；如需更换请在配置面板重新保存，或在插件设置页更新\n');
+      } catch (_) {}
+    }
   }
   serveMcp();
 }

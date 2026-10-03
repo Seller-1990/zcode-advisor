@@ -187,6 +187,32 @@ test('writeUserConfig：model 覆盖语义端到端（落盘 + overwrites 带出
   assert.strictEqual(saved.apiKey, 'k', '兄弟键不受影响');
 });
 
+test('writeUserConfig：损坏/非对象配置拒绝写入（不静默重建蒸发已有键）', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-remove-'));
+  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
+  const file = path.join(dir, 'advisor.config.json');
+
+  // 半截 JSON
+  fs.writeFileSync(file, '{"apiKey": "k",,,', 'utf8');
+  let r = writeUserConfig({ model: 'm' }, file, { fillMissingOnly: true, forceKeys: ['model'] });
+  assert.strictEqual(r.changed, false);
+  assert.ok(r.error, '损坏必须带 error');
+  assert.match(fs.readFileSync(file, 'utf8'), /apiKey/, '损坏文件原样保留');
+
+  // 合法 JSON 但不是对象（数组）——mergeUserConfig 会把非对象 base 当空处理，等于清空重建
+  fs.writeFileSync(file, '["x"]', 'utf8');
+  r = writeUserConfig({ model: 'm' }, file, { fillMissingOnly: true, forceKeys: ['model'] });
+  assert.strictEqual(r.changed, false);
+  assert.ok(r.error, '非对象 JSON 也必须拒绝');
+  assert.strictEqual(fs.readFileSync(file, 'utf8'), '["x"]');
+
+  // 文件不存在 = 正常首次写入（不受守卫影响）
+  const fresh = path.join(dir, 'fresh.json');
+  r = writeUserConfig({ model: 'm' }, fresh, { fillMissingOnly: true, forceKeys: ['model'] });
+  assert.strictEqual(r.changed, true);
+  assert.strictEqual(JSON.parse(fs.readFileSync(fresh, 'utf8')).model, 'm');
+});
+
 test('bridgeStatus：无文件/坏文件时不抛错，configured 反映 env key', (t) => {
   const cb = require('../tools/config-bridge');
   // bridgeStatus 读 USER_CONFIG 常量；测试环境该文件在 tmpdir 下且通常不存在。

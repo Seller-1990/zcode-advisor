@@ -46,7 +46,17 @@ setlocal
 set "DST=%LOCALAPPDATA%\\ZCodeAdvisor"
 echo 安装 zcode-advisor 外挂到 %DST% ...
 xcopy /E /I /Y /Q "%~dp0*" "%DST%\\" >nul
+if errorlevel 1 (
+  echo [错误] 文件复制失败（可能被杀毒软件拦截或目录被占用）：%DST%
+  echo 请关闭占用程序或将 %DST% 加入白名单后重试。桌面图标未创建。
+  endlocal & exit /b 1
+)
 cscript //nologo "%DST%\\install-shortcut.vbs"
+if errorlevel 1 (
+  echo [错误] 快捷方式创建失败（cscript 退出码非零）。文件已复制到 %DST%，可手动运行：
+  echo   %DST%\\install-shortcut.vbs
+  endlocal & exit /b 1
+)
 echo 完成：桌面已创建「ZCode Advisor」图标（双击即以角标模式启动 ZCode）。
 endlocal & exit /b 0
 `;
