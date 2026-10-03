@@ -231,7 +231,16 @@ function makeIco() {
       xor[d + 3] = s32[s + 3]; // A
     }
   }
-  const and = Buffer.alloc(32 * 4); // 全 0 = 不透明位
+  // AND 掩码按 alpha 置位（位=1 表示透明，BMP 自下而上、字节内高位在左）。
+  // 32bpp 图标多数渲染器只用 alpha 通道，但部分旧渲染路径（资源管理器小图标等）
+  // 仍读 AND 掩码——源图四角透明后若掩码全 0（=全不透明），这些路径会把透明角画成杂边。
+  const and = Buffer.alloc(32 * 4);
+  for (let y = 0; y < 32; y++) {
+    const dstRow = (31 - y) * 4;
+    for (let x = 0; x < 32; x++) {
+      if (s32[y * 32 * 4 + x * 4 + 3] < 128) and[dstRow + (x >> 3)] |= 0x80 >> (x & 7);
+    }
+  }
   const bmpHeader = Buffer.alloc(40);
   bmpHeader.writeUInt32LE(40, 0); bmpHeader.writeInt32LE(32, 4); bmpHeader.writeInt32LE(64, 8);
   bmpHeader.writeUInt16LE(1, 12); bmpHeader.writeUInt16LE(32, 14);

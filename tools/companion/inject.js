@@ -168,7 +168,12 @@
       // 输入框工具栏右侧按钮组 → 工具栏行 → 输入框外框（追加在末尾）
       '.chat-composer-input-surface .ml-auto.flex.shrink-0.items-center.justify-end',
       '.chat-composer-input-surface .flex.items-center.justify-between',
-      '.chat-composer-input-surface'
+      // 版本差异兜底：宿主改类名前缀时（如 chat-composer → xxx-composer），
+      // 子串匹配仍能锚进输入框工具栏——全部落空才会退回右下角悬浮，
+      // 而「悬浮在右下角」正是不同机器上角标位置不一致的来源。
+      '[class*="composer-input-surface"] .ml-auto.flex.shrink-0.items-center.justify-end',
+      '[class*="composer-input-surface"] .flex.items-center.justify-between',
+      '[class*="composer-input-surface"]'
     ];
 
   // topbar 模式用于标记容器（角标需要包一层，才能作为常驻条显示）
@@ -674,6 +679,7 @@
       </div>
       <details class="zca-adv" id="zca-adv">
         <summary>高级</summary>
+        <div class="zca-hint" title="仅当前会话生效，优先于这里的全局模型；reset 恢复全局模型">会话级临时换模型：在会话里运行 /advisor-model set &lt;模型id&gt;（reset 恢复全局）</div>
         <label class="zca-label" title="意见何时送达：下一轮附带，或当轮立即打断">审查模式</label>
         <select id="zca-reviewMode" title="async：意见随下一条消息送达（默认）｜sync：concern/blocker 当轮立即打断">
           <option value="async">async</option>

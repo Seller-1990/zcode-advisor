@@ -1,6 +1,6 @@
 {
   "name": "zcode-advisor",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "description": "dsh-advisor 的 zcode 移植：独立审查副模型在每轮结束后被动审查对话增量，以 nit/concern/blocker 三级建议注回会话（advisory-only，绝不阻塞主流程）。",
   "author": {
     "name": "local"
@@ -30,7 +30,7 @@
     "model": {
       "type": "string",
       "default": "",
-      "description": "审查模型 id（引擎默认 glm-5.3-flash）。留空 = 不经本表单写入配置；建议与主对话模型形成能力差，思考型模型建议把 max_tokens 提到 4096"
+      "description": "全局审查模型 id（引擎默认 glm-5.3-flash）。在此填写并保存 = 设为全局模型：非空即生效并覆盖本地配置文件里的 model，下一轮审查即生效、无需重启；留空 = 本表单不干预模型（以配置面板/默认值为准）。会话级临时换模型：会话内运行 /advisor-model set <模型id>（仅当前会话生效，优先于全局）。建议与主对话模型形成能力差，思考型模型建议把 max_tokens 提到 4096"
     },
     "base_url": {
       "type": "string",

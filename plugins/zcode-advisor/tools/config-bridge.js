@@ -5,10 +5,13 @@
 // 作用：把插件设置页（plugin.json userConfig 表单）里保存的值落盘到用户级配置
 // ~/.zcode/advisor.config.json——这样 hook（读不到 user_config 环境变量）也能用上 GUI 配置。
 // 纪律：
-// - **只填补缺失键**：宿主会把 userConfig 声明的 default 展开进环境变量（用户没填也有值），
-//   因此这里绝不能覆盖用户级配置里已有的非空值——否则每次会话启动都会把用户在
-//   配置面板/advisor-setup 里调好的端点、模型静默改回表单默认（真机实测踩过：401）。
+// - **只填补缺失键（例外：model）**：宿主会把 userConfig 声明的 default 展开进环境变量
+//   （用户没填也有值），因此这里绝不能覆盖用户级配置里已有的非空值——否则每次会话启动
+//   都会把用户在配置面板/advisor-setup 里调好的端点、模型静默改回表单默认（真机实测踩过：401）。
 //   表单是"兜底填充"，不是"权威覆盖"；显式写路径（面板保存按钮）才用覆盖语义。
+//   **model 例外**：模型是用户明确要求可从插件设置表单直接修改的全局项（0.2.14 起），
+//   表单非空即覆盖（forceKeys），其余键维持只兜底——用户在表单填模型 = 表单说了算，
+//   想以面板为准就清空表单模型字段。
 // - 落盘失败只写 stderr，不影响 MCP 协议；
 // - 启动即落盘，然后再服务最小 MCP 协议（stdio JSON-RPC），宿主异常时也不阻塞会话。
 
@@ -55,10 +58,18 @@ function isBlank(v) {
 //   已有非空值一律保留。用于**随会话启动的桥接进程**（见文件头纪律）。
 function mergeUserConfig(existingRaw, guiValues, opts) {
   const fillMissingOnly = !!(opts && opts.fillMissingOnly);
+  // opts.forceKeys（可选数组）：fillMissingOnly 语义下仍**非空即覆盖**的键。
+  // 背景：model 是用户明确要求可从插件设置表单直接修改的全局项——若同样只兜底，
+  // 配置文件里已有非空模型时表单永远改不动。其余键（尤其 apiKey/baseUrl）维持
+  // 只兜底纪律：宿主缓存旧表单值时，覆盖语义会把面板里调好的配置静默改回（真机 401 教训）。
+  const forceKeys = opts && Array.isArray(opts.forceKeys) ? opts.forceKeys : null;
   // opts.conflicts（可选数组，传入即收集）：fillMissingOnly 语义下被跳过、且 GUI 值
   // 与既有值**不同**的键。等值跳过是稳态（表单默认 === 已保存值），不算冲突——否则
   // 每次会话启动都会误报。冲突键不落盘、不报错，仅供提示与状态查询。
   const conflicts = opts && Array.isArray(opts.conflicts) ? opts.conflicts : null;
+  // opts.overwrites（可选数组，传入即收集）：forceKeys 覆盖语义下**值确实变了**的键。
+  // 等值写入也是稳态，不记；只有真覆盖才提示（用户需知道面板值被表单压回）。
+  const overwrites = opts && Array.isArray(opts.overwrites) ? opts.overwrites : null;
   let base = {};
   if (existingRaw && typeof existingRaw === 'object' && !Array.isArray(existingRaw)) {
     base = existingRaw;
@@ -73,9 +84,13 @@ function mergeUserConfig(existingRaw, guiValues, opts) {
   for (const [k, v] of Object.entries(guiValues || {})) {
     if (k === '__proto__') continue;
     if (isBlank(v)) continue;
-    if (fillMissingOnly && !isBlank(merged[k])) {
+    const forced = !!(fillMissingOnly && forceKeys && forceKeys.includes(k));
+    if (fillMissingOnly && !isBlank(merged[k]) && !forced) {
       if (conflicts && String(v) !== String(merged[k])) conflicts.push(k);
       continue; // 已有非空值：用户配置优先
+    }
+    if (forced && !isBlank(merged[k]) && String(v) !== String(merged[k]) && overwrites) {
+      overwrites.push(k);
     }
     merged[k] = v;
   }
@@ -154,30 +169,31 @@ function writeJsonAtomic(target, text) {
 function writeUserConfig(guiValues, file, opts) {
   const target = file || USER_CONFIG;
   const values = guiValues || {};
-  if (Object.keys(values).length === 0) return { changed: false, file: target, conflicts: [] };
+  if (Object.keys(values).length === 0) return { changed: false, file: target, conflicts: [], overwrites: [] };
   // 抢锁前先建目录：wx 建锁需要父目录存在（否则 ENOENT 被误判为永久性失败立即放弃）。
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   // 读-合-比-写全程在跨进程临界区内：面板保存与桥接启动写并发时不再互相覆盖（丢更新）。
-  // 冲突收集：调用方传了数组就用调用方的（同步填充），否则内部自建并随返回值带出。
+  // 冲突/覆盖收集：调用方传了数组就用调用方的（同步填充），否则内部自建并随返回值带出。
   const conflicts = opts && Array.isArray(opts.conflicts) ? opts.conflicts : [];
+  const overwrites = opts && Array.isArray(opts.overwrites) ? opts.overwrites : [];
   const outcome = withConfigLock(target, () => {
     let existing = {};
     try {
       existing = JSON.parse(fs.readFileSync(target, 'utf8'));
     } catch (_) {}
-    const merged = mergeUserConfig(existing, values, Object.assign({}, opts, { conflicts }));
+    const merged = mergeUserConfig(existing, values, Object.assign({}, opts, { conflicts, overwrites }));
     // 无实际变化就不落盘：桥接进程每次会话启动都跑一遍，无谓改写会污染 mtime
     // 并让用户误以为配置被改动（排查 401 时正是靠 mtime 定位到本缺陷）。
     if (JSON.stringify(merged) === JSON.stringify(existing)) {
-      return { changed: false, file: target, conflicts };
+      return { changed: false, file: target, conflicts, overwrites };
     }
     writeJsonAtomic(target, JSON.stringify(merged, null, 2));
-    return { changed: true, file: target, keys: Object.keys(values), conflicts };
+    return { changed: true, file: target, keys: Object.keys(values), conflicts, overwrites };
   });
   if (outcome === false) {
     // 拿不到锁（约 1s）：如实上报，调用方决定失败语义。fillMissingOnly 不会在下次会话
     // 「兜底」补回本次写入（只填缺失键），显式保存必须当场成功或当场报错。
-    return { changed: false, file: target, lockTimeout: true, conflicts };
+    return { changed: false, file: target, lockTimeout: true, conflicts, overwrites };
   }
   return outcome;
 }
@@ -312,10 +328,14 @@ function bridgeStatus() {
 
 function main() {
   const conflicts = [];
-  let result = { changed: false, file: USER_CONFIG, conflicts };
+  const overwrites = [];
+  let result = { changed: false, file: USER_CONFIG, conflicts, overwrites };
   try {
     // fillMissingOnly：宿主展开的 userConfig 默认值只用于兜底，绝不覆盖用户已配置的非空值。
-    result = writeUserConfig(guiValuesFromEnv(process.env), undefined, { fillMissingOnly: true, conflicts });
+    // 例外 forceKeys=['model']：模型是用户明确要求「插件设置表单可直接改全局」的键，
+    // 表单非空即覆盖（见 mergeUserConfig 注释）。
+    result = writeUserConfig(guiValuesFromEnv(process.env), undefined,
+      { fillMissingOnly: true, forceKeys: ['model'], conflicts, overwrites });
   } catch (err) {
     try { process.stderr.write(`[advisor-bridge] 落盘失败: ${err && err.message}\n`); } catch (_) {}
   }
@@ -323,6 +343,14 @@ function main() {
     try { process.stderr.write(`[advisor-bridge] ${JSON.stringify(result)}\n`); } catch (_) {}
   } else if (result.lockTimeout) {
     try { process.stderr.write('[advisor-bridge] 配置文件被其他进程占用，本次跳过兜底写入\n'); } catch (_) {}
+  } else if (Array.isArray(result.overwrites) && result.overwrites.includes('model')) {
+    // 表单模型覆盖了本地配置里已有的非空模型：这是 forceKeys 的预期行为，但用户
+    // 可能不知道两头入口在互相顶（面板刚改的模型被下次会话启动的表单值压回）。
+    // 指明优先关系与退出方式，不猜哪边是对的。
+    try {
+      process.stderr.write('[advisor-bridge] 提示：插件设置页表单的「模型」已作为全局模型写入（覆盖了本地配置此前保存的值）。'
+        + '若想以本地配置面板/角标面板为准，请清空插件设置页的模型字段并保存\n');
+    } catch (_) {}
   } else if (Array.isArray(result.conflicts) && result.conflicts.includes('apiKey')) {
     // 环境变量表单值与已保存 key 不同：用户在面板改过 key、宿主还在发旧表单默认时的
     // 典型征兆。桥接是只填补语义，不会覆盖；这里只指路，不猜哪边是对的。

@@ -46,3 +46,25 @@ test('桥接 stderr：等值稳态（表单默认 === 已保存）→ 无冲突�
   const r = runBridge({ ZCODE_ADVISOR_CFG_API_KEY: 'same-key' }, file);
   assert.doesNotMatch(r.stderr, /不一致/, `等值不应误报：\n${r.stderr}`);
 });
+
+test('桥接 stderr：表单模型覆盖已保存模型 → 一行指路提示（forceKeys 语义）', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-stderr-'));
+  const file = path.join(dir, 'advisor.config.json');
+  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
+  fs.writeFileSync(file, JSON.stringify({ model: 'glm-5.3-flash' }), 'utf8');
+
+  const r = runBridge({ ZCODE_ADVISOR_CFG_MODEL: 'kimi-k3' }, file);
+  assert.match(r.stderr, /模型.*已作为全局模型写入/, `应有覆盖提示：\n${r.stderr}`);
+  // model 是 forceKeys：覆盖语义，落盘的是表单值
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).model, 'kimi-k3');
+});
+
+test('桥接 stderr：表单模型与已保存等值 → 稳态无提示', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-stderr-'));
+  const file = path.join(dir, 'advisor.config.json');
+  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
+  fs.writeFileSync(file, JSON.stringify({ model: 'kimi-k3' }), 'utf8');
+
+  const r = runBridge({ ZCODE_ADVISOR_CFG_MODEL: 'kimi-k3' }, file);
+  assert.doesNotMatch(r.stderr, /已作为全局模型写入/, `等值不应误报：\n${r.stderr}`);
+});

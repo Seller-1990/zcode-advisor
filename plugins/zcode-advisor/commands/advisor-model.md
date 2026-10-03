@@ -10,4 +10,4 @@ argument-hint: "[set <model-id> | reset]"
    - 参数为空：`node "<脚本绝对路径>" ctl model --state "<状态文件绝对路径>"`
    - 参数以 `set ` 开头：`node "<脚本绝对路径>" ctl model set <model-id> --state "<状态文件绝对路径>"`
    - 参数为 `reset`：`node "<脚本绝对路径>" ctl model reset --state "<状态文件绝对路径>"`
-3. 如实报告输出。说明：`set` 只覆盖当前会话、自下一轮审查起生效（不校验模型存在性，无效模型会在 status 的 Dropped:llm_http_4xx 中暴露）；全局默认模型在插件安装目录的 advisor.config.json 中修改（注意：运行时读取的是安装缓存里的副本，改源码目录不生效）。
+3. 如实报告输出。说明：`set` 只覆盖当前会话、自下一轮审查起生效（不校验模型存在性，无效模型会在 status 的 Dropped:llm_http_4xx 中暴露）；优先级为**会话覆盖 > 全局模型 > 内置默认**。全局默认模型改法（任选）：插件设置表单（设置 → 插件管理 → zcode-advisor → 模型字段，非空即覆盖）、配置面板、或直接编辑 `~/.zcode/advisor.config.json`。

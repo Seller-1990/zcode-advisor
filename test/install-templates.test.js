@@ -13,7 +13,7 @@ const { execFileSync } = require('child_process');
 
 const T = require('../tools/companion/install-templates.cjs');
 const { COMPANION_FILES, companionRuntimeFiles } = require('../tools/companion/build-meta.cjs');
-const { makeIco, makeIcns, drawShield, encodePng, ICNS_SIZES, iconPixels } = require('../tools/companion/icon.cjs');
+const { makeIco, makeIcns, drawShield, encodePng, ICNS_SIZES, iconPixels, decodePng, loadSourceIcon } = require('../tools/companion/icon.cjs');
 
 const { VERSION } = require('../tools/companion/build-meta.cjs');
 
@@ -244,6 +244,44 @@ test('makeIcns：iconutil 可完整往返（macOS 严格校验）', {
   const files = fs.readdirSync(path.join(dir, 'a.iconset'));
   assert.ok(files.some((f) => f.endsWith('.png')), 'iconutil 应能解出 PNG 档位');
   void out;
+});
+
+// ---------------- 源图标透明度（四角白底回归防线） ----------------
+
+test('assets/icon.png：已透明化——有 alpha 通道且四角透明、中心不透明', () => {
+  const src = loadSourceIcon();
+  assert.ok(src, 'assets/icon.png 应可解码');
+  const { width, height, rgba } = src;
+  const alphaAt = (x, y) => rgba[(y * width + x) * 4 + 3];
+  // 四角必须透明：源图是 RGB 无 alpha 的徽章时，角上的白底会被原样带进 ico/icns，
+  // 在深色桌面/坞栏上出现白色杂角（实测缺陷）。
+  assert.strictEqual(alphaAt(0, 0), 0, '左上角应透明');
+  assert.strictEqual(alphaAt(width - 1, 0), 0, '右上角应透明');
+  assert.strictEqual(alphaAt(0, height - 1), 0, '左下角应透明');
+  assert.strictEqual(alphaAt(width - 1, height - 1), 0, '右下角应透明');
+  assert.strictEqual(alphaAt(Math.floor(width / 2), Math.floor(height / 2)), 255, '中心应不透明');
+});
+
+test('makeIco：AND 掩码与 32px 档 alpha 对齐（透明像素置 1）', () => {
+  // AND 掩码位=1 表示透明；部分旧渲染路径只读掩码不读 alpha——掩码全 0 会把
+  // 已透明的四角画成杂边。布局：目录 6 + 目录项 16×2 = 38 起，BMP 头 40 + XOR 32*32*4。
+  const ico = makeIco();
+  const andOff = 6 + 16 * 2 + 40 + 32 * 32 * 4;
+  const s32 = iconPixels(32);
+  const isTransparentAt = (x, y) => s32[(y * 32 + x) * 4 + 3] < 128;
+  // AND 掩码自下而上：掩码行 = 31 - y
+  const maskBit = (x, y) => {
+    const row = 31 - y;
+    return (ico[andOff + row * 4 + (x >> 3)] >> (7 - (x & 7))) & 1;
+  };
+  // 至少一个角透明（源图透明化后必然成立；程序化盾牌回退同样有透明角）
+  const cornerTransparent = isTransparentAt(0, 0) || isTransparentAt(31, 0)
+    || isTransparentAt(0, 31) || isTransparentAt(31, 31);
+  assert.ok(cornerTransparent, '32px 档应有透明角（源图或盾牌回退）');
+  for (const [x, y] of [[0, 0], [31, 0], [0, 31], [31, 31]]) {
+    assert.strictEqual(maskBit(x, y), isTransparentAt(x, y) ? 1 : 0, `AND 掩码应与 alpha 对齐：(${x},${y})`);
+  }
+  assert.strictEqual(maskBit(16, 16), 0, '中心应不透明（掩码位 0）');
 });
 
 // ---------------- 依赖闭包（B1 回归防线） ----------------

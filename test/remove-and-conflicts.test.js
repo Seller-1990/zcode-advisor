@@ -127,6 +127,66 @@ test('writeUserConfig：所有返回路径都带 conflicts', (t) => {
   assert.deepStrictEqual(r2.conflicts, [], '早退路径也带 conflicts 字段');
 });
 
+// —— forceKeys：model 表单非空即覆盖（0.2.14，用户要求插件表单可直接设全局模型） ——
+
+test('mergeUserConfig：forceKeys 的键非空即覆盖，其余键仍只兜底', () => {
+  const conflicts = [];
+  const overwrites = [];
+  const merged = mergeUserConfig(
+    { apiKey: 'user-key', model: 'glm-5.3-flash' },
+    { apiKey: 'form-key', model: 'kimi-k3' },
+    { fillMissingOnly: true, forceKeys: ['model'], conflicts, overwrites }
+  );
+  assert.strictEqual(merged.model, 'kimi-k3', '表单模型应覆盖已有全局模型');
+  assert.strictEqual(merged.apiKey, 'user-key', '未列入 forceKeys 的键不被覆盖');
+  assert.deepStrictEqual(conflicts, ['apiKey']);
+  assert.deepStrictEqual(overwrites, ['model'], '真覆盖才入列');
+});
+
+test('mergeUserConfig：forceKeys 等值写入是稳态（不记 overwrites）', () => {
+  const overwrites = [];
+  const merged = mergeUserConfig(
+    { model: 'kimi-k3' },
+    { model: 'kimi-k3' },
+    { fillMissingOnly: true, forceKeys: ['model'], overwrites }
+  );
+  assert.strictEqual(merged.model, 'kimi-k3');
+  assert.deepStrictEqual(overwrites, [], '等值写入是稳态，不算覆盖');
+});
+
+test('mergeUserConfig：表单模型为空 → 不覆盖也不清除既有模型', () => {
+  const merged = mergeUserConfig(
+    { model: 'glm-5.3-flash' },
+    { model: '' },
+    { fillMissingOnly: true, forceKeys: ['model'] }
+  );
+  assert.strictEqual(merged.model, 'glm-5.3-flash', '留空 = 表单不干预');
+});
+
+test('mergeUserConfig：forceKeys 对既有空值照常写入（填补缺失不算覆盖）', () => {
+  const overwrites = [];
+  const merged = mergeUserConfig(
+    { model: '' },
+    { model: 'kimi-k3' },
+    { fillMissingOnly: true, forceKeys: ['model'], overwrites }
+  );
+  assert.strictEqual(merged.model, 'kimi-k3');
+  assert.deepStrictEqual(overwrites, []);
+});
+
+test('writeUserConfig：model 覆盖语义端到端（落盘 + overwrites 带出 + 兄弟键保留）', (t) => {
+  const file = tmpFile(t);
+  fs.writeFileSync(file, JSON.stringify({ apiKey: 'k', model: 'glm-5.3-flash' }), 'utf8');
+  const overwrites = [];
+  const r = writeUserConfig({ model: 'kimi-k3' }, file,
+    { fillMissingOnly: true, forceKeys: ['model'], overwrites });
+  assert.strictEqual(r.changed, true);
+  assert.deepStrictEqual(r.overwrites, ['model']);
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(saved.model, 'kimi-k3');
+  assert.strictEqual(saved.apiKey, 'k', '兄弟键不受影响');
+});
+
 test('bridgeStatus：无文件/坏文件时不抛错，configured 反映 env key', (t) => {
   const cb = require('../tools/config-bridge');
   // bridgeStatus 读 USER_CONFIG 常量；测试环境该文件在 tmpdir 下且通常不存在。
