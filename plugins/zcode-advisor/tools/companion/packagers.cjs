@@ -197,16 +197,26 @@ fi
 "$NODE" "$DIR/app/auto-enable.cjs" >>"$LOG" 2>&1 || true
 
 nohup "$NODE" "$DIR/app/controller.cjs" >>"$LOG" 2>&1 &
-# 快速失败探测：controller 若在 3 秒内就退出（如「ZCode 已在运行但无调试端口」），
-# 说明这次点击没起作用。此时弹窗告知——否则用户面对的是「点了没反应」，
-# 而真正的错误原因只躺在 ~/.zcode/advisor-companion.log 里没人看。
+# 快速失败探测：controller 用退出码区分「正常让位」与「真失败」——
+#   0 = 已有一个健康的 companion 在跑（本次让位）→ 静默，不该弹窗；
+#   非 0 = 真失败（如「ZCode 已在运行但没有调试端口」）→ 弹窗告知。
+# 做法：最多等 3s；期间若进程已退出，wait 会立即返回其退出码。
+# 若 3s 后仍存活 → 视为启动成功（它是长期驻留进程，不能 wait 到底，否则启动器永久阻塞）。
 CPID=$!
-sleep 3
+i=0
+while [ "$i" -lt 6 ]; do
+  kill -0 "$CPID" 2>/dev/null || break
+  sleep 0.5
+  i=$((i + 1))
+done
 if ! kill -0 "$CPID" 2>/dev/null; then
-  # 已退出：从日志尾部取最后几行有信息量的内容作为提示
-  TAIL="$(tail -6 "$LOG" 2>/dev/null | grep -v '^\\[' | tail -3)"
-  [ -z "$TAIL" ] && TAIL="详见日志：$LOG"
-  osascript -e "display dialog \\"顾问外挂未能启动。\\n\\n$TAIL\\" with title \\"ZCode Advisor\\" buttons [\\"好\\"] default button [\\"好\\"] with icon caution" >/dev/null 2>&1
+  wait "$CPID"
+  STATUS=$?
+  if [ "$STATUS" -ne 0 ]; then
+    TAIL="$(tail -8 "$LOG" 2>/dev/null | grep -v '^\\[' | tail -4)"
+    [ -z "$TAIL" ] && TAIL="详见日志：$LOG"
+    osascript -e "display dialog \\"顾问外挂未能启动（退出码 $STATUS）。\\n\\n$TAIL\\" with title \\"ZCode Advisor\\" buttons [\\"好\\"] default button [\\"好\\"] with icon caution" >/dev/null 2>&1
+  fi
 fi
 exit 0
 `;

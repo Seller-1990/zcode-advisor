@@ -197,8 +197,12 @@ test('MAC_APP_LAUNCHER：controller 快速退出时弹窗告知（治「点了�
   // 但无调试端口」），用户面对的是「点了没反应」，错误原因只躺在日志里没人看。
   assert.match(sh, /CPID=\$!/, '应记录 controller 子进程 pid');
   assert.match(sh, /kill -0 "\$CPID"/, '应探测 controller 是否仍存活');
-  assert.match(sh, /display dialog/, '快速失败时应弹窗告知原因');
-  assert.match(sh, /tail -6 "\$LOG"/, '弹窗内容应取自日志尾部，给出可操作线索');
+  assert.match(sh, /wait "\$CPID"/, '应取退出码以区分正常让位与真失败');
+  assert.match(sh, /STATUS/, '应有退出码判断');
+  assert.match(sh, /display dialog/, '失败时应弹窗告知原因');
+  assert.match(sh, /tail -8 "\$LOG"/, '弹窗内容应取自日志尾部，给出可操作线索');
+  // 关键：不能无条件 wait 到底——controller 是长期驻留进程，那样启动器会永久阻塞
+  assert.match(sh, /while \[ "\$i" -lt 6 \]/, '必须用有限次轮询而非无限等待');
 });
 
 // ---------------- DMG（macOS 专属） ----------------
