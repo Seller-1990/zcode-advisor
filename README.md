@@ -127,6 +127,7 @@ ZCode 桌面版没有官方 UI 扩展机制，因此在界面内提供设置入�
 
 - **双击 `启动-Advisor-ZCode.cmd`**（Windows）或运行 `node tools/companion/controller.cjs`：
   以调试模式拉起 ZCode（或在已有调试实例时直接附着），保持一个控制台窗口（使用期间别关）；
+  **macOS 装好 DMG 后无需此步**——`.app` 会自动配置 LaunchAgent，登录即就绪（见上节）；
 - ZCode 输入框区域右下角出现 **🛡️ 顾问角标**，点开即设置面板：
   - **API 来源（二选一）**：`ZCode 已维护` = 直接选用 ZCode 设置里配置的第三方 API（下拉选服务商 + 模型，key 留在 ZCode 配置里不出进程）；`手动维护` = 在面板里单独填端点 / key / 模型；
   - **启用顾问**：面板首行的独立开关（新会话是否自动启用审查）；
@@ -139,6 +140,29 @@ ZCode 桌面版没有官方 UI 扩展机制，因此在界面内提供设置入�
 
 **macOS 用户**：若自动探测不到 ZCode，在 `~/.zcode/advisor-companion.json` 填
 `{ "zcodePath": "/Applications/ZCode.app" }`（支持直接填 `.app` 包路径，会自动解析到内部可执行文件）。
+
+### macOS 登录自启动（LaunchAgent）
+
+DMG 安装的 `.app` 首次打开时会**自动装上 LaunchAgent**（`~/Library/LaunchAgents/local.zcode.advisor.plist`），
+此后**登录即自动就绪**——不必再用启动器打开，直接双击 ZCode 也会有角标：
+
+- `RunAtLoad`：登录时自动拉起；`KeepAlive{SuccessfulExit:false}`：崩溃后自动重启；
+  `ThrottleInterval=30`：重试间隔 30s（不会重启风暴）。
+- 由 launchd 监督时，controller 的退出码语义会切换：**暂不可用**（ZCode 正以非调试模式运行、
+  端口占用等）退 `3` 让 launchd 稍后重试；**永久性失败**（Node 版本过低、`zcodePath` 不可执行）
+  退 `0` 停止重启，避免每 30s 空转刷日志。
+- 若你**习惯直接打开 ZCode**：那个实例没有调试端口，注入无法后补——受监督的外挂会每 30s 重试，
+  你**完全退出 ZCode（含菜单栏图标）**后它会自动接管并重新以调试模式拉起，无需手动操作。
+
+管理命令（用包内 Node 运行，`<app>` = `ZCode Advisor.app/Contents/Resources`）：
+
+```bash
+"<app>/node" "<app>/app/launchd.cjs" status         # 查看是否已加载
+"<app>/node" "<app>/app/launchd.cjs" install --now  # 安装并立即加载（幂等）
+"<app>/node" "<app>/app/launchd.cjs" uninstall      # 卸载自启动（可逆）
+```
+
+> 也可直接删掉该 plist 并执行 `launchctl bootout gui/$UID/local.zcode.advisor` 完成卸载。
 
 > **关于插件设置表单（`userConfig`）的如实说明**：本项目在 `.zcode-plugin/plugin.json` 中声明了
 > `userConfig` 设置表单（沿用 Claude Code 契约）。但 ZCode 官方插件规范

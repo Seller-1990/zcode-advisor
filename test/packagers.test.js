@@ -205,6 +205,22 @@ test('MAC_APP_LAUNCHER：controller 快速退出时弹窗告知（治「点了�
   assert.match(sh, /while \[ "\$i" -lt 6 \]/, '必须用有限次轮询而非无限等待');
 });
 
+test('MAC_APP_LAUNCHER：安装 LaunchAgent 并让位给 launchd（治「直接开 ZCode 没角标」）', () => {
+  const sh = P.MAC_APP_LAUNCHER;
+  // 回归背景：无自启动绑定 → 用户直接双击 ZCode 时顾问尚未就绪，那个实例没有
+  // 调试端口，角标永不出现。修复：启动器幂等安装 LaunchAgent 并立即加载。
+  assert.match(sh, /launchd\.cjs" install --now/, '应安装并立即加载 LaunchAgent');
+  assert.match(sh, /launchd\.cjs" status/, '应探测 agent 是否已加载');
+  assert.match(sh, /grep -q 'loaded=是'/, '已加载时应让位给 launchd');
+  // 关键：让位必须在 nohup controller 之前，否则两个 owner 互抢单实例锁、
+  // 被监督者每 30s 重启一次刷日志
+  const yieldIdx = sh.indexOf("grep -q 'loaded=是'");
+  const nohupIdx = sh.indexOf('nohup "$NODE" "$DIR/app/controller.cjs"');
+  assert.ok(yieldIdx > -1 && nohupIdx > -1 && yieldIdx < nohupIdx,
+    '让位判断必须早于自行拉起 controller（否则双 owner 抢锁）');
+  assert.match(sh, /回退路径|launchd 不可用/, '应保留 launchd 不可用时的回退拉起路径');
+});
+
 // ---------------- DMG（macOS 专属） ----------------
 
 test('buildDmg：非 macOS 时明确返回不可用原因', {

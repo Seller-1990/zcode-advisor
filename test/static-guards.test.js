@@ -100,6 +100,67 @@ test('macOS 包：stageMacApp 的 pluginDir 不得硬编码架构，且 payload 
   assert.match(macBody, /pluginDir:\s*pluginRoot/, 'pluginDir 应传 pluginRoot（避免 plugin/plugin 嵌套）');
 });
 
+test('launchd 自启动：三个发行路径都必须携带 launchd.cjs（独立 CLI 不在 require 闭包内）', () => {
+  const bi = read('tools/companion/build-installer.cjs');
+  const pk = read('tools/companion/packagers.cjs');
+  const it = read('tools/companion/install-templates.cjs');
+  const bm = read('tools/companion/build-meta.cjs');
+
+  // 前提：它确实不在依赖闭包里（否则不该显式打包，说明设计已变）
+  assert.ok(!/launchd\.cjs/.test(bm), 'launchd.cjs 不应进入 require 闭包（它是独立 CLI）');
+
+  // 1) .app（stageMacApp 拷贝 + buildMac 的 tar.gz entries）
+  assert.match(pk, /launchdMod[\s\S]{0,200}appRes[\s\S]{0,80}launchd\.cjs/,
+    'stageMacApp 必须把 launchd.cjs 拷进 Resources/app');
+  // 2) tar.gz
+  assert.match(bi, /entries\.push\(\{\s*path:\s*'launchd\.cjs'/,
+    'buildMac 必须把 launchd.cjs 打进 tar.gz');
+  // 3) tar.gz 的 install.sh
+  assert.match(it, /cp -f "\$SRC\/launchd\.cjs" "\$SUPPORT\/"/,
+    'install.sh 必须把 launchd.cjs 复制到 Support 目录');
+  // 4) 构建期校验（缺了就报错，而不是静默失效）
+  assert.match(bi, /names\.includes\('launchd\.cjs'\)/, 'tar.gz 校验必须要求 launchd.cjs');
+  assert.match(bi, /launchdMod\)/, '.app 校验必须要求 launchd.cjs');
+});
+
+test('macOS DMG：必须校验内嵌 node（GUI 启动不继承 PATH，缺 node 必然启动失败）', () => {
+  const bi = read('tools/companion/build-installer.cjs');
+  // 回归背景：曾用 --no-embed-node 构建并分发，用户双击只得到「找不到 node」弹窗
+  // （Finder 启动不继承 shell PATH，nvm 管理的 node 找不到），而校验当时不查 node。
+  assert.match(bi, /const nodeBin = path\.join\(resources, 'node'\)/,
+    'verifyDmg 必须检查 .app 内的内嵌 node');
+  assert.match(bi, /expectNode/, '内嵌 node 的校验要区分构建选项（--no-embed-node 时只警告）');
+  // 校验必须真正失败（throw），不能只 warn
+  const idx = bi.indexOf("if (!fs.existsSync(nodeBin))");
+  assert.ok(idx > -1, '应有 node 缺失分支');
+  assert.match(bi.slice(idx, idx + 400), /throw new Error/,
+    '内嵌 node 缺失必须 throw（否则构建绿灯放行坏包）');
+});
+
+test('controller：spawn 宿主必须监听 error 事件（否则未处理 error 直接崩进程）', () => {
+  const src = read('tools/companion/controller.cjs');
+  // 回归背景：实测用不可执行的 zcodePath 触发，Node 对未处理的 'error' 会抛异常终止
+  // 进程；受监督时 launchd 见非零退出就每 30s 重启 → 崩溃重启循环刷爆日志。
+  const spawnIdx = src.indexOf('const child = spawn(zcodePath');
+  assert.ok(spawnIdx > -1, '应保存 spawn 返回值（需要挂 error 监听）');
+  const tail = src.slice(spawnIdx, spawnIdx + 400);
+  assert.match(tail, /child\.once\('error'/, 'spawn 返回的 child 必须监听 error 事件');
+  // 且必须区分「永久性失败」（EACCES/ENOENT，重试无意义）与可重试失败
+  assert.match(src, /EACCES/, 'EACCES（不可执行）应走永久失败分支');
+  assert.match(src, /exitPermanent/, '不可恢复的启动失败应走 exitPermanent（受监督时停止重启）');
+});
+
+test('controller：日志不得重复落盘（stdout 已指向日志文件时不再 appendFileSync）', () => {
+  const src = read('tools/companion/controller.cjs');
+  // 回归背景：log() 既写 stdout 又 appendFileSync(LOG_FILE)，而 launchd 的
+  // StandardOutPath 与启动器的 nohup >>LOG 都指向同一文件 → 每行落盘两次。
+  assert.match(src, /detectStdoutIsLogFile/, '应检测 stdout 是否已指向日志文件');
+  const logIdx = src.indexOf('const log = (...a) =>');
+  const logBody = src.slice(logIdx, logIdx + 600);
+  assert.match(logBody, /if \(detectStdoutIsLogFile\(\)\) return;/,
+    'stdout 已指向日志文件时必须提前返回，否则重复落盘');
+});
+
 test('stagePluginPayload：items 覆盖 plugin.json 声明的全部组件（含 tools/）', () => {
   const bi = read('tools/companion/build-installer.cjs');
   const m = /const items = \[([\s\S]*?)\];/.exec(bi.slice(bi.indexOf('function stagePluginPayload')));

@@ -322,6 +322,8 @@ async function buildMac(arch, opts) {
   const pluginRoot = stagePluginPayload(path.join(DIST, `.stage-mac-payload-${arch}`));
   entries.push(...collectEntries(pluginRoot, 'plugin', 0o644));
   entries.push({ path: 'auto-enable.cjs', data: fs.readFileSync(path.join(COMPANION_DIR, 'auto-enable.cjs')), mode: 0o755 });
+  // launchd 自启动模块：不被 controller require（是独立 CLI），不在闭包推导里，须显式打包。
+  entries.push({ path: 'launchd.cjs', data: fs.readFileSync(path.join(COMPANION_DIR, 'launchd.cjs')), mode: 0o755 });
 
   entries.push({ path: 'README-install.txt', data: Buffer.from(T.macReadme(embedded), 'utf8'), mode });
   entries.push({ path: 'BUILD-INFO.txt', data: Buffer.from(T.MAC_BUILD_INFO(arch, embedded), 'utf8'), mode });
@@ -373,7 +375,7 @@ async function buildMac(arch, opts) {
         });
         if (r.ok) {
           log(`产物：${path.basename(dmgPath)}（${(r.bytes / 1048576).toFixed(1)} MB，DMG 安装包）`);
-          results.push({ path: dmgPath, kind: 'dmg' });
+          results.push({ path: dmgPath, kind: 'dmg', expectNode: !!nodeEntry });
         } else {
           warn(`跳过 DMG：${r.reason}`);
         }
@@ -397,7 +399,7 @@ function verifyArtifact(artifact) {
 
   // 安装器形态（exe/dmg）走各自的校验分支
   if (artifact.kind === 'exe') return verifyNsis(name, artifact.path);
-  if (artifact.kind === 'dmg') return verifyDmg(name, artifact.path);
+  if (artifact.kind === 'dmg') return verifyDmg(name, artifact.path, artifact.expectNode !== false);
 
   const buf = fs.readFileSync(artifact.path);
   const entries = artifact.kind === 'zip' ? readZipEntries(buf) : readTarGz(buf);
@@ -410,6 +412,10 @@ function verifyArtifact(artifact) {
   }
   if (artifact.kind === 'zip' && !names.includes('install.cmd')) throw new Error(`${name}: 缺少 install.cmd`);
   if (artifact.kind === 'targz' && !names.includes('install.sh')) throw new Error(`${name}: 缺少 install.sh`);
+  // launchd.cjs 是 macOS 专属的独立 CLI（不被 controller require），闭包推导覆盖不到，单独校验。
+  if (artifact.kind === 'targz' && !names.includes('launchd.cjs')) {
+    throw new Error(`${name}: 缺少 launchd.cjs（macOS 自启动绑定会静默失效）`);
+  }
 
   // 2) 系统工具交叉验证（尽力而为）。
   // 工具**不可用**时跳过并提示：`unzip` 不是 Windows 自带（需 Git for Windows 的 CmdTools，
@@ -478,7 +484,8 @@ function verifyNsis(name, filePath) {
 }
 
 // DMG 校验：hdiutil verify 后挂载，确认 .app 结构与依赖闭包完整。
-function verifyDmg(name, filePath) {
+// expectNode：构建时是否内嵌 Node（--no-embed-node 时为 false，只警告不报错）。
+function verifyDmg(name, filePath, expectNode = true) {
   execFileSync('hdiutil', ['verify', filePath], { stdio: 'pipe' });
 
   const mountPoint = fs.mkdtempSync(path.join(require('os').tmpdir(), 'zca-dmg-'));
@@ -505,6 +512,23 @@ function verifyDmg(name, filePath) {
       const missing = COMPANION_FILES.filter((f) => !fs.existsSync(path.join(resources, 'app', f)));
       if (missing.length > 0) {
         throw new Error(`${name}: .app 内缺少运行时文件 ${missing.join(', ')}`);
+      }
+      // **必须校验内嵌 Node**：.app 由 Finder 启动，不继承 shell PATH，
+      // `command -v node` 对 nvm 等管理的 node 会失败。曾用 --no-embed-node 构建后
+      // 分发，用户双击只得到「找不到 node」弹窗，而此处不校验 → 构建绿灯放行。
+      const nodeBin = path.join(resources, 'node');
+      if (!fs.existsSync(nodeBin)) {
+        if (expectNode) {
+          throw new Error(`${name}: .app 缺少内嵌 Node（${nodeBin}）——GUI 启动不继承 PATH，无内嵌 node 时启动器必然失败`);
+        }
+        warn(`${name}: .app 未内嵌 Node（--no-embed-node）——仅供本机调试，**不要分发**`);
+      } else if (process.platform !== 'win32' && (fs.statSync(nodeBin).mode & 0o111) === 0) {
+        throw new Error(`${name}: .app 内嵌 Node 缺少执行位（无法启动）`);
+      }
+      // launchd 自启动模块必须在包内（启动器会调用它装 LaunchAgent）
+      const launchdMod = path.join(resources, 'app', 'launchd.cjs');
+      if (!fs.existsSync(launchdMod)) {
+        throw new Error(`${name}: .app 缺少 launchd.cjs（自启动绑定将静默失效）`);
       }
       log(`校验通过（hdiutil verify + .app 结构与依赖闭包）：${name}，${(fs.statSync(filePath).size / 1048576).toFixed(1)} MB`);
     } finally {

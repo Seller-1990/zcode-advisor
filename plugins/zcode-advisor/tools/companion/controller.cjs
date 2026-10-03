@@ -135,10 +135,61 @@ const API_PORT_RANGE = [9420, 9429];
 const CDP_LAUNCH_TIMEOUT_MS = 25000;
 const POLL_INTERVAL_MS = 3000;
 
+// 受监督模式（launchd 自启动注入 ZCODE_ADVISOR_SUPERVISED=1）。
+// plist 用 KeepAlive{SuccessfulExit:false}：**只有非零退出才会被重启**。
+// 因此受监督时「暂不可用」必须以非零码退出，否则进程一退就永久失去监督——
+// 尤其「已有健康实例在跑」若照旧 exit(0)，launchd 会认为任务已完成，那个实例
+// 之后死掉就再也没人把外挂拉起来（自启动形同虚设）。
+// 退出码 3 与 launchd.cjs 的 RETRY_EXIT_CODE 一致，配 ThrottleInterval=30
+// 把重试频率限制在 30s 一次（不会重启风暴）。
+const SUPERVISED = process.env.ZCODE_ADVISOR_SUPERVISED === '1';
+const RETRY_EXIT_CODE = 3;
+
+// 退出码决策（纯函数，便于直接单测）。两类语义必须分开：
+//   retry    = 本次没服务成功，但**稍后重试可能成功**（让位 / ZCode 未就绪 / 端口冲突）
+//              → 受监督退 3（launchd 会重启）；否则退 code（调用方原语义，如 0=静默让位）
+//   fatal    = 重试也不会好转，必须用户先动手（如 Node 版本过低）
+//              → 受监督退 0（launchd 认为任务完成，停止重启，避免每 30s 刷日志）；
+//                 否则退 code（调用方原语义，如 1=失败）
+// 判错方向都有代价：retry 判成 fatal → 自启动再也不恢复；fatal 判成 retry → 无限重启刷日志。
+function exitCodeFor(kind, supervised, fallbackCode) {
+  if (kind === 'retry') return supervised ? RETRY_EXIT_CODE : fallbackCode;
+  return supervised ? 0 : fallbackCode;
+}
+
+// 只写 stderr：launchd 的 StandardErrorPath 已指向同一日志文件，再调 log() 会重复落盘。
+function exitRetryable(code, message) {
+  if (message) console.error(message);
+  process.exit(exitCodeFor('retry', SUPERVISED, code));
+}
+
+// 永久性失败退出（受监督时 exit 0 = 不再重启）。
+function exitPermanent(code, message) {
+  if (message) console.error(message);
+  process.exit(exitCodeFor('fatal', SUPERVISED, code));
+}
+
+// stdout 是否已指向日志文件本身（launchd 的 StandardOutPath、启动器的 nohup >>LOG 都是）。
+// 用 inode+device 比对而不是路径字符串：重定向可能经由符号链接或不同写法。
+// 命中时 log() 不能再 appendFileSync，否则每行落盘两次（实测：日志里所有行成对出现）。
+let stdoutIsLogFile = null;
+function detectStdoutIsLogFile() {
+  if (stdoutIsLogFile !== null) return stdoutIsLogFile;
+  stdoutIsLogFile = false;
+  try {
+    const out = fs.fstatSync(1);
+    const log = fs.statSync(LOG_FILE);
+    stdoutIsLogFile = out.ino === log.ino && out.dev === log.dev;
+  } catch (_) { /* 任一不可得 → 按未重定向处理（宁可多写一份也不丢日志） */ }
+  return stdoutIsLogFile;
+}
+
 const log = (...a) => {
   const line = `[${new Date().toLocaleTimeString()}] ${a.join(' ')}`;
   process.stdout.write(line + '\n');
-  // 无窗口启动（vbs/nohup）时 stdout 不可见：同步落盘一份供排错（超 1MB 截断）。
+  // 无窗口启动（vbs/nohup/launchd）时 stdout 不可见或已重定向到本文件：
+  // 仅在 stdout **没有**指向日志文件时才补写一份（超 1MB 截断）。
+  if (detectStdoutIsLogFile()) return;
   try {
     fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
     if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > 1e6) fs.writeFileSync(LOG_FILE, '');
@@ -477,6 +528,15 @@ function hostInstanceRunning(zcodePath) {
   }
 }
 
+// spawn 失败的 errno 分类（纯函数，便于单测）。
+//   fatal = 配置指向的路径根本不可执行（EACCES 无执行位 / ENOENT 不存在 / ENOTDIR
+//           路径中有非目录）——重试一万次也一样，必须让用户改配置，否则受监督下
+//           会变成每 30s 一次的崩溃重启循环。
+//   retry = 其它（EMFILE 句柄耗尽、EAGAIN 等）——稍后重试可能成功，交给 launchd。
+function classifySpawnError(code) {
+  return code === 'EACCES' || code === 'ENOENT' || code === 'ENOTDIR' ? 'fatal' : 'retry';
+}
+
 async function ensureCdp() {
   const cfg = readCompanionConfig();
   // 已有可用调试端口（例如上次以外挂入口启动且进程还活着）：直接附着
@@ -492,8 +552,8 @@ async function ensureCdp() {
     if (found.invalid) {
       console.error(`配置的 zcodePath 无效：${found.invalid.value}（解析为 ${found.invalid.resolved}，文件不存在）`);
     }
-    console.error(missingHint(process.platform, COMPANION_CONFIG));
-    process.exit(1);
+    // 可重试：ZCode 可能在登录之后才装好/才挂载，受监督时交给 launchd 稍后重试。
+    exitRetryable(1, missingHint(process.platform, COMPANION_CONFIG));
   }
   log(`ZCode 可执行文件：${zcodePath}（来源：${found.source}）`);
 
@@ -503,13 +563,17 @@ async function ensureCdp() {
   // 旧实现对此毫不知情，照旧 spawn 然后死等 25s 才报错；日志里只留一句超时，
   // 用户看到的是「点了没反应」。这里提前识别，给出**可操作**的指引后立即失败。
   if (hostInstanceRunning(zcodePath)) {
-    console.error(
-      'ZCode 已在运行，但它不是以调试模式启动的（当前实例没有 CDP 端口）。\n' +
-      '角标/设置面板需要调试通道，而调试端口无法注入到已在运行的进程。\n' +
-      '请先**完全退出 ZCode（含菜单栏图标）**，再重新打开「ZCode Advisor」。\n' +
-      '（若你是直接双击 ZCode 打开的，请改用 ZCode Advisor 启动器。）'
+    // 可重试：用户「完全退出 ZCode」后重启外挂即可自愈。受监督时让 launchd
+    // 每 30s 重试一次——用户退出 ZCode 后无需再手动点图标，外挂会自己接上。
+    // 受监督时会每 30s 重试，故只打一行（多行指引会随重试刷爆日志）；
+    // 未受监督时是用户主动点击触发的单次失败，给出完整可操作指引。
+    exitRetryable(1, SUPERVISED
+      ? 'ZCode 已在运行但无调试端口，等待其完全退出后自动接管（受 launchd 监督，每 30s 重试）'
+      : 'ZCode 已在运行，但它不是以调试模式启动的（当前实例没有 CDP 端口）。\n' +
+        '角标/设置面板需要调试通道，而调试端口无法注入到已在运行的进程。\n' +
+        '请先**完全退出 ZCode（含菜单栏图标）**，再重新打开「ZCode Advisor」。\n' +
+        '（若你是直接双击 ZCode 打开的，请改用 ZCode Advisor 启动器。）'
     );
-    process.exit(1);
   }
 
   let port = cfg.port && cfg.port >= CDP_PORT_RANGE[0] && cfg.port <= CDP_PORT_RANGE[1] ? cfg.port : CDP_PORT_RANGE[0];
@@ -522,8 +586,7 @@ async function ensureCdp() {
     }
   }
   if (port > CDP_PORT_RANGE[1]) {
-    console.error(`调试端口 ${CDP_PORT_RANGE[0]}-${CDP_PORT_RANGE[1]} 全部占用`);
-    process.exit(1);
+    exitRetryable(1, `调试端口 ${CDP_PORT_RANGE[0]}-${CDP_PORT_RANGE[1]} 全部占用（稍后重试；受监督时由 launchd 自动重试）`);
   }
   log(`以调试端口 ${port} 启动 ZCode：${zcodePath}`);
   // 启动 ZCode 的环境变量纪律（实测踩过）：
@@ -536,23 +599,40 @@ async function ensureCdp() {
   delete childEnv.ELECTRON_NO_ATTACH_CONSOLE;
   delete childEnv.ELECTRON_ENABLE_LOGGING;
 
-  spawn(zcodePath, [`--remote-debugging-port=${port}`], {
+  // spawn 的 error 事件必须监听：Node 对未处理的 'error' 会**直接抛异常终止进程**。
+  // 实测（用不可执行的 zcodePath 触发）：进程带着堆栈崩掉。未受监督时只是难看的崩溃；
+  // 受监督时更糟——launchd 见非零退出就每 30s 重启，形成崩溃重启循环刷爆日志。
+  // 这里捕获后按 errno 分类：可重试的交给 launchd 重试，永久性的退出 0 停止重启。
+  const child = spawn(zcodePath, [`--remote-debugging-port=${port}`], {
     detached: true,
     stdio: 'ignore',
     // macOS 上切到 app 的 MacOS 目录启动，与 zcode+ 的真机做法一致
     cwd: process.platform === 'darwin' ? path.dirname(zcodePath) : undefined,
     env: childEnv
-  }).unref();
+  });
+  const spawnError = new Promise((resolve) => {
+    child.once('error', (err) => resolve(err));
+  });
+  child.unref();
+
+  // 边等 CDP 就绪边观察 spawn 失败：spawn 失败时 CDP 永远不会就绪，必须提前退出。
   const deadline = Date.now() + CDP_LAUNCH_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    const err = await Promise.race([spawnError, sleep(700).then(() => null)]);
+    if (err) {
+      const code = err && err.code;
+      if (classifySpawnError(code) === 'fatal') {
+        // 配置的路径不可执行 / 不存在：重试也不会好转，需用户修正配置
+        exitPermanent(1, `无法启动 ZCode（${code}）：${zcodePath}\n请检查 ${COMPANION_CONFIG} 中的 zcodePath 是否指向可执行文件。`);
+      }
+      exitRetryable(1, `启动 ZCode 失败（${code || err.message}）：${zcodePath}`);
+    }
     if (await portReachable(port)) {
       log('CDP 通道就绪');
       return port;
     }
-    await sleep(700);
   }
-  console.error('等待 CDP 通道超时。若 ZCode 已在运行（未带调试端口），请先完全退出 ZCode（含托盘），再运行本入口。');
-  process.exit(1);
+  exitRetryable(1, '等待 CDP 通道超时。若 ZCode 已在运行（未带调试端口），请先完全退出 ZCode（含托盘），再运行本入口。');
 }
 
 // —— 用户级配置读写 ——
@@ -933,8 +1013,8 @@ function startApi(cdpPort, apiPort, token) {
     }
   });
   server.on('error', (err) => {
-    console.error(`API 服务启动失败：${err && err.message}`);
-    process.exit(1);
+    // 可重试：端口占用等瞬时冲突，重试通常能换到空闲端口（受监督时由 launchd 重启）。
+    exitRetryable(1, `API 服务启动失败：${err && err.message}`);
   });
   server.listen(apiPort, '127.0.0.1', () => {
     log(`本机 API 就绪：http://127.0.0.1:${apiPort}/api/status`);
@@ -963,15 +1043,22 @@ async function main() {
   // 放在这里而非模块顶层，使 require（冒烟校验/单测）不受影响。
   if (typeof WebSocket !== 'function') {
     const major = parseInt(String(process.versions.node).split('.')[0], 10);
-    console.error(
+    // 永久性失败：升 Node 之前重试多少次都不会成功，受监督时必须 exit 0
+    // （否则 launchd 每 30s 重启一个注定失败的进程，白白刷日志）。
+    exitPermanent(1,
       `zcode-advisor companion 需要 Node 22 及以上（当前 ${process.versions.node}）。\n` +
       (major < 22 ? '原因：依赖全局 WebSocket，Node 21 需 --experimental-websocket，22 起默认提供。\n' : '') +
       '请升级 Node 后重试（审查 hook 本身仍只需 Node ≥ 18）。'
     );
-    process.exit(1);
   }
 
-  if (!acquireLock()) process.exit(0);   // 已有健康实例在跑 → 静默让位（保持原行为）
+  // 已有健康实例在跑 → 本次让位。
+  // 未受监督：exit 0（旧行为，双击启动器时静默让位，不弹窗、不打印）。
+  // 受监督：必须退 3——否则 launchd 认为任务已完成、不再重启，而那个「已有实例」
+  // 之后死掉就再没人把外挂拉起来（自启动形同虚设）。
+  if (!acquireLock()) {
+    exitRetryable(0, SUPERVISED ? '已有健康的 companion 实例在运行，本次让位（稍后重试以便接管）' : '');
+  }
   injectSource = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
   log('zcode-advisor 输入框角标外挂启动');
 
@@ -1021,4 +1108,4 @@ if (require.main === module) {
 
 module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi,
   // 供单测直接验证单实例锁与主实例探测（不启动进程）
-  _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS } };
+  _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, exitCodeFor, classifySpawnError, RETRY_EXIT_CODE, SUPERVISED, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS } };

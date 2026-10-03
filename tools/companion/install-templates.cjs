@@ -97,6 +97,9 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$SUPPORT/bin" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 ${runtimeFiles.map((f) => `[ -f "$SRC/${f}" ] || { echo "[错误] 发行包缺少 ${f}" >&2; exit 1; }`).join('\n')}
 ${runtimeFiles.map((f) => `cp -f "$SRC/${f}" "$SUPPORT/"`).join('\n')}
+# launchd 自启动模块：不被 controller require（独立 CLI），故不在闭包推导里，须显式复制。
+[ -f "$SRC/launchd.cjs" ] || { echo "[错误] 发行包缺少 launchd.cjs" >&2; exit 1; }
+cp -f "$SRC/launchd.cjs" "$SUPPORT/"
 
 # 安装插件本体（包内 payload → 调用 auto-enable 走 ZCode 官方 CLI 注册/安装/启用）。
 # 这是 tar.gz 路径的"自动启用"执行点：包内携带 plugin/ 与 auto-enable.cjs，
@@ -151,14 +154,21 @@ mkdir -p "$(dirname "$LOG")"
 NODE="$SUPPORT/bin/node"
 [ -x "$NODE" ] || NODE="$(command -v node)"
 if [ -z "$NODE" ] || [ ! -x "$NODE" ]; then
-  osascript -e 'display dialog "未找到 node（可能已升级或卸载），请重新运行 install.sh" with title "ZCode Advisor" buttons ["好"] default button "好" with icon caution' >/dev/null 2>&1
+  osascript -e 'display dialog "未找到 node（可能已升级或卸载），请重新运行 install.sh" with title "ZCode Advisor" buttons ["好"] default button ["好"] with icon caution' >/dev/null 2>&1
   exit 1
+fi
+# 自启动绑定（幂等）：登录时自动拉起，崩溃时自动重启。
+"$NODE" "$SUPPORT/launchd.cjs" install --now >>"$LOG" 2>&1 || true
+# LaunchAgent 已加载时交由 launchd 常驻，避免两个 owner 互抢单实例锁。
+if "$NODE" "$SUPPORT/launchd.cjs" status 2>/dev/null | grep -q 'loaded=是'; then
+  exit 0
 fi
 nohup "$NODE" "$SUPPORT/controller.cjs" >>"$LOG" 2>&1 &
 exit 0
 LAUNCH
 chmod +x "$APP/Contents/MacOS/ZCodeAdvisor"
 echo "已安装：~/Applications/ZCode Advisor.app（启动台可见）"
+echo "已配置登录自启动（LaunchAgent: ~/Library/LaunchAgents/local.zcode.advisor.plist）"
 echo "打开应用即以角标模式启动 ZCode；日志：~/.zcode/advisor-companion.log"
 `;
 

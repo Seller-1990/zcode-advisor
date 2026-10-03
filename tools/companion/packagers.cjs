@@ -192,7 +192,20 @@ if [ -z "$NODE" ] || [ ! -x "$NODE" ]; then
   exit 1
 fi
 
-# 日志追加；controller 自身有单实例锁，重复点击不会重复注入
+# ── 自启动绑定（幂等）──
+# 装 LaunchAgent 并立即加载：登录时 RunAtLoad 自动拉起，崩溃时 KeepAlive 重启。
+# 这是「直接打开 ZCode 也有角标」的根因解法——顾问必须在用户双击 ZCode 之前就绪。
+# --now 让本次点击即生效；已加载且配置未变时不重载（不打断正在跑的实例）。
+"$NODE" "$DIR/app/launchd.cjs" install --now >>"$LOG" 2>&1 || true
+
+# LaunchAgent 已加载时，常驻与重启交给 launchd，启动器不再自己拉起 controller。
+# 为什么必须二选一：两个 owner 会互抢单实例锁，被监督者每 30s 重启一次刷日志，
+# 且角标可能随抢占闪烁。
+if "$NODE" "$DIR/app/launchd.cjs" status 2>/dev/null | grep -q 'loaded=是'; then
+  exit 0
+fi
+
+# ── 回退路径：launchd 不可用（bootstrap 失败 / 非 GUI 会话）时自行拉起 ──
 # 插件自动启用（幂等；失败不阻断角标外挂的启动）
 "$NODE" "$DIR/app/auto-enable.cjs" >>"$LOG" 2>&1 || true
 
@@ -267,6 +280,12 @@ function stageMacApp(opts) {
   }
   const autoEnable = path.join(companionDir, 'auto-enable.cjs');
   if (fs.existsSync(autoEnable)) fs.copyFileSync(autoEnable, path.join(appRes, 'auto-enable.cjs'));
+  // launchd 自启动模块（启动器会调用 install --now 装 LaunchAgent）
+  const launchdMod = path.join(companionDir, 'launchd.cjs');
+  if (fs.existsSync(launchdMod)) {
+    fs.copyFileSync(launchdMod, path.join(appRes, 'launchd.cjs'));
+    fs.chmodSync(path.join(appRes, 'launchd.cjs'), 0o755);
+  }
   if (nodeBinPath && fs.existsSync(nodeBinPath)) {
     fs.copyFileSync(nodeBinPath, path.join(resources, 'node'));
     fs.chmodSync(path.join(resources, 'node'), 0o755);

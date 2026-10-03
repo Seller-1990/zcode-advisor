@@ -1,6 +1,6 @@
 {
   "name": "zcode-advisor",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "description": "dsh-advisor 的 zcode 移植：独立审查副模型在每轮结束后被动审查对话增量，以 nit/concern/blocker 三级建议注回会话（advisory-only，绝不阻塞主流程）。",
   "author": {
     "name": "local"
