@@ -148,25 +148,114 @@ const log = (...a) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const maskKey = (k) => { const s = String(k || ''); return s.length <= 8 ? '****' : `${s.slice(0, 4)}…${s.slice(-4)}`; };
 
-// —— 单实例锁：面板重复点击/多入口同时启动时只保留一个 controller ——
+// —— 单实例锁（服务租约）：面板重复点击/多入口同时启动时只保留一个 controller ——
+//
+// 语义是「**服务可用**的租约」，不是「进程活着」。旧实现只判 pid 存活且无 TTL，
+// 出过一次真实故障：controller 附着的 ZCode 被关掉后，它变成僵尸——进程活着、
+// 占着锁，但 rescan 找不到 CDP 目标且从不重建通道。用户再点图标时，新实例在
+// acquireLock 就 exit(0)，既无窗口也无提示（表现为「点了没反应」），
+// 且因为 acquireLock 在 ensureCdp 之前，永远走不到「重新拉起 ZCode」那步。
+//
+// 三处加固（范式抄自 auto-enable.cjs 的单飞锁，那边是仓库里唯一正确的实现）：
+//   ① TTL：持锁超过 LOCK_TTL_MS 视为陈旧，允许接管（防 pid 复用永久阻塞）；
+//   ② 心跳：持锁者周期刷新 started，证明「我还活着且在干活」——僵尸不再能续租；
+//   ③ 原子接管：写唯一 tmp → rename → 回读确认是自己，避免两个实例同时持锁。
+const LOCK_TTL_MS = 60 * 1000;        // 1 分钟：心跳每 20s 一次，三拍不跳即判心跳死亡
+const LOCK_HEARTBEAT_MS = 20 * 1000;
+// 僵尸宽限：进程活着、心跳正常，但**长时间没有 CDP 可用** → 判为僵尸租约，允许接管。
+// 为什么不能只靠心跳：僵尸 controller 的 rescan 每 3s 跑一次、心跳也照跳，
+// 只看心跳它永远「新鲜」。必须把「服务可用性」纳入租约判据。
+// 3 分钟足以覆盖一次正常的 ZCode 重启 + CDP 重建（正常只需数秒），
+// 又不会让用户点击后等太久（修②的自愈通常几秒内就恢复了，这里只是兜底）。
+const LOCK_ZOMBIE_GRACE_MS = 3 * 60 * 1000;
+const LOCK_FILE = path.join(os.tmpdir(), 'zcode-advisor-companion.lock');
+
+function readLockInfo(lockFile) {
+  try {
+    const txt = fs.readFileSync(lockFile, 'utf8');
+    const num = (re) => Number(((re.exec(txt) || [])[1]) || 0);
+    return {
+      pid: num(/(?:^|\n)pid=(\d+)/),
+      started: num(/(?:^|\n)started=(\d+)/),
+      // 服务可用性：持锁者当前附着的 CDP 端口（0 = 没有可用通道）。
+      cdp: num(/(?:^|\n)cdp=(\d+)/),
+      // 最近一次「有 CDP」的时间戳（从未有过则为持锁起始时间）。
+      cdpSince: num(/(?:^|\n)cdpSince=(\d+)/)
+    };
+  } catch (_) {
+    return { pid: 0, started: 0, cdp: 0, cdpSince: 0 };
+  }
+}
+
+// 陈旧判定：无 started / 心跳超时 / pid 不存在 / 长期无 CDP（僵尸）→ 陈旧。
+// kill(pid,0) 的 errno 语义要分清：EPERM = 存在但无权限（视为存活），ESRCH = 不存在。
+function isStale(info) {
+  if (!info.started) return true;
+  if (Date.now() - info.started > LOCK_TTL_MS) return true;
+  if (!info.pid) return true;
+  let alive = false;
+  try {
+    process.kill(info.pid, 0);
+    alive = true;
+  } catch (err) {
+    if (err && err.code === 'EPERM') alive = true;
+  }
+  if (!alive) return true;
+  // 活着但长期无 CDP：僵尸租约（进程在跑、服务不可用）。
+  if (info.cdp === 0 && info.cdpSince && Date.now() - info.cdpSince > LOCK_ZOMBIE_GRACE_MS) return true;
+  return false;
+}
+
+function writeLock(lockFile, cdpPort) {
+  const prev = readLockInfo(lockFile);
+  const now = Date.now();
+  // cdpSince 的维护：有 CDP 就刷新；没有则继承上一次的值（保留「最后一次有 CDP 的时刻」）。
+  const cdpSince = cdpPort > 0 ? now : (prev.pid === process.pid && prev.cdpSince ? prev.cdpSince : now);
+  const tmp = `${lockFile}.tmp-${process.pid}-${now}`;
+  fs.writeFileSync(tmp, `pid=${process.pid}\nstarted=${now}\ncdp=${cdpPort || 0}\ncdpSince=${cdpSince}\n`, 'utf8');
+  fs.renameSync(tmp, lockFile);
+  return readLockInfo(lockFile).pid === process.pid;
+}
+
+let lockHeartbeat = null;
+// 持锁者心跳：续租（刷新 started）并把当前 CDP 端口写进租约——证明服务确实可用。
+function startLockHeartbeat(cdpPortRef) {
+  if (lockHeartbeat) clearInterval(lockHeartbeat);
+  lockHeartbeat = setInterval(() => {
+    try {
+      const cur = readLockInfo(LOCK_FILE);
+      if (cur.pid !== process.pid) { clearInterval(lockHeartbeat); lockHeartbeat = null; return; } // 已被接管，停止续租
+      writeLock(LOCK_FILE, cdpPortRef.value);
+    } catch (_) {}
+  }, LOCK_HEARTBEAT_MS);
+  if (lockHeartbeat.unref) lockHeartbeat.unref();
+}
+
 function acquireLock() {
-  const lockFile = path.join(os.tmpdir(), 'zcode-advisor-companion.lock');
-  try {
-    const pid = parseInt(fs.readFileSync(lockFile, 'utf8'), 10);
-    if (pid && pid !== process.pid) {
-      process.kill(pid, 0); // 活着的实例 → 抛错前返回；不存在 → 走 stale 分支
-      log(`已有 companion 实例在运行（pid ${pid}），本实例退出`);
-      process.exit(0);
+  const cur = readLockInfo(LOCK_FILE);
+  if (cur.pid && cur.pid !== process.pid) {
+    if (!isStale(cur)) {
+      log(`已有 companion 实例在运行（pid ${cur.pid}），本实例退出`);
+      return false;
     }
-  } catch (_) { /* 进程不存在或无锁文件：继续 */ }
+    log(`检测到陈旧的 companion 锁（pid ${cur.pid}：心跳超时 / 进程不存在 / 长期无 CDP）——接管`);
+  }
   try {
-    fs.writeFileSync(lockFile, String(process.pid));
-    process.on('exit', () => {
-      try {
-        if (parseInt(fs.readFileSync(lockFile, 'utf8'), 10) === process.pid) fs.unlinkSync(lockFile);
-      } catch (_) {}
-    });
-  } catch (_) {}
+    if (!writeLock(LOCK_FILE, 0)) {
+      log('锁竞争失败（已被其他实例接管），本实例退出');
+      return false;
+    }
+  } catch (e) {
+    // 写锁失败不应致命（如 tmpdir 只读）：记录后继续，行为退化为旧版（无锁保护）
+    log(`写单实例锁失败（${String(e).slice(0, 80)}）——继续启动，但可能多实例`);
+    return true;
+  }
+  process.on('exit', () => {
+    try {
+      if (readLockInfo(LOCK_FILE).pid === process.pid) fs.unlinkSync(LOCK_FILE);
+    } catch (_) {}
+  });
+  return true;
 }
 
 // —— 外挂自身配置（zcodePath 等）——
@@ -303,6 +392,15 @@ function attachTarget(target) {
 
 // 当前附着的调试端口。0 = 尚未附着。
 let currentPort = 0;
+// 当前 CDP 端口的最新值，供锁心跳读取（心跳要证明「服务可用」）。
+const cdpPortRef = { value: 0 };
+// CDP 消失后开始计时的时刻（0 = 当前有 CDP）。用于判断是否该自愈重建。
+let cdpLostSince = 0;
+// 自愈宽限：CDP 消失超过此时长才尝试重建，避免 ZCode 正常重启（几秒）期间反复 spawn。
+const CDP_SELFHEAL_GRACE_MS = 30 * 1000;
+// 自愈节流：两次重建尝试的最小间隔，防止 ZCode 起不来时高频 spawn。
+const CDP_SELFHEAL_COOLDOWN_MS = 60 * 1000;
+let lastSelfHealAt = 0;
 
 // 全端口段重扫：与 zcode-plus 等其他 CDP 外挂共存的关键。
 // CDP 允许多客户端同时附着同一实例（✨ 与 🛡️ 在同一页面共存）；
@@ -320,6 +418,8 @@ async function rescan() {
       log(currentPort === 0 ? `附着调试实例（端口 ${p}）` : `调试实例切换：${currentPort} → ${p}，重新附着`);
       currentPort = p;
     }
+    cdpPortRef.value = p;
+    cdpLostSince = 0;
     for (const t of targets) {
       if (t.type === 'page' && t.webSocketDebuggerUrl) attachTarget(t);
     }
@@ -328,6 +428,52 @@ async function rescan() {
   if (currentPort !== 0) {
     log('调试实例已消失（ZCode 被关闭/重启？），等待重新出现…');
     currentPort = 0;
+  }
+  cdpPortRef.value = 0;
+  // 自愈：CDP 消失超过宽限期后，重新走 ensureCdp（会重新拉起带调试端口的 ZCode）。
+  // 旧实现只打印「等待重新出现」——一旦被附着的 ZCode 死掉，本进程就永久空转：
+  // 进程活着、占着单实例锁、却永远不恢复服务（实测故障：用户点图标「没反应」）。
+  // 这里加上重建，配合带 CDP 标记的租约，僵尸态最多持续 GRACE+COOLDOWN。
+  const now = Date.now();
+  if (cdpLostSince === 0) cdpLostSince = now;
+  const lostFor = now - cdpLostSince;
+  if (lostFor > CDP_SELFHEAL_GRACE_MS && now - lastSelfHealAt > CDP_SELFHEAL_COOLDOWN_MS) {
+    lastSelfHealAt = now;
+    log(`CDP 已消失 ${Math.round(lostFor / 1000)}s，尝试重建调试通道…`);
+    try {
+      const p = await ensureCdp();
+      cdpPortRef.value = p;
+      cdpLostSince = 0;
+      log(`调试通道已重建（端口 ${p}）`);
+    } catch (e) {
+      // ensureCdp 失败会 process.exit(1)；能走到这里说明是别的异常，记录后下轮再试
+      log(`重建调试通道失败：${String(e).slice(0, 120)}（下轮重试）`);
+    }
+  }
+}
+
+// 宿主主实例探测：ZCode 是否正在运行（不论有无调试端口）。
+// 用途：在没有可用调试端口时判断「是否已开着一个非调试模式的 ZCode」——
+// 那种情况下 spawn 带 flag 的新实例是徒劳的（Electron 单实例语义会并入/丢弃新进程，
+// 调试端口永远不会开），必须让用户先完全退出 ZCode，而不是静默死等 25s。
+// 探测失败一律返回 false：宁可照旧尝试，也不要因探测本身出错而误拦启动。
+function hostInstanceRunning(zcodePath) {
+  const want = path.basename(String(zcodePath || 'ZCode')).replace(/\.exe$/i, '');
+  if (!want) return false;
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync('tasklist /FO CSV /NH', { encoding: 'utf8', timeout: 5000, windowsHide: true });
+      return out.split('\n').some((l) => {
+        const m = /^"([^"]+)"/.exec(l.trim());
+        return m && m[1].replace(/\.exe$/i, '').toLowerCase() === want.toLowerCase();
+      });
+    }
+    // macOS/Linux：comm 是完整可执行路径，取 basename 精确比对。
+    // 用精确匹配而非包含匹配：ZCode 的 helper 进程（"ZCode Helper"）basename 不同，不会误判。
+    const out = execSync('ps -Ao comm=', { encoding: 'utf8', timeout: 5000 });
+    return out.split('\n').some((line) => path.basename(line.trim()) === want);
+  } catch (_) {
+    return false;
   }
 }
 
@@ -350,6 +496,22 @@ async function ensureCdp() {
     process.exit(1);
   }
   log(`ZCode 可执行文件：${zcodePath}（来源：${found.source}）`);
+
+  // 主实例预检：ZCode 已在运行（且没有调试端口，否则上面早附着上了）时，
+  // 再 spawn 一个带 --remote-debugging-port 的实例**不会**让既有实例获得调试端口——
+  // Electron 的单实例语义会把新进程并入/丢弃，调试端口永远不会开。
+  // 旧实现对此毫不知情，照旧 spawn 然后死等 25s 才报错；日志里只留一句超时，
+  // 用户看到的是「点了没反应」。这里提前识别，给出**可操作**的指引后立即失败。
+  if (hostInstanceRunning(zcodePath)) {
+    console.error(
+      'ZCode 已在运行，但它不是以调试模式启动的（当前实例没有 CDP 端口）。\n' +
+      '角标/设置面板需要调试通道，而调试端口无法注入到已在运行的进程。\n' +
+      '请先**完全退出 ZCode（含菜单栏图标）**，再重新打开「ZCode Advisor」。\n' +
+      '（若你是直接双击 ZCode 打开的，请改用 ZCode Advisor 启动器。）'
+    );
+    process.exit(1);
+  }
+
   let port = cfg.port && cfg.port >= CDP_PORT_RANGE[0] && cfg.port <= CDP_PORT_RANGE[1] ? cfg.port : CDP_PORT_RANGE[0];
   for (; port <= CDP_PORT_RANGE[1]; port++) {
     try {
@@ -809,7 +971,7 @@ async function main() {
     process.exit(1);
   }
 
-  acquireLock();
+  if (!acquireLock()) process.exit(0);   // 已有健康实例在跑 → 静默让位（保持原行为）
   injectSource = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
   log('zcode-advisor 输入框角标外挂启动');
 
@@ -829,6 +991,9 @@ async function main() {
   } catch (_) { /* 自动启用失败不阻断外挂 */ }
 
   const cdpPort = await ensureCdp();
+  // 锁心跳：把「当前 CDP 端口」写进租约，证明服务可用（僵尸租约靠它被识别）。
+  cdpPortRef.value = cdpPort;
+  startLockHeartbeat(cdpPortRef);
   const apiPort = await pickApiPort();
   const token = crypto.randomBytes(16).toString('hex');
   // 角标固定位置：'composer'（输入框工具栏右侧）或 'topbar'（任务窗口上边）。
@@ -854,4 +1019,6 @@ if (require.main === module) {
   });
 }
 
-module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi };
+module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi,
+  // 供单测直接验证单实例锁与主实例探测（不启动进程）
+  _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS } };

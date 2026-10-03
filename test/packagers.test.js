@@ -191,6 +191,16 @@ test('MAC_APP_LAUNCHER：自包含运行时，缺 node 时弹窗而非静默失�
   assert.match(sh, /nohup "\$NODE" "\$DIR\/app\/controller\.cjs"/);
 });
 
+test('MAC_APP_LAUNCHER：controller 快速退出时弹窗告知（治「点了没反应」）', () => {
+  const sh = P.MAC_APP_LAUNCHER;
+  // 回归背景：旧启动器 nohup 后直接 exit 0，controller 若秒退（如「ZCode 已在运行
+  // 但无调试端口」），用户面对的是「点了没反应」，错误原因只躺在日志里没人看。
+  assert.match(sh, /CPID=\$!/, '应记录 controller 子进程 pid');
+  assert.match(sh, /kill -0 "\$CPID"/, '应探测 controller 是否仍存活');
+  assert.match(sh, /display dialog/, '快速失败时应弹窗告知原因');
+  assert.match(sh, /tail -6 "\$LOG"/, '弹窗内容应取自日志尾部，给出可操作线索');
+});
+
 // ---------------- DMG（macOS 专属） ----------------
 
 test('buildDmg：非 macOS 时明确返回不可用原因', {

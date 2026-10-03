@@ -176,6 +176,9 @@ function buildNsisInstaller(opts) {
 // ---------------- macOS：.app + DMG ----------------
 
 // 自包含 .app 的启动器：运行时与控制器都在包内，不依赖 Application Support。
+// 注意：controller 必须后台跑（要长期驻留），所以启动器无法同步得知它是否成功。
+// 失败可见性由 controller 自己负责（见 controller.cjs 的 notifyUser：失败时弹窗）——
+// 本启动器保持 exit 0 是正确的后台语义，不是「吞掉错误」。
 const MAC_APP_LAUNCHER = `#!/bin/bash
 # ZCode Advisor 启动器（自包含 .app：运行时与控制器均在包内）
 DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
@@ -194,6 +197,17 @@ fi
 "$NODE" "$DIR/app/auto-enable.cjs" >>"$LOG" 2>&1 || true
 
 nohup "$NODE" "$DIR/app/controller.cjs" >>"$LOG" 2>&1 &
+# 快速失败探测：controller 若在 3 秒内就退出（如「ZCode 已在运行但无调试端口」），
+# 说明这次点击没起作用。此时弹窗告知——否则用户面对的是「点了没反应」，
+# 而真正的错误原因只躺在 ~/.zcode/advisor-companion.log 里没人看。
+CPID=$!
+sleep 3
+if ! kill -0 "$CPID" 2>/dev/null; then
+  # 已退出：从日志尾部取最后几行有信息量的内容作为提示
+  TAIL="$(tail -6 "$LOG" 2>/dev/null | grep -v '^\\[' | tail -3)"
+  [ -z "$TAIL" ] && TAIL="详见日志：$LOG"
+  osascript -e "display dialog \\"顾问外挂未能启动。\\n\\n$TAIL\\" with title \\"ZCode Advisor\\" buttons [\\"好\\"] default button [\\"好\\"] with icon caution" >/dev/null 2>&1
+fi
 exit 0
 `;
 

@@ -210,6 +210,40 @@ function main() {
 // .app 启动器先跑完（约 5 秒）并释放锁，controller 稍后才启动，
 // 于是又完整跑一遍（实测日志 11:16:12 与 11:16:17 各一套）。
 // 这既浪费几秒，也会无谓改写宿主缓存目录。
+// 语义：确保「至少 payload 这个版本」被安装启用，**绝不降级**。
+//
+// 为什么要有「不降级」：.app 内嵌的是**打包时**的插件快照。用户从仓库装了更新的
+// 版本（如 0.2.11）后，只要点一次旧 .app（内嵌 0.2.9），旧实现就会
+// marketplace add(.app/plugin) → update → install，把市场源改指 .app 并把 0.2.9
+// 装回去，之后 payload 与已装都是 0.2.9、走幂等快路径，**新版本被永久钉死**。
+// （实测故障：0.2.11 的 P0 修复与 UI 改动全部失效，用户看到的是旧界面。）
+// 因此这里只认「已装 >= payload」为已就绪；只有真正升级时才动 marketplace。
+function parseSemver(v) {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(String(v || ''));
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+function cmpSemver(a, b) {
+  const x = parseSemver(a);
+  const y = parseSemver(b);
+  if (!x || !y) return 0;   // 任一不可解析 → 视为相等（保守：走原逻辑）
+  for (let i = 0; i < 3; i++) {
+    if (x[i] !== y[i]) return x[i] > y[i] ? 1 : -1;
+  }
+  return 0;
+}
+
+// 纯决策：给定 `plugins list` 输出与包内版本，判断是否已就绪（可跳过安装）。
+// 抽成纯函数是为了能直接单测——「不降级」这条判据一旦写错，用户新装的版本会被
+// 旧 .app 反复覆盖回快照版本（真机故障），必须有测试锁住。
+function isReadyFromList(out, pkgVersion) {
+  if (!/zcode-advisor@\S+\s+\[enabled\]/.test(out)) return false;
+  if (!pkgVersion) return true;
+  // 已装版本从 cache 路径解析：`…/zcode-advisor/<ver>`
+  const installed = ((/zcode-advisor\/(\d+\.\d+\.\d+)/.exec(out) || [])[1]) || '';
+  if (installed) return cmpSemver(installed, pkgVersion) >= 0;  // 已装 >= 包内 → 就绪（不降级）
+  return out.includes(`zcode-advisor/${pkgVersion}`);           // 解析不出 → 退回精确匹配
+}
+
 function alreadyEnabled(cli, nodeBin, payload) {
   try {
     const env = Object.assign({}, process.env);
@@ -217,14 +251,16 @@ function alreadyEnabled(cli, nodeBin, payload) {
     const out = execFileSync(nodeBin, [cli, 'plugins', 'list'], {
       encoding: 'utf8', timeout: 60000, env
     });
-    if (!/zcode-advisor@\S+\s+\[enabled\]/.test(out)) return false;
     // 版本也要一致：包升级后必须重装，否则仍跑旧代码
     let pkgVersion = '';
     try {
       pkgVersion = JSON.parse(fs.readFileSync(path.join(payload, 'package.json'), 'utf8')).version || '';
     } catch (_) {}
-    if (!pkgVersion) return true;
-    return out.includes(`zcode-advisor/${pkgVersion}`);
+    const ready = isReadyFromList(out, pkgVersion);
+    if (ready && pkgVersion && !out.includes(`zcode-advisor/${pkgVersion}`)) {
+      log(`已装版本不低于包内 ${pkgVersion}——跳过（不降级）`);
+    }
+    return ready;
   } catch (_) {
     return false;
   }
@@ -299,4 +335,9 @@ function runEnable() {
   return 0;
 }
 
-process.exitCode = main();
+// 只在被直接执行时跑主流程；被 require（单测）时只加载函数。
+// 早期是无条件 `process.exitCode = main()`——require 会真的去跑 CLI 安装流程。
+if (require.main === module) process.exitCode = main();
+
+// 供单测验证「不降级」判据（避免真跑 CLI）
+module.exports = { cmpSemver, parseSemver, alreadyEnabled, isReadyFromList, findPluginPayload };
