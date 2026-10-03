@@ -192,7 +192,11 @@ function deriveHealth(beacon, opts) {
   // 有尝试且在近 STALE 内：看最近成功是否新鲜
   const successFresh = success > 0 && (now - success) <= staleMs;
   if (successFresh && beacon.state === 'ok') return 'ok';
-  if (beacon.state === 'degraded') return 'degraded';
+  // degraded 也必须「新鲜」才成立：降级成功同样刷新 lastSuccessAt（writeResult 的 ok 分支），
+  // 所以黄灯能亮本身就意味着近期确有产出。若不校验新鲜度，「降级成功后持续崩溃」会永久常亮黄灯
+  // （每轮只刷新 lastAttemptAt、成功时间戳停在旧值），把连续崩溃粉饰成「降级兜住」——
+  // 正是 M4 要消灭的「静默掩盖」的镜像。
+  if (successFresh && beacon.state === 'degraded') return 'degraded';
   // 有尝试、无新鲜成功 → down（含 worker 崩溃：attempt 更新、success 停留）
   return 'down';
 }

@@ -76,7 +76,9 @@ function deriveHealth(beacon, opts) {
   if (now - attempt > staleMs) return 'unknown';
   const successFresh = success > 0 && (now - success) <= staleMs;
   if (successFresh && beacon.state === 'ok') return 'ok';
-  if (beacon.state === 'degraded') return 'degraded';
+  // degraded 与 ok 同受新鲜度约束：降级成功也刷新 lastSuccessAt，故黄灯能亮本身就意味着近期有产出。
+  // 不校验则「降级成功后持续崩溃」会永久黄灯，掩盖连续失败（M4 要消灭的静默掩盖之镜像）。
+  if (successFresh && beacon.state === 'degraded') return 'degraded';
   return 'down';
 }
 

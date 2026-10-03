@@ -216,6 +216,21 @@ test('deriveHealth：degraded 保留降级态（不升级成 ok）', () => {
   assert.strictEqual(HEALTH.deriveHealth({ lastAttemptAt: t, lastSuccessAt: t, state: 'degraded' }, { now }), 'degraded');
 });
 
+// 回归：degraded 不得绕过新鲜度检查。曾用「先降级成功、随后每轮 spawn 都崩溃」复现：
+// 降级成功会置 state='degraded' 并刷新 lastSuccessAt，此后崩溃只刷新 lastAttemptAt，
+// 旧实现里 `if (state==='degraded') return 'degraded'` 位于 down 判定之前，黄灯永久常亮，
+// 把「连续崩溃、零产出」粉饰成「降级兜住」——正是 M4 要消灭的静默掩盖的镜像。
+test('deriveHealth：降级成功后持续崩溃 → down（黄灯不得掩盖连续失败）', () => {
+  const now = Date.parse('2030-01-01T00:00:00.000Z');
+  const attempt = new Date(now - 5 * 1000).toISOString();     // 刚尝试过（新鲜）
+  const staleSuccess = new Date(now - 60 * 60 * 1000).toISOString(); // 1 小时前降级成功（已陈旧）
+  assert.strictEqual(
+    HEALTH.deriveHealth({ lastAttemptAt: attempt, lastSuccessAt: staleSuccess, state: 'degraded' }, { now }),
+    'down',
+    '成功已陈旧且仍在尝试 → 必须 down，不能因 state=degraded 而常亮黄灯'
+  );
+});
+
 test('staleThresholdMs：下界 10 分钟，且不小于 2×reviewBudgetMs', () => {
   assert.strictEqual(HEALTH.staleThresholdMs(120000), 600000, '小预算取下界 10 分钟');
   assert.strictEqual(HEALTH.staleThresholdMs(480000), 960000, '大预算取 2×');
@@ -265,6 +280,7 @@ test('deriveHealth：controller 内联副本与 hooks/lib/health 行为逐一一
     [{ sessionId: 's', state: 'ok' }, { now }],                                   // 无 attempt
     [{ lastAttemptAt: fresh, lastSuccessAt: fresh, state: 'ok' }, { now }],        // ok
     [{ lastAttemptAt: fresh, lastSuccessAt: fresh, state: 'degraded' }, { now }],  // degraded
+    [{ lastAttemptAt: fresh, lastSuccessAt: old, state: 'degraded' }, { now, staleMs: 600000 }], // down（降级成功后持续崩溃，黄灯不得掩盖）
     [{ lastAttemptAt: fresh, lastSuccessAt: old, state: 'ok' }, { now, staleMs: 600000 }], // down（跑了没结果）
     [{ lastAttemptAt: fresh, state: 'down' }, { now }],                            // down（从未成功）
     [{ lastAttemptAt: old, lastSuccessAt: old, state: 'ok' }, { now, staleMs: 600000 }],   // 陈旧 → unknown
