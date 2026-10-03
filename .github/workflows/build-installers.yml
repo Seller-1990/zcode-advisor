@@ -2,7 +2,12 @@ name: build-installers
 
 # 触发：
 # - push tag `v*`   → 构建安装包并发布到 Release
+# - push main       → 只跑 test job（防「镜像漂移/坏改动」静默合入 main）
 # - 手动触发         → 只构建并上传 Actions artifact（用于验证）
+#
+# 为什么加 push main：此前只有 tag 与 PR 触发测试，直接 push main 不跑任何 CI，
+# 而本仓有「根目录 ↔ plugins/zcode-advisor/ 双副本」结构，忘同步就会把旧代码合入。
+# 只跑 test（构建类 job 已加 if 条件，不在 push main 时执行）：快、无网络依赖，够堵住漂移。
 #
 # 工具链选择依据（2026-09 查证 actions/runner-images）：
 # - windows-2022 预装 NSIS 3.10，可直接产出 setup.exe（windows-2025 未预装 NSIS，只有 InnoSetup）
@@ -10,6 +15,7 @@ name: build-installers
 #   注意：macos-13 已从 runner-images 移除，macos-14 已标记 deprecated，不要用它们
 on:
   push:
+    branches: [main]
     tags:
       - 'v*'
   workflow_dispatch:
@@ -37,7 +43,9 @@ jobs:
         run: npm test
 
   # ---------- Windows：绿色 zip + NSIS setup.exe ----------
+  # 只在打 tag 或手动触发时构建；push main 只跑 test（见文件头）。
   windows:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: windows-2022
     steps:
@@ -72,6 +80,7 @@ jobs:
   # 架构列表由一个前置 job 计算：手动触发时尊重 inputs.mac_arch，打 tag 时两者都建。
   # 这样避免在 matrix 展开前引用 matrix.*（GitHub Actions 不允许）。
   plan-macos:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ubuntu-latest
     outputs:
