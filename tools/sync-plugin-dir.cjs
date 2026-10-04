@@ -135,12 +135,14 @@ function quarantineOrphans() {
   let moved = 0;
   const failed = [];
   const retire = (from, relPath) => {
-    const target = path.join(bin, relPath);
     try {
+      // ⚠️ 绝不 rm 掉已存在的隔离文件：本目录承诺是 **append-only 回收站**
+      //（"等价回收站语义，误删可回捞"）。改名冲突时用带序号的新名避开，而不是删旧的。
+      let target = path.join(bin, relPath);
+      for (let i = 1; fs.existsSync(target) && i < 100; i++) {
+        target = path.join(bin, `${relPath}.dup${i}`);
+      }
       fs.mkdirSync(path.dirname(target), { recursive: true });
-      // rename 在目标已存在（EEXIST/EPERM，Windows 常见）或跨卷时失败：
-      // 先清掉残留目标再重试一次，仍失败则记录（而不是假装成功）。
-      try { fs.rmSync(target, { recursive: true, force: true }); } catch (_) {}
       fs.renameSync(from, target);
       moved++;
       return true;
@@ -184,8 +186,13 @@ function quarantineOrphans() {
     try { destIsDir = fs.existsSync(dest) && fs.statSync(dest).isDirectory(); } catch (_) {}
     if (srcIsDir && destIsDir) walk(src, dest, item);
     else if (!srcIsDir && fs.existsSync(dest)) {
-      // 单文件项：内容不同由 copyIfChanged 处理，这里只处理类型冲突（源是文件、目标是目录）
-      try { if (fs.statSync(dest).isDirectory()) retire(dest, item); } catch (_) {}
+      // 单文件项：内容不同由 copyIfChanged 处理，这里只处理类型冲突（源是文件、目标是目录）。
+      // stat 失败（EBUSY/杀毒占用等）必须记进 failed——静默跳过会让"本该隔离的残留"
+      // 留在副本里，而调用方看到 failed 为空、以为已经干净（与 rename 同一类掩盖）。
+      let destIsDir2 = false;
+      try { destIsDir2 = fs.statSync(dest).isDirectory(); }
+      catch (err) { failed.push(`${item}（stat: ${(err && err.code) || err}）`); continue; }
+      if (destIsDir2) retire(dest, item);
     }
   }
   if (moved === 0 && failed.length === 0) { try { fs.rmdirSync(bin); } catch (_) {} }
