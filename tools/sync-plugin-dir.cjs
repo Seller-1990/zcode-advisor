@@ -18,8 +18,15 @@
 const fs = require('fs');
 const path = require('path');
 
-const ROOT = path.resolve(__dirname, '..');
-const DEST = path.join(ROOT, 'plugins', 'zcode-advisor');
+// ROOT/DEST 支持 env 覆盖：测试需要造一份「源侧整个 ITEM 消失」的完整 fixture 树
+// 才能真正触发顶层分支（在真实仓库里临时移走 ITEMS 会污染并行的其他测试文件）。
+// 与本仓库其他可覆盖项（ZCODE_ADVISOR_USER_CONFIG / _ZCODE_CONFIG）同一惯例。
+const ROOT = process.env.ZCODE_ADVISOR_SYNC_ROOT
+  ? path.resolve(process.env.ZCODE_ADVISOR_SYNC_ROOT)
+  : path.resolve(__dirname, '..');
+const DEST = process.env.ZCODE_ADVISOR_SYNC_DEST
+  ? path.resolve(process.env.ZCODE_ADVISOR_SYNC_DEST)
+  : path.join(ROOT, 'plugins', 'zcode-advisor');
 
 // 插件运行必需的文件/目录。
 // **必须与 .zcode-plugin/plugin.json 的声明一致**——尤其 tools/：

@@ -109,11 +109,9 @@ test('同步清单覆盖 plugin.json 声明的全部组件（防再漏 tools/ �
     `副本目录缺少 plugin.json 声明的组件：${missing.join(', ')}（同步清单漏项会让插件功能失效）`);
 });
 
-test('同步脚本能发现「整个 ITEM 被删」的残留（不只单个文件）', () => {
-  // 回归（OCR medium）：cleanup 对 ITEMS 里已不存在的整项曾直接 continue，
-  // 副本里的整块残留（如整个 commands/ 目录）永远不会被隔离、也不会被 --check 报出。
+test('同步脚本：目录内残留（walk 分支）被检出并隔离', () => {
+  // 反向比对的基本情形：副本里多出一个源侧不存在的子项。
   const dest = path.join(ROOT, 'plugins', 'zcode-advisor');
-  const ghostDir = path.join(dest, 'ghost-item');
   const run = () => {
     try {
       execFileSync(process.execPath, [SYNC, '--check'], { encoding: 'utf8', stdio: 'pipe' });
@@ -124,23 +122,68 @@ test('同步脚本能发现「整个 ITEM 被删」的残留（不只单个文�
   };
   const orphanDirs = () => fs.readdirSync(dest).filter((n) => n.startsWith('.orphan-'));
   const before = new Set(orphanDirs());
+  const ghostSub = path.join(dest, 'commands', '__ghost-dir__');
   try {
-    // 造一个「源里没有、副本里有」的整项目录（ghost-item 不在 ITEMS 中，
-    // 因此直接测 walk 之外的分支：把它当作 ITEMS 里的项来模拟——用 commands 同级不可行，
-    // 改为验证 walk 的目录级残留检测已生效：在 commands/ 下造子目录）
-    fs.mkdirSync(path.join(dest, 'commands', '__ghost-dir__'), { recursive: true });
-    fs.writeFileSync(path.join(dest, 'commands', '__ghost-dir__', 'x.md'), '# x\n', 'utf8');
-    assert.notStrictEqual(run(), 0, '整目录残留必须让 --check 失败');
+    fs.mkdirSync(ghostSub, { recursive: true });
+    fs.writeFileSync(path.join(ghostSub, 'x.md'), '# x\n', 'utf8');
+    assert.notStrictEqual(run(), 0, '目录内残留必须让 --check 失败');
     execFileSync(process.execPath, [SYNC], { encoding: 'utf8', stdio: 'pipe' });
-    assert.ok(!fs.existsSync(path.join(dest, 'commands', '__ghost-dir__')), '同步应隔离整目录残留');
+    assert.ok(!fs.existsSync(ghostSub), '同步应隔离该残留');
     assert.strictEqual(run(), 0, '隔离后应恢复无漂移');
   } finally {
-    try { fs.rmSync(path.join(dest, 'commands', '__ghost-dir__'), { recursive: true, force: true }); } catch (_) {}
+    try { fs.rmSync(ghostSub, { recursive: true, force: true }); } catch (_) {}
     const trash = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-orphan2-'));
     for (const name of orphanDirs()) {
       if (before.has(name)) continue;
       try { fs.renameSync(path.join(dest, name), path.join(trash, name)); } catch (_) {}
     }
   }
-  assert.ok(!fs.existsSync(ghostDir), '占位目录不应存在');
+});
+
+test('同步脚本：源侧整个 ITEM 消失 → 副本里的整块残留被 --check 报出并被隔离（顶层分支）', (t) => {
+  // 回归（OCR medium + advisor 复核）：cleanup/check 对「ITEMS 里某项在源侧已不存在」
+  // 曾直接 continue，副本里的整块残留（如整个 commands/ 目录）永远不会被报出或隔离。
+  // 必须在**独立 fixture 树**里造这个场景——在真实仓库临时移走 ITEMS 会污染并行的其他测试。
+  const fx = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-syncfx-'));
+  const fxRoot = path.join(fx, 'src');
+  const fxDest = path.join(fx, 'dest');
+  t.after(() => { try { fs.rmSync(fx, { recursive: true, force: true }); } catch (_) {} });
+
+  // 最小 fixture：源侧只有 commands/ 一个 ITEM，且它存在；副本侧除它之外还有整块残留
+  fs.mkdirSync(path.join(fxRoot, 'commands'), { recursive: true });
+  fs.writeFileSync(path.join(fxRoot, 'commands', 'keep.md'), 'keep\n', 'utf8');
+  fs.mkdirSync(path.join(fxDest, 'commands'), { recursive: true });
+  fs.writeFileSync(path.join(fxDest, 'commands', 'keep.md'), 'keep\n', 'utf8');
+  // 残留：源侧不存在的整个 ITEM（模拟「commands 整个被删/改名」后副本没跟上）
+  fs.mkdirSync(path.join(fxDest, 'tools'), { recursive: true });
+  fs.writeFileSync(path.join(fxDest, 'tools', 'stale.cjs'), 'stale\n', 'utf8');
+
+  const env = Object.assign({}, process.env, {
+    ZCODE_ADVISOR_SYNC_ROOT: fxRoot,
+    ZCODE_ADVISOR_SYNC_DEST: fxDest
+  });
+  const run = (args) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath, [SYNC, ...args], { encoding: 'utf8', stdio: 'pipe', env }) };
+    } catch (err) {
+      return { code: err.status, out: String(err.stdout || '') + String(err.stderr || '') };
+    }
+  };
+
+  // 前置：残留存在时 --check 必须失败（旧实现这里恒为 0 —— 顶层 continue 跳过了它）
+  const before = run(['--check']);
+  assert.notStrictEqual(before.code, 0, `源侧不存在的整项残留必须让 --check 失败：\n${before.out}`);
+
+  // 同步后：残留被隔离出 DEST，且恢复无漂移
+  const syncRes = run([]);
+  assert.strictEqual(syncRes.code, 0, `同步应成功：\n${syncRes.out}`);
+  assert.ok(!fs.existsSync(path.join(fxDest, 'tools')), '整块残留应被移出 DEST');
+  const after = run(['--check']);
+  assert.strictEqual(after.code, 0, `隔离后应无漂移：\n${after.out}`);
+
+  // 隔离目录在 DEST 内、且残留内容确实在里面（等价回收站语义，不是直接删）
+  const orphans = fs.readdirSync(fxDest).filter((n) => n.startsWith('.orphan-'));
+  assert.strictEqual(orphans.length, 1, '应恰好产生一个隔离目录');
+  const rescued = path.join(fxDest, orphans[0], 'tools', 'stale.cjs');
+  assert.ok(fs.existsSync(rescued), '残留内容应可在隔离目录里回捞');
 });
