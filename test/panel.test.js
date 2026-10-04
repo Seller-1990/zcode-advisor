@@ -342,3 +342,34 @@ test('writeUserConfig：空 GUI 值 + 只含旧 apiKey 的配置 → 仍会清�
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
   }
 });
+
+test('配置面板页面：已保存的服务商不可用时显式提示（不静默换成列表第一项）', async () => {
+  // 真正触发该分支：配置里写一个「存在但不满足条件」的服务商（缺 key），
+  // 页面会把它从下拉里 filter 掉、选中值落到 providers[0]。必须显式告知，
+  // 否则用户不动它一保存就把选择改掉了、还以为没动过。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-missing-prov-'));
+  const v2file = path.join(dir, 'v2.json');
+  fs.writeFileSync(v2file, JSON.stringify({ provider: {
+    'no-key': { name: '缺key网', kind: 'openai-compatible',
+      options: { baseURL: 'http://10.0.0.9:8080/v1' }, models: { 'm-a': {} } },
+    'ok': { name: '可用网', kind: 'openai-compatible',
+      options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-ok' }, models: { 'm-b': {} } }
+  } }), 'utf8');
+  const prevZ = process.env.ZCODE_ADVISOR_ZCODE_CONFIG;
+  const prevCfg = fs.existsSync(USER_CONFIG) ? fs.readFileSync(USER_CONFIG, 'utf8') : null;
+  process.env.ZCODE_ADVISOR_ZCODE_CONFIG = v2file;
+  try {
+    fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true });
+    fs.writeFileSync(USER_CONFIG, JSON.stringify({ zcodeProvider: 'no-key' }), 'utf8');
+    const html = await (await fetch('http://127.0.0.1:8799/')).text();
+    assert.ok(html.includes('no-key'), `应点名那个不可用的服务商：\n${html.slice(0, 500)}`);
+    assert.ok(/缺 key|不可用/.test(html), '应说明原因（缺 key / 不可用）');
+    assert.ok(/保存.*换|换成列表/.test(html), '应警示"不改动就保存会替换选择"');
+  } finally {
+    if (prevZ === undefined) delete process.env.ZCODE_ADVISOR_ZCODE_CONFIG;
+    else process.env.ZCODE_ADVISOR_ZCODE_CONFIG = prevZ;
+    if (prevCfg === null) { try { fs.unlinkSync(USER_CONFIG); } catch (_) {} }
+    else fs.writeFileSync(USER_CONFIG, prevCfg, 'utf8');
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+  }
+});

@@ -62,8 +62,25 @@ function esc(s) {
 function page() {
   const cfg = readUserConfig();
   // 状态栏（0.2.17）：审查通道只走 ZCode 第三方服务商，端点/key 由 ZCode 统一维护。
-  const providers = listZcodeProvidersSafe().filter((p) => p.eligible && !p.official && p.baseURL && p.apiKey);
+  const allProviders = listZcodeProvidersSafe();
+  const providers = allProviders.filter((p) => p.eligible && !p.official && p.baseURL && p.apiKey);
   const selProvider = providers.find((p) => p.id === cfg.zcodeProvider) || providers[0] || null;
+  // ⚠️ 配置里选的服务商若不满足条件会被上面的 filter 剔除，于是下拉静默落到 providers[0]，
+  // 用户一保存就把选择改掉了（还没意识到）。这里显式告知，让"被替换"可见。
+  const wantRaw = String(cfg.zcodeProvider || '').trim();
+  const wantMissing = Boolean(wantRaw) && !providers.some((p) => p.id === wantRaw);
+  let missingHint = '';
+  if (wantMissing) {
+    const known = allProviders.find((p) => p.id === wantRaw);
+    const why = !known ? '在 ZCode 配置里已不存在'
+      : (known.official ? '是官方内置通道（审查通道不使用）'
+        : (!known.eligible ? `协议 ${known.kind || '未知'} 非 OpenAI 兼容`
+          : (!known.baseURL ? '缺端点' : (!known.apiKey ? '缺 key' : '不满足使用条件'))));
+    missingHint = `<div class="card" style="border-left:3px solid #f59e0b">`
+      + `<b>⚠ 已保存的服务商「${esc(wantRaw)}」当前不可用</b>（${esc(why)}）。`
+      + `下面显示的是可用列表；<b>不改动就保存会把选择换成列表里的第一项</b>——`
+      + `请先在 ZCode 设置里修好它，或明确改选一个可用服务商。</div>`;
+  }
   const statusModel = cfg.model || (selProvider && selProvider.models[0]) || '（服务商默认）';
   const statusKey = selProvider ? '服务商 key（ZCode 维护）' : '（ZCode 里暂无可用第三方服务商）';
   const providerOpts = providers.length === 0
@@ -100,6 +117,7 @@ function page() {
 <div style="font-size:13px;margin-top:4px">服务商：<code>${esc(selProvider ? (selProvider.name || selProvider.id) : '（无）')}</code> ｜ 模型：<code>${esc(statusModel)}</code> ｜ 模式：<code>${esc(cfg.reviewMode || 'async')}</code> ｜ key：<code id="st-key">${esc(statusKey)}</code></div>
 <small>保存后**下一轮审查即生效**，无需重启 ZCode；新建会话后斜杠命令（/advisor-status 等）可用。</small>
 </div>
+${missingHint}
 <div class="card"><h2>审查副模型</h2>
 <label>启用</label>
 <select id="startEnabled">

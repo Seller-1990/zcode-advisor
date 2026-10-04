@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 
@@ -109,7 +110,17 @@ def similar(a, b):
 
 
 def merge(results):
-    """并集去重 + 共性加权。相同意见归并，记录哪些模型提到过。"""
+    """并集去重 + 共性加权。相同意见归并，记录哪些模型提到过。
+
+    归并判据（务必别退回成 `near or similar`）：同一份 diff 里，**相邻行常常是不同问题**
+    （密集改动区尤其如此）。早期实现用「行号邻近 OR 内容相似」，会把两条无关意见并成一条，
+    直接损害"哪些问题被判为高置信"的结论——这比漏并更糟（漏并只是少一条，误并会让用户
+    以为某个问题有两个模型背书）。
+    现在的规则：
+      - 行号邻近（±3）**且** 内容相似 → 同一条（同一处被两个模型以不同措辞描述）
+      - 行号较远但内容高度相似 → 同一条（同一问题被定位到不同行）
+      - 其余 → 各自独立
+    """
     merged = []
     for r in results:
         for c in r['comments']:
@@ -120,10 +131,10 @@ def merge(results):
             for m in merged:
                 if m['path'] != path:
                     continue
-                # 行号邻近（±3 行）或内容相似，都视为同一条
-                near = (isinstance(line, int) and isinstance(m['start_line'], int)
-                        and abs(line - m['start_line']) <= 3)
-                if near or similar(content, m['content']):
+                # 无论行号远近，都**必须内容相似**才算同一条：
+                # 同一份 diff 里相邻行常是不同问题（密集改动区尤其如此），
+                # 只看行号会把无关意见并成一条 → 假的高置信，比漏并更糟。
+                if similar(content, m['content']):
                     hit = m
                     break
             if hit is None:
@@ -173,9 +184,12 @@ def main():
         print(f'  槽位{n}: {p}/{m}')
     print()
 
+    # 临时文件名带 pid：固定名（mr-slot<N>.json）在并发跑两个评审时会互相覆盖，
+    # 导致"结果 A 里混进结果 B"这种最难查的错误。/tmp 是共享目录，必须区分。
+    tag = f'{os.getpid()}-{int(time.time())}'
     with ThreadPoolExecutor(max_workers=len(slots)) as ex:
         futs = [ex.submit(run_one, n, p, m, args.frm, args.to,
-                          os.path.join(args.workdir, f'mr-slot{n}.json'))
+                          os.path.join(args.workdir, f'mr-slot{n}-{tag}.json'))
                 for n, p, m in slots]
         results = [f.result() for f in futs]
 

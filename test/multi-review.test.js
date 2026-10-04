@@ -102,3 +102,32 @@ test('merge：多模型报同一问题取更严重的等级', () => {
   assert.strictEqual(merged.length, 1);
   assert.strictEqual(merged[0].severity, 'high', '应升级到更严重的等级，不能降级掩盖');
 });
+
+test('merge：相邻行（±3 内）的不同问题**不得**误并（回归：曾用 `near or similar`）', () => {
+  // 密集改动区里相邻行常是不同问题。早期实现只要"行号邻近"就归并，
+  // 会把两条无关意见并成一条并标成「两个模型都提到」→ 假高置信，比漏并更糟。
+  const merged = runMerge([
+    slot(1, 'p', 'm1', 'complete', [
+      { path: 'x.js', start_line: 10, severity: 'high', content: 'sql injection via string concat' },
+      { path: 'x.js', start_line: 12, severity: 'low', content: 'unused import of fs module' },
+      { path: 'x.js', start_line: 11, severity: 'medium', content: 'missing rate limit on this endpoint' },
+    ]),
+  ]);
+  assert.strictEqual(merged.length, 3, '同一文件相邻行的三个不同问题必须各自独立');
+  for (const m of merged) {
+    assert.strictEqual(m.confidence, 'single', '都不该被判为"多模型共同提到"');
+  }
+});
+
+test('merge：同一问题、相邻行、措辞不同 → 仍应归并为高置信', () => {
+  const merged = runMerge([
+    slot(1, 'p', 'm1', 'complete', [
+      { path: 'x.js', start_line: 10, severity: 'high', content: 'env override is not paired with the key' },
+    ]),
+    slot(3, 'p2', 'm2', 'complete', [
+      { path: 'x.js', start_line: 12, severity: 'high', content: 'env override is not paired with the key' },
+    ]),
+  ]);
+  assert.strictEqual(merged.length, 1, '内容相同应归并（不能因收紧规则而漏并）');
+  assert.strictEqual(merged[0].confidence, 'high');
+});
