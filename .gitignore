@@ -7,3 +7,6 @@ dist/
 plugins/zcode-advisor/.orphan-*/
 # 改动前的本机备份（D1：动核心文件前先备份，不入库）
 backups/
+# Python 字节码缓存（跑 tools/*.py 的副产品，不属于插件 payload）
+__pycache__/
+*.pyc

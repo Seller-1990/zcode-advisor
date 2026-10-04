@@ -45,10 +45,12 @@ function diffTree(a, b, rel, out) {
   let st;
   try { st = fs.statSync(a); } catch (_) { out.push(`缺失: ${rel}`); return out; }
   if (st.isDirectory()) {
-    const srcNames = fs.readdirSync(a);
+    const srcNames = fs.readdirSync(a).filter((n) => n !== '__pycache__');
     let destNames = [];
     try { destNames = fs.readdirSync(b); } catch (_) { /* 目标缺失：下面的 diffTree 会记 */ }
     for (const name of destNames) {
+      // __pycache__ 不参与比对：它是跑 Python 的副产品，不属于插件 payload。
+      if (name === '__pycache__') continue;
       if (!srcNames.includes(name)) out.push(`多余（源已删除）: ${path.join(rel, name)}`);
     }
     for (const name of srcNames) {
@@ -88,7 +90,12 @@ function copyIfChanged(src, dest) {
   try { st = fs.statSync(src); } catch (_) { return; }
   if (st.isDirectory()) {
     fs.mkdirSync(dest, { recursive: true });
-    for (const name of fs.readdirSync(src)) copyIfChanged(path.join(src, name), path.join(dest, name));
+    for (const name of fs.readdirSync(src)) {
+      // Python 字节码缓存不属于插件 payload：跑过 tools/*.py 就会生成，
+      // 同步进副本只会制造"副本缺 .pyc"的伪漂移（CI 上实测踩到）。跳过。
+      if (name === '__pycache__') continue;
+      copyIfChanged(path.join(src, name), path.join(dest, name));
+    }
     return;
   }
   try {
@@ -158,6 +165,8 @@ function quarantineOrphans() {
     try { destNames = fs.readdirSync(destDir); } catch (_) { return; }
     for (const name of destNames) {
       if (name.startsWith('.orphan-')) continue;
+      // __pycache__ 不是 payload（跑 Python 的副产品）：既不该同步、也不该被"隔离"。
+      if (name === '__pycache__') continue;
       const destPath = path.join(destDir, name);
       const relPath = path.join(rel, name);
       if (!srcNames.includes(name)) {

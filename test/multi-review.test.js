@@ -21,8 +21,13 @@ mr = importlib.util.module_from_spec(spec); spec.loader.exec_module(mr)
 results = json.loads(sys.stdin.read())
 print(json.dumps(mr.merge(results), ensure_ascii=False))
 `;
-  const out = execFileSync('python3', ['-c', py], {
+  // `-B`：禁止写 .pyc。exec_module 会为加载的模块生成 tools/__pycache__/*.pyc，
+  // 而 tools/ 属于 sync-plugin-dir 的同步范围 —— 残留会被判成"副本缺该文件"的漂移
+  //（CI 上实测踩到：本机 Python 3.9 不生成、CI 的 3.12 生成，本地因此复现不出）。
+  // 同步器与 .gitignore 另加两道防线兜底。
+  const out = execFileSync('python3', ['-B', '-c', py], {
     input: JSON.stringify(results), encoding: 'utf8',
+    env: Object.assign({}, process.env, { PYTHONDONTWRITEBYTECODE: '1' }),
   });
   return JSON.parse(out);
 }
