@@ -24,23 +24,27 @@
   "userConfig": {
     "zcode_provider": {
       "type": "string",
+      "title": "全局审查服务商",
       "default": "",
-      "description": "全局审查服务商（ZCode 已维护的第三方 OpenAI 兼容服务商，填其 id 或名称）。留空 = 自动选择（优先含所填模型的可用服务商）。端点与 key 由 ZCode 统一维护，本插件不单独保存；ZCode 官方内置通道（BigModel/Z.ai）不用于审查。改选择也可用角标面板的「完整配置」"
+      "description": "ZCode 已维护的第三方 OpenAI 兼容服务商（填其 id 或名称）。留空 = 自动选择（优先含所填模型的可用服务商）。端点与 key 由 ZCode 统一维护，本插件不单独保存；ZCode 官方内置通道（BigModel/Z.ai）不用于审查。改选择也可用角标面板的「完整配置」"
     },
     "model": {
       "type": "string",
+      "title": "全局审查模型",
       "default": "",
-      "description": "全局审查模型 id（如 glm-5.3-flash）。非空即生效并覆盖本地配置里的模型，下一轮审查生效、无需重启；留空 = 取所选服务商的登记清单首项。建议与主对话模型形成能力差，思考型模型建议把 max_tokens 提到 4096。会话级临时换模型/服务商：角标面板「本会话的审查模型」，或 /advisor-model set <模型id> [provider:<服务商>]"
+      "description": "审查模型 id（如 glm-5.3-flash）。非空即生效并覆盖本地配置里的模型，下一轮审查生效、无需重启；留空 = 取所选服务商的登记清单首项。建议与主对话模型形成能力差，思考型模型建议把 max_tokens 提到 4096。会话级临时换模型/服务商：角标面板「本会话的审查模型」，或 /advisor-model set <模型id> [provider:<服务商>]"
     },
     "review_mode": {
       "type": "string",
+      "title": "审查模式",
       "default": "",
-      "description": "审查模式：async（引擎默认，零体感延迟）或 sync（当轮打断）。留空 = 不经本表单写入配置"
+      "description": "async（引擎默认，零体感延迟）或 sync（当轮打断）。留空 = 不经本表单写入配置"
     },
     "max_tokens": {
       "type": "number",
+      "title": "单次审查 max_tokens",
       "default": 0,
-      "description": "单次审查输出的 max_tokens 上限（引擎默认 4096；思考型模型建议 4096，越界会被钳到 64–16384）。填 0 或留空 = 不经本表单写入配置"
+      "description": "单次审查输出的上限（引擎默认 4096；思考型模型建议 4096，越界会被钳到 64–16384）。填 0 或留空 = 不经本表单写入配置"
     }
   }
 }
