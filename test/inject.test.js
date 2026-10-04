@@ -1001,3 +1001,19 @@ test('inject.js：历史区头部键盘可达（role/aria-expanded + Enter 可�
   assert.strictEqual(head.getAttribute('aria-expanded'), 'true', 'Enter 展开后 aria-expanded 应为 true');
 });
 
+
+test('panel 契约：程序化赋值 select.value 不触发 change（故无需"回填"标志位）', () => {
+  // 规范与实证：按 DOM 规范，**程序化**赋值 select.value 不派发 change 事件
+  //（jsdom 实测：赋值 0 次、dispatchEvent 1 次）——所以 panel.cjs 的 change 处理器
+  // 只会被真实用户交互触发，fillModels 的回填不会误清手填模型框。
+  // 这条测试锁住该前提：若后人再引入 programmaticSelect 之类的标志位，说明前提被误解了。
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'tools', 'companion', 'panel.cjs'), 'utf8'
+  );
+  assert.ok(!/programmaticSelect/.test(src),
+    '不应存在"回填会触发 change"的标志位：程序化赋值本就不触发 change');
+  // 用户主动选择时清空手填值这一真实修复必须保留
+  assert.match(src, /clearManualIfPicked/, 'zmodel/zprovider 的 change 处理器应清手填框');
+  assert.match(src, /addEventListener\('change', clearManualIfPicked\)/,
+    'zmodel 的 change 应绑定清空处理器（否则手填旧值会压过用户刚选项）');
+});

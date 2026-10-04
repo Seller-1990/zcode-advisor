@@ -149,11 +149,8 @@ details summary:hover{color:#e6e8ec}
     for (const id of list) { const o = document.createElement('option'); o.value = id; o.textContent = id; sel.appendChild(o); }
     if (!list.length) { const o = document.createElement('option'); o.value = ''; o.textContent = '（无登记模型——点「从端点拉取」试试）'; sel.appendChild(o); }
     const want = curCfg && curCfg.model;
-    // 程序化回填期间置标志：这次 change（若有）是回填触发的，不是用户选择。
-    programmaticSelect = true;
     if (want && list.includes(want)) sel.value = want;
     else if (list.length) sel.value = list[0];
-    programmaticSelect = false;
     // 模型清单刚被换过（切服务商 / 拉取实时清单）：手填框里的旧值不再代表用户意图，
     // 不清空会盖住用户接下来在下拉里的选择（currentModelId 手填优先）。
     const manual = $('modelManual');
@@ -185,11 +182,10 @@ details summary:hover{color:#e6e8ec}
   // 用户主动改下拉（选模型 / 切服务商）时，手填框里的旧值不再代表意图，清掉。
   // 只靠 fillModels 里「不在新清单里才清」不够：旧值恰好也在新清单里时会被保留，
   // 于是它继续压过用户刚选的那一项（静默忽略刚做的选择）。
-  // ⚠️ 必须区分「用户操作」与「程序回填」：fillModels 中赋值 sel.value 同样会
-  // 触发 change 事件，若不加标志就会把回填当成用户选择、误清手填值（初次打开面板即中招）。
-  let programmaticSelect = false;
+  // 注：**不需要**区分"程序回填 vs 用户操作"——按 DOM 规范，程序化赋值 select.value
+  // 不会派发 change 事件（jsdom 实测：赋值 0 次、dispatchEvent 1 次），所以下面的
+  // 处理器只会被真实用户交互触发，回填不会误清手填值。
   function clearManualIfPicked() {
-    if (programmaticSelect) return; // 回填不算用户意图
     const m = $('modelManual');
     if (m && m.value) m.value = '';
   }
