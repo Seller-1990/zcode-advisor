@@ -714,8 +714,44 @@ test('inject.js：会话覆盖模型优先展示（sessionModel 非空时标注�
   await new Promise((r) => setTimeout(r, 20));
   const st = dom.byId.get('zca-status');
   assert.match(st.textContent, /kimi-k3（本会话覆盖）/, '会话覆盖模型应优先于全局展示');
-  const hint = dom.byId.get('zca-session-hint');
-  assert.match(hint.textContent, /\/advisor-model set/, '应给出会话换模型命令指引');
+  const sm = dom.byId.get('zca-session-model');
+  assert.strictEqual(sm.value, 'kimi-k3', '会话模型输入框应回填当前覆盖值');
+});
+
+test('inject.js：会话级模型控件（0.2.16 补 UI）：回填当前覆盖值，保存发 /api/session-model', async () => {
+  const setCalls = [];
+  const fetchStub = async (url, opt) => {
+    const u = String(url);
+    if (u.includes('/api/session-model')) {
+      setCalls.push(JSON.parse((opt && opt.body) || '{}'));
+      return { json: async () => ({ ok: true, sessionModel: 'kimi-k3' }) };
+    }
+    if (u.includes('/api/session')) {
+      return { json: async () => ({ ok: true, hasSession: true, sessionId: 'sess_m1', enabled: true, sessionModel: 'glm-5.3-flash' }) };
+    }
+    if (u.includes('/api/config')) return { json: async () => ({ ok: true, config: { model: 'glm-5.3-flash', reviewMode: 'async', apiSource: 'manual' } }) };
+    return { json: async () => ({ ok: false }) };
+  };
+  const dom = runInject({ fetch: fetchStub });
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 20));
+
+  const input = dom.byId.get('zca-session-model');
+  assert.ok(input, '面板应有本会话模型输入框 #zca-session-model');
+  assert.strictEqual(input.value, 'glm-5.3-flash', '应回填当前会话覆盖模型');
+  // 修改并保存
+  input.value = 'kimi-k3';
+  dom.byId.get('zca-panel').querySelector('#zca-session-model-save')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(setCalls.length, 1, '应发出会话模型设置请求');
+  assert.strictEqual(setCalls[0].model, 'kimi-k3');
+  const msgEl = dom.byId.get('zca-msg');
+  assert.match(msgEl.textContent, /本会话模型已设为/, '应确认设置成功');
+  // 空值保存 = 恢复全局
+  input.value = '';
+  dom.byId.get('zca-panel').querySelector('#zca-session-model-save')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(setCalls[1].model, '', '空值保存 = reset 恢复全局');
 });
 
 test('inject.js：完整配置按钮以 hash 令牌打开 /panel（全局配置唯一 GUI 入口）', async () => {

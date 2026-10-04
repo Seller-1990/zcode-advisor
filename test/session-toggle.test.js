@@ -36,6 +36,32 @@ function writeState(patch) {
   return file;
 }
 
+test('setSessionModel：设置/重置会话级模型，与 hook 的 sessionModel 落点一致', () => {
+  writeBeacon();
+  const file = writeState({ enabled: true, sessionModel: '' });
+  // 设置
+  const r1 = controller.setSessionModel('kimi-k3');
+  assert.strictEqual(r1.ok, true);
+  assert.strictEqual(r1.sessionModel, 'kimi-k3');
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sessionModel, 'kimi-k3');
+  // 重置（空 = 恢复全局）
+  const r2 = controller.setSessionModel('');
+  assert.strictEqual(r2.ok, true);
+  assert.strictEqual(r2.sessionModel, '');
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sessionModel, '');
+  assert.ok(!fs.existsSync(`${file}.wrlock`), '锁应释放');
+  // 空白字符串等同重置（trim 语义）
+  controller.setSessionModel('   ');
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sessionModel, '');
+});
+
+test('setSessionModel：无会话 → no_session（不静默成功）', () => {
+  for (const f of fs.readdirSync(healthDir)) fs.unlinkSync(path.join(healthDir, f));
+  const r = controller.setSessionModel('m1');
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.error, 'no_session');
+});
+
 test('readSessionSnapshot：经信标 stateDir 定位状态文件，返回 enabled/sessionModel', () => {
   writeBeacon();
   writeState({ enabled: true, sessionModel: 'kimi-k3' });

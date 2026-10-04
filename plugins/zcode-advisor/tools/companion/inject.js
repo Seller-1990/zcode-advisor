@@ -95,6 +95,12 @@
 /* 启用开关：面板正文第一行的独立控件。曾在标题栏里挤着——难点中、又像关闭按钮的邻居（位置不对的来源） */
 .zca-toggle-row{display:flex;align-items:center;justify-content:space-between;
  padding:7px 10px;background:#242833;border-radius:8px}
+/* 会话级模型行：label + 输入框 + 保存按钮同行，紧贴启用开关下方 */
+.zca-session-model-row{display:flex;align-items:center;gap:8px;margin-top:8px;
+ padding:7px 10px;background:#242833;border-radius:8px}
+.zca-session-model-row .zca-label{flex:0 0 auto}
+.zca-session-model-row input{flex:1 1 auto;padding:4px 8px;font-size:12px}
+.zca-session-model-row .zca-btn{font-size:12px}
 .zca-switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
 .zca-switch input{position:absolute;opacity:0;width:0;height:0}
 .zca-track{width:30px;height:17px;border-radius:9px;background:#4a5160;position:relative;transition:background .15s;flex:0 0 auto}
@@ -377,16 +383,39 @@
       // 会话启用开关初始态：必须回填，否则用户打开面板看到"未启用"、一点就静默停用
       const en = document.getElementById('zca-session-enabled');
       if (en) en.checked = session ? session.enabled !== false : true;
+      // 会话级模型输入框回填当前覆盖值（空 = 跟随全局）
+      const sm = document.getElementById('zca-session-model');
+      if (sm && session) sm.value = String(session.sessionModel || '');
       // 开关旁的会话标注：无会话数据时置灰提示
       const hint = document.getElementById('zca-session-hint');
       if (hint) {
         hint.textContent = (!session || !session.hasSession)
           ? '暂无活动会话（先在 ZCode 里跑一轮对话）'
-          : (session.sessionModel ? `本会话已临时换模型：/advisor-model set <id> 可更改，reset 恢复全局` : '全局配置与模型请点「完整配置」；会话临时换模型用 /advisor-model set <id>');
+          : '保存后自下一轮审查生效；模型可从「完整配置」的模型列表里复制';
       }
     } catch (err) {
       // 网络层失败才可能是"外挂未运行"；此时把原因也带上，便于排查
       msg(`无法连接本机 controller（外挂未运行？）：${err && err.message ? err.message : err}`, false);
+    }
+  }
+
+  // 保存/重置会话级模型（写 state.sessionModel，与 /advisor-model set|reset 同一落点）
+  async function saveSessionModel() {
+    const input = document.getElementById('zca-session-model');
+    if (!input) return;
+    const model = String(input.value || '').trim();
+    try {
+      const r = await api('/api/session-model', { model });
+      if (r && r.ok) {
+        msg(model
+          ? `本会话模型已设为 ${model}（自下一轮审查生效；不影响其他会话）`
+          : '已恢复跟随全局模型（自下一轮审查生效）', true);
+        refreshStatus();
+      } else {
+        msg('设置失败：' + (r && (r.hint || r.error) || '未知'), false);
+      }
+    } catch (e) {
+      msg('设置失败：' + (e && e.message ? e.message : e), false);
     }
   }
 
@@ -431,6 +460,11 @@
           <span class="zca-switch-text">启用顾问（本会话）</span>
         </label>
       </div>
+      <div class="zca-session-model-row">
+        <label class="zca-label" for="zca-session-model" style="margin:0" title="留空并保存 = 恢复全局模型；仅当前会话生效，优先于全局">本会话模型</label>
+        <input id="zca-session-model" placeholder="（使用全局模型）" title="填模型 id 覆盖本会话审查模型；留空 = 跟随全局">
+        <button type="button" class="zca-btn alt" id="zca-session-model-save" style="flex:0 0 auto;padding:5px 10px">保存</button>
+      </div>
       <div class="zca-hint" id="zca-session-hint" style="margin-top:6px"></div>
       <div class="zca-row">
         <button class="zca-btn" id="zca-fullpanel" title="全局配置（API 来源 / 端点 / key / 全局模型 / 拉取模型 / Ping）在浏览器中打开">完整配置…</button>
@@ -450,6 +484,11 @@
     // Esc 关闭（对话框惯例）：键盘用户不必去够右上角小叉
     p.addEventListener('keydown', (ev) => { if (ev && ev.key === 'Escape') closePanel(); });
     p.querySelector('#zca-session-enabled').addEventListener('change', (ev) => toggleSession(!!(ev && ev.target && ev.target.checked)));
+    p.querySelector('#zca-session-model-save').addEventListener('click', saveSessionModel);
+    // Enter 直接送出（与保存按钮等价）
+    p.querySelector('#zca-session-model').addEventListener('keydown', (ev) => {
+      if (ev && ev.key === 'Enter') { ev.preventDefault(); saveSessionModel(); }
+    });
     // 完整配置：全局配置的唯一 GUI 载体（宿主不渲染插件设置表单，见 panel.cjs 头注释）。
     // 令牌经 URL hash 传递：不进服务器日志、不落 referer（GET /panel 本身不含敏感数据）。
     p.querySelector('#zca-fullpanel').addEventListener('click', () => {

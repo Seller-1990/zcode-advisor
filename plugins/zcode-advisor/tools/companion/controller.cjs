@@ -920,6 +920,59 @@ function toggleSessionEnabled(enabled) {
   }
 }
 
+// 设置/重置最近活动会话的会话级模型（角标面板「本会话模型」入口）。
+// 与 /advisor-model set|reset（mutateStateExclusive）同款 wrlock 互斥、同一落点：
+// 只写 state.sessionModel，审查链下一轮 effectiveModel 即取到（会话覆盖 > 全局）。
+function setSessionModel(model) {
+  const want = String(model || '').trim();
+  const b = locateLatestSessionBeacon();
+  if (!b) {
+    return { ok: false, error: 'no_session', hint: '没有可操作的会话——先在 ZCode 里打开一个会话并让它跑起来（信标尚不存在）' };
+  }
+  const stateFile = path.join(String(b.stateDir), `sess-${sanitizeSessionIdForState(b.sessionId)}.json`);
+  const lock = `${stateFile}.wrlock`;
+  const myPid = String(process.pid);
+  let got = false;
+  for (let i = 0; i < 40 && !got; i++) {
+    try {
+      fs.writeFileSync(lock, myPid, { flag: 'wx' });
+      got = true;
+    } catch (_) {
+      try {
+        const st = fs.statSync(lock);
+        if (Date.now() - st.mtimeMs > 10000) { try { fs.unlinkSync(lock); } catch (_) {} }
+      } catch (_) {}
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); } catch (_) {}
+    }
+  }
+  if (!got) return { ok: false, error: 'lock_timeout', hint: '会话状态正被审查进程写入，请稍后重试' };
+  const ownLock = () => { try { return fs.readFileSync(lock, 'utf8').trim() === myPid; } catch (_) { return false; } };
+  try {
+    if (!ownLock()) return { ok: false, error: 'lock_timeout', hint: '会话状态正被审查进程写入，请稍后重试' };
+    let st;
+    try {
+      st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    } catch (_) {
+      return { ok: false, error: 'state_unreadable', hint: '会话状态文件不可读（可能尚未生成）：' + stateFile };
+    }
+    if (!st || typeof st !== 'object') {
+      return { ok: false, error: 'state_unreadable', hint: '会话状态文件内容异常：' + stateFile };
+    }
+    st.sessionModel = want; // 空 = reset（恢复全局）
+    const tmp = `${stateFile}.tmp-${process.pid}`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(st, null, 2), { encoding: 'utf8', mode: 0o600 });
+      fs.renameSync(tmp, stateFile);
+    } catch (err) {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+      return { ok: false, error: 'state_write_failed', hint: String(err && err.message || err).slice(0, 120) };
+    }
+    return { ok: true, sessionModel: want, sessionId: String(b.sessionId || '') };
+  } finally {
+    try { if (fs.readFileSync(lock, 'utf8').trim() === myPid) fs.unlinkSync(lock); } catch (_) {}
+  }
+}
+
 // 清除用户级配置的 apiKey（完整面板「清除 API key」入口）。语义与 config-bridge 的
 // removeUserConfigKeys 一致：走同一把配置锁；损坏/非对象报失败（绝不静默重建蒸发键）；
 // 键不存在 = 幂等成功。controller 与 config-bridge 是跨目录独立副本（发行包无 hooks/）。
@@ -1165,6 +1218,12 @@ function startApi(cdpPort, apiPort, token) {
         const body = await readBody();
         return done(200, toggleSessionEnabled(body && body.enabled));
       }
+      // 会话级模型（角标面板「本会话模型」）：body.model 空 = reset 恢复全局。
+      // 与 /advisor-model set|reset 同一落点（state.sessionModel），优先级：会话覆盖 > 全局。
+      if (req.method === 'POST' && req.url === '/api/session-model') {
+        const body = await readBody();
+        return done(200, setSessionModel(body && body.model));
+      }
       // 清除已保存的 apiKey（完整面板入口；与配置面板「清除 API key」同一落点）。
       if (req.method === 'POST' && req.url === '/api/remove-key') {
         const r = removeApiKeyFromUserConfig();
@@ -1304,6 +1363,6 @@ if (require.main === module) {
 }
 
 module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi,
-  readSessionSnapshot, toggleSessionEnabled,
+  readSessionSnapshot, toggleSessionEnabled, setSessionModel,
   // 供单测直接验证单实例锁与主实例探测（不启动进程）
   _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, exitCodeFor, classifySpawnError, RETRY_EXIT_CODE, SUPERVISED, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS } };
