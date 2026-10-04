@@ -6,11 +6,19 @@
 #     拦截靠 CI 的确定性检查，评审只作为 advisory 关卡。
 #   - 也**不定时跑**：只在每个 PR 合并前调用一次。
 #
-# 三级模型降级链（provider|model，与 ~/.opencodereview/config.json 的 custom_providers 对应）：
-#   主    x666        -> grok-4.7        （薄荷 0 倍率）
-#   备用① nas-hy4     -> hy4-preview-f   （8787 网关）
-#   备用② nas-octopus -> glm-5.3-flash   （PM-API 免费分组）
-#
+# 模型降级链（provider|model，与 ~/.opencodereview/config.json 的 custom_providers 对应）：
+#   ⚠️ 本脚本含云端 provider，**只允许公开仓使用**（云端会把代码发往第三方）；
+#      私有仓用 ocr-review.sh.private 变体（NAS-only，见 ~/.dsh/templates/ocr-review/）。
+#   前四棒全 0 倍率免费（2026-10-04 成本优先，避开 kimi-k3 等贵模型）：
+#   主    nas-hy4     -> deepseek-v4.1-flash （8787 免费，工具调用已实测）
+#   备用① nas-octopus -> glm-5.3-flash      （8088 PM-API 免费分组）
+#   备用② nas-hy4     -> hy3                （8787 免费）
+#   备用③ nas-hy4     -> hy4-preview-f      （8787 免费）
+#   备用④ x666        -> ministral-14b-latest （云端 0 倍率，工具调用已实测）
+#   备用⑤ lucky-gem   -> gemini-3.6-flash   （云端，主人提供 key，工具调用已实测）
+#   备用⑥ lucky       -> stealth/space-bunny-alpha （云端，工具调用已实测）
+#   备用⑦ lucky       -> step-5-preview     （云端，工具调用已实测）
+#   备用⑧ daigua      -> gpt-6-sol          （云端，顾问生产验证过工具调用）
 # 用法：
 #   ./scripts/ocr-review.sh              # 默认基准 origin/dev（不存在则回退 main）
 #   ./scripts/ocr-review.sh v1.8.8       # 对比 tag / 分支
@@ -124,11 +132,17 @@ fi
 AGENT_MODEL="$(tr -d '[:space:]' < "$AGENT_MODEL_FILE" 2>/dev/null || true)"
 [ -n "$AGENT_MODEL" ] && echo "（编码代理当前模型：${AGENT_MODEL}，评审将优先使用其他 provider）"
 
-# 三级降级链：逐个尝试，第一个**产出有效 JSON** 的即采用
+# 降级链：逐个尝试，第一个**产出有效 JSON** 的即采用
 CHAIN=(
-  "x666|grok-4.7"
-  "nas-hy4|hy4-preview-f"
+  "nas-hy4|deepseek-v4.1-flash"
   "nas-octopus|glm-5.3-flash"
+  "nas-hy4|hy3"
+  "nas-hy4|hy4-preview-f"
+  "x666|ministral-14b-latest"
+  "lucky-gem|gemini-3.6-flash"
+  "lucky|stealth/space-bunny-alpha"
+  "lucky|step-5-preview"
+  "daigua|gpt-6-sol"
 )
 
 # 模板必须以 XXXXXX 结尾：GNU mktemp 把 -t 当 --tmpdir 并要求该后缀（BSD/macOS 两者都接受）。
@@ -196,7 +210,14 @@ for entry in "${CHAIN[@]}"; do
   : > "$OUT_JSON"
   ATTEMPT_LOG="$(mktemp "${TMPDIR_OCR%/}/ocr-attempt-XXXXXX" 2>/dev/null || true)"
   echo "  尝试 provider=$provider model=$model …"
+  # --concurrency 2：ocr 默认并发 8 个子任务（每组还有多轮工具调用），实测会打满
+  # x666 的「25 请求/5 分钟」限流（429）——连续 6 次评审全灭的根因。降并发换稳。
+  # 可用 OCR_REVIEW_CONCURRENCY 覆盖；限流充裕的 provider 可设回 8。
+  # --exclude 图片：assets/icon.png 是 ~1MB 二进制，进 diff 会塞爆每个分组的上下文，
+  # 实测两个模型全部返回空 comments（20 组全灭）——二进制资产对文本评审只有噪音。
   if ocr review --from "$FROM" --to "$TO" --format json --output "$OUT_JSON" \
+       --concurrency "${OCR_REVIEW_CONCURRENCY:-2}" \
+       --exclude '**/*.png,**/*.ico,**/*.icns,**/*.jpg,**/*.jpeg,**/*.gif,**/*.pdf' \
        --provider "$provider" --model "$model" >"${ATTEMPT_LOG:-/dev/null}" 2>&1 && valid_output; then
     echo "  成功：$provider / $model"
     CHOSEN="$provider/$model"
