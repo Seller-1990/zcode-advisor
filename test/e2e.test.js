@@ -945,3 +945,43 @@ test('M4 告警：旧形状 state（无 M4 字段）升级后不炸', (t) => {
   const r = runHook(['user-prompt-submit'], { session_id: 'd4', transcript_path: '/nonexistent', prompt: 'x' }, env);
   assert.strictEqual(r.status, 0, '旧形状 state 不应导致崩溃');
 });
+
+test('ctl doctor --state：按会话生效值评估门禁（与 /advisor-status 同口径）', (t) => {
+  const { transcript, stateDir } = setup(t);
+  // 全局只有官方内置通道 → 全局体检必然报门禁未满足
+  const zcodeCfg = path.join(stateDir, 'zcode-official-only.json');
+  fs.writeFileSync(zcodeCfg, JSON.stringify({
+    provider: {
+      'builtin:bigmodel': {
+        name: 'BigModel 官方', kind: 'openai',
+        options: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'sk-official' },
+        models: { 'glm-5.3': {} }
+      },
+      'prov-3p': {
+        name: '第三方网关', kind: 'openai-compatible',
+        options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-3p' },
+        models: { 'm-a': {} }
+      }
+    }
+  }));
+  const env = makeEnv(stateDir, {
+    ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg,
+    // 全局显式指向不可用的官方内置通道 → 全局解析必然失败（否则自动选择会挑中 prov-3p）
+    ZCODE_ADVISOR_ZCODE_PROVIDER: 'builtin:bigmodel'
+  });
+  const stateFile = path.join(stateDir, 'sess-doc.json');
+  runHook(['session-start'], { session_id: 'doc', transcript_path: transcript }, env);
+  runHook(['ctl', 'model', 'set', 'm-a', 'provider:prov-3p', '--state', stateFile], null, env);
+
+  // 不带 --state：只看全局 → 门禁未满足
+  const globalDoc = runHook(['ctl', 'doctor'], null, env);
+  assert.match(globalDoc.stdout, /范围: 全局/, '应标明是全局口径');
+  assert.match(globalDoc.stdout, /门禁: 未满足/, '全局口径应报未满足');
+
+  // 带 --state：按会话生效值 → 门禁满足，且标注会话
+  const sessDoc = runHook(['ctl', 'doctor', '--state', stateFile], null, env);
+  assert.match(sessDoc.stdout, /范围: 本会话/, '应标明会话口径');
+  assert.match(sessDoc.stdout, /门禁: 满足/, `会话已覆盖时门禁应满足：\n${sessDoc.stdout}`);
+  assert.match(sessDoc.stdout, /第三方网关/);
+  assert.ok(!sessDoc.stdout.includes('sk-3p'), 'doctor 不得回显 key 明文');
+});

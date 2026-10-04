@@ -181,6 +181,11 @@ function resolveProviderTarget(providers, providerWant, modelWant) {
 // 解析全局审查目标并写入 cfg（loadConfig 的 provider 解析阶段）。
 // 解析失败不产出凭据（cfg.baseUrl/apiKey 留空）→ 门禁拦下并展示 problem；
 // 环境变量逃生舱（ZCODE_ADVISOR_BASE_URL/API_KEY/MODEL）在调用方随后覆盖，仍可放行。
+//
+// 说明：hook 侧真正发起调用时凭据走 advisor-hook.js 的 resolveTarget（它按会话覆盖
+// 重新解析，且**不读** cfg.baseUrl/cfg.apiKey）。这里写入的 cfg.baseUrl/apiKey 供
+// configWarnings/gate 的历史参数位与 ctl doctor 的全局口径使用——两条路径各自解析
+// 一次是有意的（loadConfig 无会话上下文），不要当成重复计算删掉其一。
 function applyZcodeTarget(cfg, problems, sources, notices, env) {
   cfg.providerLabel = 'ZCode 第三方服务商';
   cfg.providerId = '';

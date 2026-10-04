@@ -177,11 +177,13 @@ function resolveTarget(cfg, state, env) {
   // 会话覆盖标记：面板据此显示「全局默认 / 本会话固定」徽标。
   out.hasOverride = Boolean(sessionProvider || sessionModel);
   out.overrides = [sessionProvider && '服务商', sessionModel && '模型'].filter(Boolean);
-  out.effective = t.ok || Boolean(e.ZCODE_ADVISOR_BASE_URL || e.ZCODE_ADVISOR_MODEL || e.ZCODE_ADVISOR_API_KEY);
   return out;
 }
 
 // 兼容旧签名（reviewTurn 消费方仍读扁平 baseUrl/apiKey/model）。
+// 兼容旧签名（reviewTurn 消费方仍读扁平 baseUrl/apiKey/model）。
+// apiKeyInfo 形参已不再使用——凭据一律由 resolveTarget 从服务商解析得到；
+// 保留位置参数是为了不动现有调用点（改动面越小越安全）。
 function effectiveApi(cfg, apiKeyInfo, state) {
   return resolveTarget(cfg, state, process.env);
 }
@@ -1092,7 +1094,11 @@ async function handleCtl(args) {
   const stateDir = resolveStateDir(cfg);
 
   if (sub === 'doctor') {
-    return ctlDoctor(cfg, args);
+    // doctor 支持 --state：否则它只能按**全局**解析结果判门禁，会话已覆盖服务商/模型时
+    // 会与 /advisor-status 给出不一致的门禁结论（用户会以为其中一个坏了）。
+    const idxD = args.indexOf('--state');
+    const stateForDoctor = idxD !== -1 && args[idxD + 1] ? loadState(path.resolve(args[idxD + 1])) : null;
+    return ctlDoctor(cfg, args, stateForDoctor);
   }
 
   const idxState = args.indexOf('--state');
@@ -1314,25 +1320,29 @@ async function handleCtl(args) {
     return;
   }
 
-  process.stdout.write(`advisor: 未知子命令 ${sub}。可用：status | on | off | model [set <id> [provider:<id>]|provider <id>|reset] | providers [--all] | doctor [--probe [--n 5]] [--ping] [--model <id>]\n`);
+  process.stdout.write(`advisor: 未知子命令 ${sub}。可用：status | on | off | model [set <id> [provider:<id>]|provider <id>|reset] | providers [--all] | doctor [--state <文件>] [--probe [--n 5]] [--ping] [--model <id>]\n`);
 }
 
 // 体检：展示配置解析链、key 来源（脱敏）、门禁与警告；--ping 用 max_tokens=1 的
 // 最小请求实测端点/认证/模型可用性，便于 /advisor-setup 完成后即时验证。
-async function ctlDoctor(cfg, args) {
+// state 可选：传入后按**会话生效值**评估门禁（与 /advisor-status 同口径）；
+// 不传则只看全局解析结果（CI 无会话场景）。
+async function ctlDoctor(cfg, args, state) {
   const apiKeyInfo = resolveApiKey(cfg, process.env);
-  const eff = resolveTarget(cfg, null, process.env);
+  const eff = resolveTarget(cfg, state || null, process.env);
   const lines = [];
   lines.push('advisor 体检');
+  lines.push(`  范围: ${state ? `本会话（${state.sessionId || '未知'}，含会话覆盖）` : '全局（未指定 --state，不反映会话覆盖）'}`);
   lines.push(`  配置来源: ${(cfg.configSources && cfg.configSources.length) ? cfg.configSources.join(' → ') : '(全部内置默认)'}`);
   lines.push(`  用户级配置: ${fs.existsSync(userConfigPath()) ? userConfigPath() : '不存在（可选：/advisor-setup 可写全局模型等，跨升级保留）'}`);
-  lines.push(`  服务商: ${eff.providerName || '（未解析出）'}${eff.providerSource === 'auto' ? '（自动选择）' : ''}`);
-  lines.push(`  模型: ${eff.model || '（未定）'}`);
+  lines.push(`  服务商: ${eff.providerName || '（未解析出）'}${eff.providerSource === 'auto' ? '（自动选择）' : (eff.providerSource === 'session-override' ? '（本会话覆盖）' : '')}`);
+  lines.push(`  模型: ${eff.model || '（未定）'}${eff.modelSource === 'session-override' ? '（本会话覆盖）' : ''}`);
   lines.push(`  端点: ${eff.baseUrl || '（未解析出）'}`);
   lines.push(`  模式: ${cfg.reviewMode} | 预算: maxTokens=${cfg.maxTokens}, 审查超时=${cfg.reviewTimeoutMs}ms`);
   const gateReasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey });
   lines.push(`  门禁: ${gateReasons.length > 0 ? '未满足 → ' + gateReasons.join(',') : '满足'} | key 来源: ${eff.keySource || '(无)'}${eff.apiKey ? `（${maskKey(eff.apiKey)}）` : ''}`);
   for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
+  for (const p of eff.problems || []) lines.push(`  配置问题: ${p}`);
   for (const n of cfg.notices || []) lines.push(`  配置提示: ${n}`);
   for (const w of configWarnings({ baseUrl: eff.baseUrl }, { key: eff.apiKey, source: eff.keySource })) lines.push(`  配置警告: ${w}`);
   process.stdout.write(lines.join('\n') + '\n');
