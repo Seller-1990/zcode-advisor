@@ -270,3 +270,53 @@ test('listZcodeProviders：剔除 apiKey 明文并给出 eligible/official/hasAp
   const pbuiltin = list.find((p) => p.id === 'builtin:bigmodel');
   assert.strictEqual(pbuiltin.official, true, 'builtin: 前缀 = ZCode 官方内置通道');
 });
+
+test('占位符 key：ZCode 服务商里粘了模板占位符 → 视为未配置（防误导性 401）', () => {
+  // 用户在 ZCode 里把 apiKey 留成 your-api-key/test-* 这类模板值时，
+  // 若当真实 key 发出去会得到"key 无效"的 401——其实是压根没填。必须视为未配置。
+  const dir = tmpRoot();
+  const file = path.join(dir, 'v2-placeholder.json');
+  fs.writeFileSync(file, JSON.stringify({
+    provider: {
+      'prov-ph': {
+        name: '占位符网关', kind: 'openai-compatible',
+        options: { baseURL: 'http://10.0.0.1:8080/v1', apiKey: 'your-api-key' },
+        models: { 'm-1': {} }
+      }
+    }
+  }));
+  const list = listZcodeProviders({ ZCODE_ADVISOR_ZCODE_CONFIG: file });
+  const p = list.find((x) => x.id === 'prov-ph');
+  assert.strictEqual(p.hasApiKey, false, '占位符 key 不得算作"已配置"');
+
+  // 全局解析时同样不产出凭据（门禁拦下并给出可操作原因）
+  const cfg = loadConfig(tmpRoot(), hermeticEnv({
+    ZCODE_ADVISOR_ZCODE_CONFIG: file,
+    ZCODE_ADVISOR_ZCODE_PROVIDER: 'prov-ph'
+  }));
+  assert.strictEqual(cfg.apiKey, undefined, '占位符 key 不得进入 cfg.apiKey');
+  assert.ok(cfg.problems.some((x) => x.startsWith('zcode_provider_incomplete')),
+    `应报服务商不完整：${JSON.stringify(cfg.problems)}`);
+});
+
+test('env 逃生舱：端点与 key 必须成对（与 hook 侧 resolveTarget 同一纪律）', () => {
+  const env = hermeticEnv({ ZCODE_ADVISOR_BASE_URL: 'http://evil.example/v1' });
+  const cfg = loadConfig(tmpRoot(), env);
+  assert.strictEqual(cfg.baseUrl, undefined, '只给端点时不得生效（否则服务商 key 会发往该端点）');
+  assert.ok(cfg.problems.some((p) => p.startsWith('env_override_incomplete')));
+
+  const ok = loadConfig(tmpRoot(), hermeticEnv({
+    ZCODE_ADVISOR_BASE_URL: 'http://ok.example/v1',
+    ZCODE_ADVISOR_API_KEY: 'sk-real-key-123456'
+  }));
+  assert.strictEqual(ok.baseUrl, 'http://ok.example/v1');
+  assert.strictEqual(ok.apiKey, 'sk-real-key-123456');
+
+  // 占位符 key 不算成对
+  const ph = loadConfig(tmpRoot(), hermeticEnv({
+    ZCODE_ADVISOR_BASE_URL: 'http://ok.example/v1',
+    ZCODE_ADVISOR_API_KEY: 'your-api-key'
+  }));
+  assert.strictEqual(ph.baseUrl, undefined);
+  assert.ok(ph.problems.some((p) => p.startsWith('env_override_incomplete')));
+});

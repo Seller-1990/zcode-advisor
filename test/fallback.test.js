@@ -118,11 +118,14 @@ test('eligibility：备用与主模型同名 → 不可用（换了个寂寞）'
   assert.strictEqual(r.reason, 'fallback_same_model');
 });
 
-test('eligibility：会话级 sessionFallbackModel 优先于全局', () => {
+test('resolveFallbackModel：只看全局 cfg.fallbackModel（0.2.17 起无会话级覆盖）', () => {
   const H = require('../hooks/advisor-hook');
-  const state = { sessionFallbackModel: 'sess-fb' };
-  assert.strictEqual(H.resolveFallbackModel(mkCfg({ fallbackModel: 'global-fb' }), state), 'sess-fb');
+  // 旧状态文件里可能残留 sessionFallbackModel（旧 /advisor-api 写的），但它无写入方、
+  // 也没有 UI 能改——继续读它会让"备用模型打到别的服务商"隐性生效。故显式忽略。
+  const state = { sessionFallbackModel: 'stale-fb' };
+  assert.strictEqual(H.resolveFallbackModel(mkCfg({ fallbackModel: 'global-fb' }), state), 'global-fb');
   assert.strictEqual(H.resolveFallbackModel(mkCfg({ fallbackModel: 'global-fb' }), {}), 'global-fb');
+  assert.strictEqual(H.resolveFallbackModel(mkCfg({ fallbackModel: '' }), state), '');
 });
 
 test('eligibility：async + 有备用模型 → 可用', () => {

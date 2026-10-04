@@ -170,7 +170,11 @@ function writeJsonAtomic(target, text) {
 function writeUserConfig(guiValues, file, opts) {
   const target = file || USER_CONFIG;
   const values = guiValues || {};
-  if (Object.keys(values).length === 0) return { changed: false, file: target, conflicts: [], overwrites: [] };
+  // ⚠️ 空 GUI 值**不能**在这里直接早退：0.2.16→0.2.17 升级用户的配置可能只剩
+  // `{apiKey:'...'}`（旧版唯一必填项），而桥接在没收到 CFG_* 环境变量时 values 就是空——
+  // 早退会让下面的 legacy 清理永远不跑，明文 key 长期留盘（安全意图落空）。
+  // 改为继续往下走：清理后若确实无变化，后面的「无变化不落盘」会自然短路。
+  const hasValues = Object.keys(values).length > 0;
   // 抢锁前先建目录：wx 建锁需要父目录存在（否则 ENOENT 被误判为永久性失败立即放弃）。
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   // 读-合-比-写全程在跨进程临界区内：面板保存与桥接启动写并发时不再互相覆盖（丢更新）。

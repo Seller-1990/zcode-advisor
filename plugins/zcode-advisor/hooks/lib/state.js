@@ -53,9 +53,6 @@ function freshState(sessionId, transcriptPath, startEnabled) {
     // 降级告警走独立阶梯（不与停摆告警共计数，否则两类故障互相压制对方的提醒间隔）。
     degradeNotifiedAt: '',
     degradeAlertCount: 0,
-    // 会话级备用模型：0.2.17 起无写入方（旧 /advisor-api 的 fallback: 覆盖已删除）。
-    // 保留字段只为兼容旧状态文件——resolveFallbackModel 仍会读它，但新会话恒为空串。
-    sessionFallbackModel: '',
     tokensIn: 0,
     tokensOut: 0,
     // 会话级审查目标覆盖（角标面板 / /advisor-model 写入）。两者独立可空：

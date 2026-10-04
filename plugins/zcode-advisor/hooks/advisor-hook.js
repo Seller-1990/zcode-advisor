@@ -20,7 +20,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const {
-  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey,
+  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey, isPlaceholderKey,
   readZcodeProviders, resolveProviderTarget
 } = require('./lib/config');
 const {
@@ -158,14 +158,17 @@ function resolveTarget(cfg, state, env) {
   // （或反之），这正是 0.2.17 要消灭的密钥交叉面——旧实现有这条纪律，重写时不能丢。
   // 只给了一半时整体不生效，并挂 problem 让用户看见（不静默）。
   const envBase = e.ZCODE_ADVISOR_BASE_URL ? String(e.ZCODE_ADVISOR_BASE_URL) : '';
-  const envKey = e.ZCODE_ADVISOR_API_KEY ? String(e.ZCODE_ADVISOR_API_KEY) : '';
-  if (envBase || envKey) {
+  const envKeyRaw = e.ZCODE_ADVISOR_API_KEY ? String(e.ZCODE_ADVISOR_API_KEY) : '';
+  // 占位符样式的 env key 视为未配置：`test-*`/`your-api-key`/`REPLACE_*` 这类误配若当真实 key
+  // 发出去，会得到误导性的 401（"key 无效"其实是"压根没配"）。与 resolveApiKey 同一判据。
+  const envKey = envKeyRaw && !isPlaceholderKey(envKeyRaw) ? envKeyRaw : '';
+  if (envBase || envKeyRaw) {
     if (envBase && envKey) {
       out.baseUrl = envBase;
       out.apiKey = envKey;
       out.keySource = 'env:ZCODE_ADVISOR_API_KEY';
     } else {
-      out.problems.push(`env_override_incomplete: 环境变量只提供了 ${envBase ? 'ZCODE_ADVISOR_BASE_URL' : 'ZCODE_ADVISOR_API_KEY'}——端点与 key 必须成对提供，为避免密钥交叉本次不生效`);
+      out.problems.push(`env_override_incomplete: 环境变量只提供了 ${envBase ? 'ZCODE_ADVISOR_BASE_URL' : 'ZCODE_ADVISOR_API_KEY'}（或 key 形似占位符）——端点与 key 必须成对且真实，为避免密钥交叉本次不生效`);
     }
   }
   if (e.ZCODE_ADVISOR_MODEL) { out.model = String(e.ZCODE_ADVISOR_MODEL); out.modelSource = 'env'; }
@@ -279,13 +282,12 @@ function reviewBudgetMs(cfg) {
 // 端点故障/限流/超时/与模型无关的错**不触发**——换模型只会加剧或无效。
 const FALLBACK_TRIGGER_REASONS = new Set(['llm_empty_response', 'unparsed', 'llm_http_404']);
 
-// 备用模型的目标解析：全局 cfg.fallbackModel。
-// （0.2.17 起没有会话级备用模型——旧 /advisor-api 的 fallback: 覆盖已随该命令删除；
-//  state.sessionFallbackModel 也不再写入，读取仅作向后兼容。）
-function resolveFallbackModel(cfg, state) {
-  const s = state && typeof state === 'object' ? state : {};
-  const sess = String(s.sessionFallbackModel || '').trim();
-  if (sess) return sess;
+// 备用模型的目标解析：只看全局 cfg.fallbackModel。
+// 0.2.17 起**没有**会话级备用模型——唯一的写入方（旧 /advisor-api 的 fallback: 覆盖）已随该命令删除，
+// 生产代码零写入。因此不再读 state.sessionFallbackModel：留着这条读取路径只会让
+// 旧状态文件里的残留值（可能属于**另一个服务商**）继续生效，造成"备用模型打到别的服务商"
+// 的隐性错误——而用户没有任何入口能改它、也看不到它。
+function resolveFallbackModel(cfg) {
   return String(cfg.fallbackModel || '').trim();
 }
 
@@ -305,10 +307,13 @@ function fallbackEligibility(cfg, state, eff) {
   if (sessProvider) {
     const sessResolved = String((eff && eff.providerId) || '').trim();
     const globalProvider = String((cfg && cfg.providerId) || '').trim();
-    // 两者都解析出来了就比真实 id；会话解析不出（无效服务商）时保守跳过降级。
-    if (!sessResolved || (globalProvider && sessResolved !== globalProvider)) {
-      return { ok: false, reason: 'fallback_skipped:session_provider' };
-    }
+    // 会话解析不出（无效服务商）→ 保守跳过。
+    // 会话解析出了 + 全局也解析出了 → 只有真的不同才跳过。
+    // 会话解析出了但**全局没解析出**（全局未配/解析失败）→ 这也是"换了服务商"
+    //   （全局那条链路根本不产出凭据），过去 `globalProvider && ...` 会短路成 false
+    //   导致放行降级，而备用模型沿用会话凭据会打到别的服务商 → 必须跳过。
+    if (!sessResolved) return { ok: false, reason: 'fallback_skipped:session_provider' };
+    if (sessResolved !== globalProvider) return { ok: false, reason: 'fallback_skipped:session_provider' };
   }
   if (model === eff.model) return { ok: false, reason: 'fallback_same_model' };
   return { ok: true, model };
@@ -1347,7 +1352,7 @@ async function ctlDoctor(cfg, args, state) {
   lines.push(`  模型: ${eff.model || '（未定）'}${eff.modelSource === 'session-override' ? '（本会话覆盖）' : ''}`);
   lines.push(`  端点: ${eff.baseUrl || '（未解析出）'}`);
   lines.push(`  模式: ${cfg.reviewMode} | 预算: maxTokens=${cfg.maxTokens}, 审查超时=${cfg.reviewTimeoutMs}ms`);
-  const gateReasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey });
+  const gateReasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey, source: eff.keySource });
   lines.push(`  门禁: ${gateReasons.length > 0 ? '未满足 → ' + gateReasons.join(',') : '满足'} | key 来源: ${eff.keySource || '(无)'}${eff.apiKey ? `（${maskKey(eff.apiKey)}）` : ''}`);
   for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
   for (const p of eff.problems || []) lines.push(`  配置问题: ${p}`);

@@ -720,8 +720,18 @@ function saveUserConfig(patch) {
     const merged = Object.assign({}, readUserConfig(), allowed);
     // 配置文件可能残留旧版手动 key/端点：写入时一并清掉，避免「手动 key 发往服务商端点」
     // 的密钥交叉面（0.2.17 起端点/key 只来自 ZCode 服务商，插件配置不参与解析）。
+    // ⚠️ 这是**有意的破坏性迁移**：升级用户的 key 会从这里消失。必须留日志痕迹，
+    // 否则用户只看到"我的 key 没了"却不知去哪了（日志同时给出替代位置）。
+    const removedLegacy = [];
     for (const legacy of ['apiKey', 'baseUrl', 'apiSource', 'zcodeModel']) {
-      if (Object.prototype.hasOwnProperty.call(merged, legacy)) delete merged[legacy];
+      if (Object.prototype.hasOwnProperty.call(merged, legacy)) {
+        delete merged[legacy];
+        removedLegacy.push(legacy);
+      }
+    }
+    if (removedLegacy.length > 0) {
+      log(`迁移 0.2.17：已从配置移除旧版手动键 [${removedLegacy.join(', ')}]；`
+        + '端点与 key 现由 ZCode 服务商统一维护（设置 → 模型服务商），不要在插件配置里补回。');
     }
     // 目录 0700、文件 0600（与转录快照/意见历史同级；旧版此文件含明文 key）。
     const tmp = `${USER_CONFIG}.tmp-${process.pid}`;

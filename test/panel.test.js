@@ -324,3 +324,21 @@ test('配置面板 HTTP：clear-key 拒绝非 JSON body（400，不执行删除�
   assert.strictEqual(JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8')).apiKey, 'keep-me',
     '非法 body 不得触发删除');
 });
+
+test('writeUserConfig：空 GUI 值 + 只含旧 apiKey 的配置 → 仍会清理（升级用户不再长期留明文）', () => {
+  // 回归（独立模型评审 high）：早退守卫曾让 `values` 为空时直接 return，
+  // 而桥接在没收到 CFG_* 环境变量时 values 就是空——0.2.16 升级用户的配置里
+  // 只剩 {apiKey}，于是 legacy 清理永不执行、明文 key 长期留盘。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-legacy-empty-'));
+  const file = path.join(dir, 'advisor.config.json');
+  try {
+    fs.writeFileSync(file, JSON.stringify({ apiKey: 'sk-LEGACY-PLAINTEXT' }), 'utf8');
+    const r = writeUserConfig({}, file);
+    assert.strictEqual(r.changed, true, '清理应产生写动作');
+    const saved = fs.readFileSync(file, 'utf8');
+    assert.ok(!saved.includes('sk-LEGACY-PLAINTEXT'), '明文 key 必须被清除');
+    assert.strictEqual(JSON.parse(saved).apiKey, undefined);
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {}
+  }
+});

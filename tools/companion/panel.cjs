@@ -179,6 +179,14 @@ details summary:hover{color:#e6e8ec}
     return fromManual || fromSel;
   }
 
+  // 用户主动改下拉（选模型 / 切服务商）时，手填框里的旧值不再代表意图，清掉。
+  // 只靠 fillModels 里「不在新清单里才清」不够：旧值恰好也在新清单里时会被保留，
+  // 于是它继续压过用户刚选的那一项（静默忽略刚做的选择）。
+  function clearManualIfPicked() {
+    const m = $('modelManual');
+    if (m && m.value) m.value = '';
+  }
+
   async function refreshStatus() {
     try {
       const r = await api('/api/config');
@@ -239,7 +247,9 @@ details summary:hover{color:#e6e8ec}
     } catch (e) { $('hist').innerHTML = '<div class="hitem">读取失败</div>'; }
   }
 
-  $('zprovider').addEventListener('change', () => fillModels());
+  $('zprovider').addEventListener('change', () => { clearManualIfPicked(); fillModels(); });
+  // 用户亲手选模型 = 明确意图，清掉可能压倒它的手填旧值。
+  $('zmodel').addEventListener('change', clearManualIfPicked);
   $('zrefresh').addEventListener('click', () => loadProviders(true));
   $('zfetch').addEventListener('click', fetchZcodeModels);
   $('save').addEventListener('click', save);

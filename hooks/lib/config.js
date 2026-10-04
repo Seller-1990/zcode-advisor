@@ -97,12 +97,16 @@ function readZcodeProviders(env) {
     if (!p || typeof p !== 'object') continue;
     const opts = p.options && typeof p.options === 'object' ? p.options : {};
     const models = p.models && typeof p.models === 'object' ? Object.keys(p.models) : [];
+    // 占位符样式的 key（REPLACE_*/your-api-key/test-* 等）视为未配置：
+    // 用户在 ZCode 里粘了个模板占位符时，若当真实 key 发出去会得到误导性的 401
+    //（"key 无效"其实是"压根没填"）。与 resolveApiKey 同一判据，保持全链路一致。
+    const rawKey = String(opts.apiKey || '').trim();
     out.push({
       id,
       name: String(p.name || ''),
       kind: String(p.kind || ''),
       baseURL: String(opts.baseURL || '').trim(),
-      apiKey: String(opts.apiKey || '').trim(),
+      apiKey: rawKey && !isPlaceholderKey(rawKey) ? rawKey : '',
       models,
       eligible: p.kind === 'openai' || p.kind === 'openai-compatible',
       // 官方内置通道（bigmodel/z.ai 的 builtin:*）——审查通道不使用。
