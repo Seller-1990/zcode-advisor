@@ -2,8 +2,9 @@
 'use strict';
 
 // zcode-advisor 本地配置面板（零依赖，双击「配置面板.cmd」即开）。
-// - 表单：API key / 审查模型 / 端点 / 审查模式 → 写入用户级配置 ~/.zcode/advisor.config.json
-// - Ping：用当前表单值实测端点/认证/模型可用性（max_tokens=1 的最小请求）
+// - 表单（0.2.17）：服务商 / 审查模型 / 审查模式 / 启停 → 写入 ~/.zcode/advisor.config.json
+//   端点与 key 一律来自 ZCode 已维护的第三方服务商，本面板不收集、不显示。
+// - Ping：用当前表单选择实测服务商端点/认证/模型可用性（max_tokens=1 的最小请求）
 // - 只监听 127.0.0.1；hook 每次调用都会重读配置，保存后下一轮审查即生效，无需重启会话。
 
 const http = require('http');
@@ -11,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { writeUserConfig, removeUserConfigKeys, USER_CONFIG } = require('./config-bridge');
-const { loadConfig, resolveApiKey, gate, configWarnings, maskKey, isPlaceholderKey, readZcodeProviders, findZcodeProvider } = require('../hooks/lib/config');
+const { loadConfig, readZcodeProviders, findZcodeProvider, resolveProviderTarget } = require('../hooks/lib/config');
 const { callReviewer } = require('../hooks/lib/reviewer');
 const { readHistory } = require('../hooks/lib/history');
 
@@ -20,7 +21,6 @@ const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const PORT = parseInt(process.argv.find((a) => a.startsWith('--port='))?.split('=')[1], 10)
   || parseInt(process.env.ZCODE_ADVISOR_PANEL_PORT, 10)
   || 8789;
-const MODEL_SUGGESTIONS = ['glm-5.3-flash', 'glm-5.3'];
 
 function readUserConfig() {
   try {
@@ -30,20 +30,15 @@ function readUserConfig() {
   }
 }
 
-// 面板可保存的字符串键。apiSource 单独校验（只认 manual/zcode）。
-const SAVE_STRING_KEYS = ['apiKey', 'model', 'baseUrl', 'reviewMode', 'zcodeProvider', 'zcodeModel'];
+// 面板可保存的键（0.2.17 起：端点/key 不在本插件维护，只保存服务商与模型选择）。
+const SAVE_STRING_KEYS = ['model', 'reviewMode', 'zcodeProvider'];
 
 function saveUserConfig(patch) {
   const allowed = {};
   for (const k of SAVE_STRING_KEYS) {
     const v = String(patch[k] || '').trim();
-    // 占位符判定只针对 apiKey：isPlaceholderKey 会丢弃含中文或 test*/your* 开头的值，
-    // 那对服务商 id / 模型名 / 端点是合法内容（中文 provider 名还能被 findZcodeProvider 按 name 命中）。
-    const placeholder = k === 'apiKey' && isPlaceholderKey(v);
-    if (v && !placeholder) allowed[k] = v;
+    if (v) allowed[k] = v;
   }
-  const src = String(patch.apiSource || '').trim().toLowerCase();
-  if (src === 'manual' || src === 'zcode') allowed.apiSource = src;
   // 顾问总开关（新会话是否自动启用）：接受布尔与字符串形式
   if (patch.startEnabled === true || patch.startEnabled === 'true') allowed.startEnabled = true;
   else if (patch.startEnabled === false || patch.startEnabled === 'false') allowed.startEnabled = false;
@@ -54,7 +49,11 @@ function saveUserConfig(patch) {
     const mt = parseInt(patch.maxTokens, 10);
     if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) allowed.maxTokens = mt;
   }
-  return writeUserConfig(allowed);
+  // 旧版残留（手动端点/key/来源）一并清除：0.2.17 起插件配置不参与端点/key 解析，
+  // 留着只会让用户误以为它们还在生效（且明文 key 留在盘上是纯风险）。
+  const r = writeUserConfig(allowed);
+  if (r && r.ok !== false && !r.lockTimeout && !r.error) removeUserConfigKeys(['apiKey', 'baseUrl', 'apiSource', 'zcodeModel'], USER_CONFIG);
+  return r;
 }
 
 function esc(s) {
@@ -63,26 +62,16 @@ function esc(s) {
 
 function page() {
   const cfg = readUserConfig();
-  const keyMasked = cfg.apiKey ? maskKey(cfg.apiKey) : '（未设置）';
-  const src = cfg.apiSource === 'zcode' ? 'zcode' : 'manual';
-  // 状态栏按来源展示实际生效值：zcode 模式下审查走服务商端点/key，
-  // 显示手动 key 的掩码（常为「未设置」）会误导用户以为没配好。
-  let statusKey = keyMasked;
-  let statusModel = cfg.model || '（默认 glm-5.3-flash）';
-  if (src === 'zcode') {
-    const prov = findZcodeProvider(listZcodeProvidersSafe(), cfg.zcodeProvider);
-    statusKey = prov && prov.apiKey ? '服务商 key' : '（服务商未配置 key）';
-    statusModel = cfg.zcodeModel || (prov && prov.models && prov.models[0]) || '（服务商默认）';
-  }
-  // 服务商下拉在服务端直接渲染（页面打开即可见，无需额外请求）
-  const providers = listZcodeProvidersSafe();
-  const eligible = providers.filter((p) => p.eligible);
-  const providerOpts = eligible.length === 0
-    ? '<option value="">（ZCode 里暂无 OpenAI 兼容服务商）</option>'
-    : eligible.map((p) => `<option value="${esc(p.id)}"${cfg.zcodeProvider === p.id ? ' selected' : ''}>${esc(p.name || p.id)}（${p.models.length} 模型）</option>`).join('');
-  const selProvider = eligible.find((p) => p.id === cfg.zcodeProvider) || eligible[0] || null;
+  // 状态栏（0.2.17）：审查通道只走 ZCode 第三方服务商，端点/key 由 ZCode 统一维护。
+  const providers = listZcodeProvidersSafe().filter((p) => p.eligible && !p.official && p.baseURL && p.apiKey);
+  const selProvider = providers.find((p) => p.id === cfg.zcodeProvider) || providers[0] || null;
+  const statusModel = cfg.model || (selProvider && selProvider.models[0]) || '（服务商默认）';
+  const statusKey = selProvider ? '服务商 key（ZCode 维护）' : '（ZCode 里暂无可用第三方服务商）';
+  const providerOpts = providers.length === 0
+    ? '<option value="">（ZCode 里暂无可用第三方服务商）</option>'
+    : providers.map((p) => `<option value="${esc(p.id)}"${cfg.zcodeProvider === p.id ? ' selected' : ''}>${esc(p.name || p.id)}（${p.models.length} 模型）</option>`).join('');
   const modelOpts = selProvider
-    ? selProvider.models.map((m) => `<option value="${esc(m)}"${cfg.zcodeModel === m ? ' selected' : ''}>${esc(m)}</option>`).join('')
+    ? selProvider.models.map((m) => `<option value="${esc(m)}"${cfg.model === m ? ' selected' : ''}>${esc(m)}</option>`).join('')
     : '';
   return `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
@@ -95,14 +84,10 @@ function page() {
  label{display:block;margin:8px 0 3px;font-weight:600;font-size:13px}
  input,select{width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid #d0d5dd;border-radius:7px;font-size:13px;background:#fff}
  input:focus,select:focus{outline:none;border-color:#2563eb}
- .seg{display:flex;gap:0;border:1px solid #d0d5dd;border-radius:8px;overflow:hidden;width:fit-content;margin-top:2px}
- .seg button{padding:7px 16px;border:0;background:#fff;color:#475467;font-size:13px;cursor:pointer}
- .seg button.on{background:#2563eb;color:#fff}
  small{color:#667085;font-size:12px} code{background:#eef2f6;padding:1px 5px;border-radius:4px;font-size:12px}
  .btnrow{margin-top:12px;display:flex;gap:8px}
  button.act{padding:8px 18px;border:0;border-radius:7px;background:#2563eb;color:#fff;font-size:13px;cursor:pointer}
  button.act.alt{background:#fff;color:#344054;border:1px solid #d0d5dd}
- button.act.danger{background:#fff;color:#b91c1c;border:1px solid #fda29b}
  button.act:disabled{opacity:.55;cursor:default}
  #msg{margin-top:10px;padding:9px 11px;border-radius:7px;display:none;white-space:pre-wrap;font-size:13px}
  .ok{background:#ecfdf3;border:1px solid #abefc6;color:#067647} .bad{background:#fef3f2;border:1px solid #fecdca;color:#b42318}
@@ -113,7 +98,7 @@ function page() {
 <h1>🛡️ zcode-advisor 配置面板</h1>
 <div class="card"><h2>当前状态</h2>
 <div style="font-size:13px">配置文件：<code>${esc(USER_CONFIG)}</code></div>
-<div style="font-size:13px;margin-top:4px">API key：<code id="st-key">${esc(statusKey)}</code> ｜ 模型：<code>${esc(statusModel)}</code> ｜ 模式：<code>${esc(cfg.reviewMode || 'async')}</code> ｜ 来源：<code>${src === 'zcode' ? 'ZCode 已维护' : '手动维护'}</code></div>
+<div style="font-size:13px;margin-top:4px">服务商：<code>${esc(selProvider ? (selProvider.name || selProvider.id) : '（无）')}</code> ｜ 模型：<code>${esc(statusModel)}</code> ｜ 模式：<code>${esc(cfg.reviewMode || 'async')}</code> ｜ key：<code id="st-key">${esc(statusKey)}</code></div>
 <small>保存后**下一轮审查即生效**，无需重启 ZCode；新建会话后斜杠命令（/advisor-status 等）可用。</small>
 </div>
 <div class="card"><h2>审查副模型</h2>
@@ -122,29 +107,11 @@ function page() {
  <option value="true"${cfg.startEnabled !== false ? ' selected' : ''}>启用（新会话自动开启审查）</option>
  <option value="false"${cfg.startEnabled === false ? ' selected' : ''}>停用（新会话不开启）</option>
 </select>
-<label>API 来源</label>
-<div class="seg">
- <button type="button" id="src-zcode"${src === 'zcode' ? ' class="on"' : ''}>ZCode 已维护</button>
- <button type="button" id="src-manual"${src === 'manual' ? ' class="on"' : ''}>手动维护</button>
-</div>
-<small>「ZCode 已维护」= 直接使用 ZCode 设置里配置的第三方 API（服务商 + 模型），改 ZCode 设置无需同步本插件；「手动维护」= 用下面单独填写的端点 / key / 模型。</small>
-<div id="zcodeSec" style="display:${src === 'zcode' ? 'block' : 'none'}">
- <label>服务商</label>
- <select id="zcodeProvider">${providerOpts}</select>
- <label>模型</label>
- <select id="zcodeModel">${modelOpts || '<option value="">（该服务商未配置模型）</option>'}</select>
- <div class="hintline" id="zcodeEndpoint">${selProvider ? esc(`端点：${selProvider.baseURL || '（该服务商未配置 baseURL）'}`) : '先在 ZCode 设置里添加 OpenAI 兼容服务商'}</div>
-</div>
-<div id="manualSec" style="display:${src === 'manual' ? 'block' : 'none'}">
- <label>API key（智谱 BigModel / Z.ai 或第三方）</label>
- <input id="apiKey" placeholder="留空 = 不修改已保存的 key">
- <label>审查模型</label>
- <input id="model" list="models" value="${esc(cfg.model || 'glm-5.3-flash')}">
- <datalist id="models">${MODEL_SUGGESTIONS.map((m) => `<option value="${m}">`).join('')}</datalist>
- <small>建议与主对话模型形成能力差；思考型模型请把 max_tokens 提到 4096</small>
- <label>端点（OpenAI 兼容）</label>
- <input id="baseUrl" value="${esc(cfg.baseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions')}">
-</div>
+<label>服务商（来自 ZCode 已维护的第三方服务商）</label>
+<select id="zcodeProvider">${providerOpts}</select>
+<label>审查模型</label>
+<select id="zcodeModel">${modelOpts || '<option value="">（该服务商未配置模型）</option>'}</select>
+<div class="hintline" id="zcodeEndpoint">${selProvider ? esc(`端点：${selProvider.baseURL || '（该服务商未配置 baseURL）'}`) : '先在 ZCode 设置里添加 OpenAI 兼容服务商（官方内置通道不用于审查）'}</div>
 <label>审查模式</label>
 <select id="reviewMode">
  <option value="async"${(cfg.reviewMode || 'async') === 'async' ? ' selected' : ''}>async（默认：零体感延迟，意见随下一条消息送达）</option>
@@ -154,10 +121,9 @@ function page() {
 <input id="maxTokens" type="number" min="64" max="16384" value="${cfg.maxTokens || 4096}">
 <div class="btnrow">
  <button class="act" onclick="save()">保存配置</button>
- <button class="act alt" onclick="ping()">Ping 测试（验证 key 与模型）</button>
- <button class="act danger" id="clearBtn" onclick="clearKey()">清除 API key</button>
+ <button class="act alt" onclick="ping()">Ping 测试（验证服务商与模型）</button>
 </div>
-<small class="hintline">清除只移除本机配置文件里的 key（环境变量 key 不受影响）；要作废已泄露的 key 请到智谱/Z.ai 控制台吊销。</small>
+<small class="hintline">端点与 key 由 ZCode 服务商统一维护（本插件不单独保存，也不显示明文）；会话级临时换服务商/模型用 ZCode 角标面板或 /advisor-model。</small>
 <div id="msg"></div>
 </div>
 <div class="card"><h2>📜 顾问意见记录（最近 50 条）</h2>
@@ -175,7 +141,7 @@ function page() {
       const ts=String(it.ts||'').replace('T',' ').slice(5,16);
       const sev=it.severity||it.event||'-';
       // 历史行来自本机 JSONL（无枚举校验），ts/sev 必须转义后才能拼 innerHTML
-      //（note 一直走 textContent）。本页能改写 baseUrl/apiKey，不可给注入留口。
+      //（note 一直走 textContent）。本页能改写配置，不可给注入留口。
       return '<div><b>'+esc(ts)+'</b> ['+esc(sev)+'] <span></span></div>';
     }).join('');
     const spans=document.querySelectorAll('#hist span');
@@ -191,18 +157,8 @@ function page() {
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let apiSource='${src}';
 function msg(t,ok){const m=$('msg');m.textContent=t;m.style.display='block';m.className=ok?'ok':'bad';}
 async function post(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return r.json();}
-function setSource(s){
- apiSource=s;
- $('src-zcode').className=s==='zcode'?'on':'';
- $('src-manual').className=s==='manual'?'on':'';
- $('zcodeSec').style.display=s==='zcode'?'block':'none';
- $('manualSec').style.display=s==='manual'?'block':'none';
-}
-$('src-zcode').onclick=()=>setSource('zcode');
-$('src-manual').onclick=()=>setSource('manual');
 $('zcodeProvider').addEventListener('change',async()=>{
  // 服务商切换：从服务端取该服务商的模型清单与端点提示（apiKey 不出进程）
  const r=await post('/api/zcode-models',{providerId:$('zcodeProvider').value});
@@ -212,13 +168,9 @@ $('zcodeProvider').addEventListener('change',async()=>{
  $('zcodeEndpoint').textContent=(r&&r.ok)?('端点：'+(r.baseURL||'（该服务商未配置 baseURL）')):'服务商读取失败';
 });
 function formBody(){
- const body={apiSource,startEnabled:$('startEnabled').value==='true'};
- if(apiSource==='zcode'){
-  if($('zcodeProvider').value)body.zcodeProvider=$('zcodeProvider').value;
-  if($('zcodeModel').value)body.zcodeModel=$('zcodeModel').value;
- }else{
-  for(const k of['apiKey','model','baseUrl']){const v=$(k).value.trim();if(v)body[k]=v;}
- }
+ const body={startEnabled:$('startEnabled').value==='true'};
+ if($('zcodeProvider').value)body.zcodeProvider=$('zcodeProvider').value;
+ if($('zcodeModel').value)body.model=$('zcodeModel').value;
  const rm=$('reviewMode').value.trim();if(rm)body.reviewMode=rm;
  const mt=parseInt($('maxTokens').value,10);if(Number.isFinite(mt))body.maxTokens=mt;
  return body;
@@ -230,19 +182,7 @@ async function save(){
 async function ping(){
  msg('Ping 中…',true);
  const r=await post('/api/ping',formBody());
- msg(r.ok?('Ping OK（'+r.ms+'ms）— 端点可达、认证与模型有效'+(r.note||'')):('Ping 失败 → '+r.error+(r.hint?('：'+r.hint):'')),r.ok);
-}
-async function clearKey(){
- if(!confirm('确定清除已保存的 API key？\\n清除后顾问将无 key 可用（状态显示 missing:apiKey，静默跳过审查）。\\n如 key 已泄露，清除本地副本不等于作废——请到智谱/Z.ai 控制台吊销。'))return;
- const btn=$('clearBtn');btn.disabled=true;
- try{
-  const r=await post('/api/clear-key',{});
-  const cleared=r.ok&&r.removed&&r.removed.length;
-  // 只有真删了才把状态行置为未设置：env key（ZCODE_ADVISOR_API_KEY 等）不在配置文件里，
-  // 清除不影响它——无差别写「未设置」会让用户以为 env key 也没了，而审查/Ping 其实照常。
-  msg(r.ok?(cleared?('已清除 API key（'+r.removed.join('、')+'）；若环境变量仍配了 key，审查与 Ping 仍会成功'):'配置里没有已保存的 API key（环境变量 key 不受影响）'):(r.lockTimeout?'清除失败：配置文件正被其他进程写入，请稍后重试':('清除失败：'+r.error)),r.ok);
-  if(cleared)$('st-key').textContent='（未设置）';
- }catch(e){msg('清除失败：'+e,false);}finally{btn.disabled=false;}
+ msg(r.ok?('Ping OK（'+r.ms+'ms）— 服务商端点可达、认证与模型有效'+(r.note||'')):('Ping 失败 → '+r.error+(r.hint?('：'+r.hint):'')),r.ok);
 }
 </script></body></html>`;
 }
@@ -261,34 +201,27 @@ function hint(err) {
 }
 
 async function ping(body) {
+  // 与审查侧同一解析规则：端点/key 只来自 ZCode 第三方服务商（非官方、OpenAI 兼容、齐备），
+  // 表单里改了服务商/模型还没保存时优先用表单值，未给则回退已存配置。
   const envLike = Object.assign({}, process.env);
-  let cfg = loadConfig(PLUGIN_ROOT, envLike);
-  let model = body.model || cfg.model;
-  let baseUrl = body.baseUrl || cfg.baseUrl;
-  let apiKey = body.apiKey || cfg.apiKey;
-  // zcode 模式：表单里可能改了服务商/模型还没保存——优先用表单选择现解析，
-  // 未给则回退已存配置（loadConfig 已按 apiSource 解析过一轮）。
-  if ((body.apiSource || cfg.apiSource) === 'zcode') {
-    const prov = findZcodeProvider(readZcodeProviders(envLike), body.zcodeProvider || cfg.zcodeProvider);
-    if (!prov) {
-      return { ok: false, error: 'provider_missing', hint: 'ZCode 配置里找不到所选的 OpenAI 兼容服务商' };
-    }
-    if (!prov.eligible) {
-      return { ok: false, error: 'provider_ineligible', hint: '该服务商协议非 OpenAI 兼容，审查通道不可用' };
-    }
-    // 与审查侧 applyZcodeSource 同一成对规则：缺端点或缺 key 都整段不用——
-    // 只取其一会把手动 key 发往服务商端点，或把服务商 key 发往手动端点。
-    if (!prov.baseURL || !prov.apiKey) {
-      const missing = [!prov.baseURL && 'baseURL', !prov.apiKey && 'apiKey'].filter(Boolean).join('/');
-      return { ok: false, error: 'provider_incomplete', hint: `provider 缺少 ${missing}，为避免密钥与端点交叉使用，Ping 已中止` };
-    }
-    baseUrl = prov.baseURL;
-    apiKey = prov.apiKey;
-    model = body.zcodeModel || cfg.zcodeModel || prov.models[0] || cfg.model;
+  const cfg = loadConfig(PLUGIN_ROOT, envLike);
+  const wantProvider = String(body.zcodeProvider || cfg.zcodeProvider || '').trim();
+  const wantModel = String(body.model || cfg.model || '').trim();
+  const t = resolveProviderTarget(readZcodeProviders(envLike), wantProvider, wantModel);
+  if (!t.ok) {
+    const hints = {
+      zcode_provider_missing: 'ZCode 里没有可用的第三方服务商（需 OpenAI 兼容且已填端点与 key）',
+      zcode_provider_not_found: 'ZCode 配置里找不到所选服务商，请刷新页面后重新选择',
+      zcode_provider_official: 'ZCode 官方内置通道不用于审查，请选择第三方服务商',
+      zcode_provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+      zcode_provider_incomplete: '服务商的端点/key 缺一，Ping 已中止',
+      zcode_no_model: '该服务商未登记模型，请在 ZCode 设置里添加'
+    };
+    return { ok: false, error: t.problem.split(':')[0], hint: hints[t.problem.split(':')[0]] || t.problem };
   }
   const t0 = Date.now();
   const res = await callReviewer({
-    baseUrl, model, apiKey,
+    baseUrl: t.baseUrl, model: t.model, apiKey: t.apiKey,
     systemPrompt: 'You are a health check.',
     userContent: 'ping',
     maxTokens: 1,
@@ -296,7 +229,7 @@ async function ping(body) {
     timeoutMs: 20000
   });
   if (!res.error || res.error === 'llm_empty_response') {
-    return { ok: true, ms: Date.now() - t0, note: res.error === 'llm_empty_response' ? '；响应体为空是 max_tokens=1 下的正常现象' : '' };
+    return { ok: true, ms: Date.now() - t0, provider: t.provider.name || t.provider.id, model: t.model, note: res.error === 'llm_empty_response' ? '；响应体为空是 max_tokens=1 下的正常现象' : '' };
   }
   return { ok: false, error: res.error, detail: res.detail, hint: hint(res.error) };
 }
@@ -350,16 +283,13 @@ const server = http.createServer((req, res) => {
     });
     return;
   }
-  // 清除已保存的 apiKey：与保存同源防护、同一把锁。错误一律 JSON（前端按 ok 分红绿条），
-  // 非 JSON 错误体会让 clearKey 的 r.error 变成 undefined，用户只看到"清除失败：undefined"。
+  // 清除历史遗留的手动 apiKey（0.2.17 起本插件不再维护 key；保留此端点用于清理旧配置残留）。
   if (req.method === 'POST' && req.url === '/api/clear-key') {
     if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
       try {
-        // 解析与落盘分开包 try：文件系统错误（权限/磁盘/rename）不能伪装成
-        // 「请求体不是合法 JSON」的 400——那是两个不同性质的失败。
         let parsed;
         try {
           parsed = JSON.parse(body || '{}');

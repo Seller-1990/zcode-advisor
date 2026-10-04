@@ -16,13 +16,33 @@ const HOOK = path.join(PLUGIN_ROOT, 'hooks', 'advisor-hook.js');
 const FIXTURE = path.join(__dirname, 'fixtures', 'transcript-basic.jsonl');
 
 function makeEnv(stateDir, extra) {
+  // 0.2.17 起审查目标（端点/key/模型）一律由 ZCode 第三方服务商解析。
+  // 测试必须自带一份 fixture 服务商：既隔离本机真实 ~/.zcode/v2/config.json
+  // （否则断言随开发者环境漂移、明文 key 进测试输出），也保证走的是生产解析路径。
+  const zcodeCfg = path.join(stateDir, 'zcode-v2.json');
+  try {
+    if (!fs.existsSync(zcodeCfg)) {
+      fs.mkdirSync(stateDir, { recursive: true });
+      fs.writeFileSync(zcodeCfg, JSON.stringify({
+        provider: {
+          'prov-e2e': {
+            name: 'E2E 网关',
+            kind: 'openai-compatible',
+            options: { baseURL: 'http://127.0.0.1:1/v1', apiKey: 'e2e-key-abc123-not-placeholder' },
+            models: { 'e2e-model': {}, 'kimi-k3': {} }
+          }
+        }
+      }));
+    }
+  } catch (_) {}
   return Object.assign({}, process.env, {
     ZCODE_ADVISOR_STATE_DIR: stateDir,
     ZCODE_ADVISOR_MOCK: '1',
     ZCODE_ADVISOR_API_KEY: 'e2e-key-abc123-not-placeholder',
     ZCODE_ADVISOR_NO_SPAWN: '1',
     // 隔离用户级配置，避免读本机真实 ~/.zcode/advisor.config.json
-    ZCODE_ADVISOR_USER_CONFIG: path.join(stateDir, 'no-such-user-config.json')
+    ZCODE_ADVISOR_USER_CONFIG: path.join(stateDir, 'no-such-user-config.json'),
+    ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg
   }, extra || {});
 }
 
@@ -96,12 +116,49 @@ test('首条用户消息送达注册行（含脚本与状态文件路径）；�
 
 test('门禁失败：注册行与门禁提示仍然投递（命令通道不失联）', (t) => {
   const { transcript, stateDir } = setup(t);
-  const env = makeEnv(stateDir, { ZCODE_ADVISOR_API_KEY: '' });
+  // 0.2.17：让门禁失败的正确方式是「没有可用的 ZCode 第三方服务商」
+  // （凭据一律来自服务商解析，清空 env key 已不足以制造 missing）。
+  const env = makeEnv(stateDir, {
+    ZCODE_ADVISOR_ZCODE_CONFIG: path.join(stateDir, 'no-such-zcode-config.json')
+  });
   const r = runHook(['user-prompt-submit'], { session_id: 'sg', transcript_path: transcript, prompt: 'x' }, env);
   assert.strictEqual(r.status, 0);
   const out = JSON.parse(r.stdout);
-  assert.ok(out.hookSpecificOutput.additionalContext.includes('missing:apiKey'));
+  assert.ok(out.hookSpecificOutput.additionalContext.includes('门禁未满足'),
+    `门禁失败提示必须投递，实际：${out.hookSpecificOutput.additionalContext}`);
+  assert.ok(out.hookSpecificOutput.additionalContext.includes('zcode_provider_missing'),
+    '应给出可操作原因（ZCode 里没有可用第三方服务商）');
   assert.ok(out.hookSpecificOutput.additionalContext.includes('状态文件'));
+});
+
+test('注册行门禁按会话生效值评估：全局无可用服务商 + 本会话已覆盖 → 不误报门禁未满足', (t) => {
+  const { transcript, stateDir } = setup(t);
+  // 全局：只有官方内置通道（审查不使用）→ 全局解析必然失败
+  const zcodeCfg = path.join(stateDir, 'zcode-official-only.json');
+  fs.writeFileSync(zcodeCfg, JSON.stringify({
+    provider: {
+      'builtin:bigmodel': {
+        name: 'BigModel 官方', kind: 'openai',
+        options: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'sk-official' },
+        models: { 'glm-5.3': {} }
+      },
+      'prov-3p': {
+        name: '第三方网关', kind: 'openai-compatible',
+        options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-3p' },
+        models: { 'm-a': {} }
+      }
+    }
+  }));
+  const env = makeEnv(stateDir, { ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg });
+  const stateFile = path.join(stateDir, 'sess-ov.json');
+  runHook(['session-start'], { session_id: 'ov', transcript_path: transcript }, env);
+  // 本会话固定到可用的第三方服务商
+  runHook(['ctl', 'model', 'set', 'm-a', 'provider:prov-3p', '--state', stateFile], null, env);
+  // 注册行此时应按会话生效值判定：门禁满足，不得出现「门禁未满足」
+  const r = runHook(['user-prompt-submit'], { session_id: 'ov', transcript_path: transcript, prompt: 'x' }, env);
+  const ctx = JSON.parse(r.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(!ctx.includes('门禁未满足'), `会话已覆盖时注册行不得误报门禁失败：\n${ctx}`);
+  assert.ok(ctx.includes('第三方网关'), '注册行应显示会话生效的服务商');
 });
 
 test('sync 模式：blocker 立即经 Stop block 送达并进入冷却', (t) => {
@@ -325,14 +382,29 @@ test('ctl：多会话并存时拒绝无 --state 的操作（防误伤）', (t) =
 
 test('ctl doctor：体检输出配置链/门禁（无网络）', (t) => {
   const { stateDir } = setup(t);
-  const env = makeEnv(stateDir);
+  // 0.2.17：审查目标由 ZCode 第三方服务商解析——造一份最小可用服务商配置
+  const zcodeCfg = path.join(stateDir, 'zcode-v2.json');
+  fs.writeFileSync(zcodeCfg, JSON.stringify({
+    provider: {
+      'prov-3p': {
+        name: '第三方网关', kind: 'openai-compatible',
+        options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-doctor-key' },
+        models: { 'glm-5.3-flash': {} }
+      }
+    }
+  }));
+  const env = makeEnv(stateDir, { ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg });
+  // 清掉 env 逃生舱 key，验证「key 完全来自服务商解析」这条主路径
+  delete env.ZCODE_ADVISOR_API_KEY;
   const r = runHook(['ctl', 'doctor'], null, env);
   assert.strictEqual(r.status, 0);
   assert.ok(r.stdout.includes('advisor 体检'));
   assert.ok(r.stdout.includes('门禁: 满足'));
-  // env 提供的 key 会被 loadConfig 收进 cfg.apiKey，来源显示为 config
-  assert.ok(r.stdout.includes('key 来源: config'));
+  // key 来自服务商解析，来源显示为 config
+  assert.ok(r.stdout.includes('key 来源: config'), `应显示 config 来源：\n${r.stdout}`);
   assert.ok(r.stdout.includes('用户级配置'));
+  assert.ok(r.stdout.includes('第三方网关'), '体检应显示解析出的服务商');
+  assert.ok(!r.stdout.includes('sk-doctor-key'), '体检不得回显 key 明文');
 });
 
 test('parse_empty：转录有完整行但零解析产率时留信号', (t) => {

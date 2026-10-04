@@ -53,18 +53,16 @@ function freshState(sessionId, transcriptPath, startEnabled) {
     // 降级告警走独立阶梯（不与停摆告警共计数，否则两类故障互相压制对方的提醒间隔）。
     degradeNotifiedAt: '',
     degradeAlertCount: 0,
-    // 会话级备用模型（/advisor-api 可覆盖全局 fallbackModel）。
+    // 会话级备用模型（/advisor-model 可覆盖全局 fallbackModel）。
     sessionFallbackModel: '',
     tokensIn: 0,
     tokensOut: 0,
+    // 会话级审查目标覆盖（角标面板 / /advisor-model 写入）。两者独立可空：
+    // - sessionProvider：本会话用哪个 ZCode 第三方服务商（''= 跟随全局）
+    // - sessionModel：本会话用哪个模型（''= 跟随全局/服务商清单首项）
+    // 0.2.17 起端点/key 一律由服务商解析得到，状态文件不再落任何 key 明文。
+    sessionProvider: '',
     sessionModel: '',
-    // 会话级 API 覆盖（/advisor-api set 写入）。三键独立可空：只存显式设置过的项，
-    // 空项回落全局配置。apiKey 含明文——saveState 落盘收紧到 0600（见下）。
-    sessionApi: {
-      baseUrl: '',
-      apiKey: '',
-      model: ''
-    },
     lastAction: '',
     lastActivity: '',
     createdAt: new Date().toISOString()
@@ -74,7 +72,7 @@ function freshState(sessionId, transcriptPath, startEnabled) {
 // 找不到就创建（幂等）。所有调用方都必须拿到一个可用 state，保证流程可继续。
 function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  // 目录已存在时 mkdirSync 的 mode 不生效：state 目录含会话明文 key 的文件，
+  // 目录已存在时 mkdirSync 的 mode 不生效：state 目录含会话转录路径与审查计数，
   // 历史遗留的宽权限目录在此收紧（失败不阻断——只读文件系统下尽力而为）。
   try { fs.chmodSync(stateDir, 0o700); } catch (_) {}
   const file = stateFilePath(stateDir, sessionId);
@@ -114,6 +112,14 @@ function loadState(file) {
 
 // 区分四种读取结果：ok / missing（不存在）/ corrupt（JSON 或 schema 损坏）/ error（IO 错误）。
 // 调用方据此决定重建、留尸或放弃——"任何读错误都当不存在"曾导致 enabled 复活、计数清零。
+// 0.2.17 迁移：旧版把会话级端点/API key 明文写在 state.sessionApi 里（0600 落盘）。
+// 该覆盖面已废弃，但旧文件不会被自动重写——只要有一次读-改-写，明文 key 就会继续留在盘上。
+// 因此在**读取时**就剥掉该字段（下一次 saveState 落盘即为干净内容），避免升级用户长期留明文。
+function stripLegacySecrets(state) {
+  if (state && typeof state === 'object' && state.sessionApi !== undefined) delete state.sessionApi;
+  return state;
+}
+
 function loadStateDetailed(file) {
   let raw;
   try {
@@ -124,7 +130,7 @@ function loadStateDetailed(file) {
   }
   try {
     const state = JSON.parse(raw);
-    if (state && state.schema === 1) return { status: 'ok', state };
+    if (state && state.schema === 1) return { status: 'ok', state: stripLegacySecrets(state) };
     return { status: 'corrupt', state: null };
   } catch (_) {
     return { status: 'corrupt', state: null };
@@ -138,7 +144,7 @@ function saveState(file, state) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${attempt}`;
     try {
-      // state 可能含会话级 API key（sessionApi.apiKey）：0600 落盘，不依赖 umask。
+      // state 含会话转录路径与审查计数：0600 落盘，不依赖 umask（历史版本曾含明文 key）。
       fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
       fs.renameSync(tmp, file);
       // rename 后文件 inode 来自 tmp（恒 0600）；此 chmod 是针对异常文件系统的

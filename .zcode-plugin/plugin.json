@@ -1,6 +1,6 @@
 {
   "name": "zcode-advisor",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "description": "dsh-advisor 的 zcode 移植：独立审查副模型在每轮结束后被动审查对话增量，以 nit/concern/blocker 三级建议注回会话（advisory-only，绝不阻塞主流程）。",
   "author": {
     "name": "local"
@@ -14,35 +14,23 @@
         "${CLAUDE_PLUGIN_ROOT}/tools/config-bridge.js"
       ],
       "env": {
-        "ZCODE_ADVISOR_CFG_API_KEY": "${user_config.api_key}",
         "ZCODE_ADVISOR_CFG_MODEL": "${user_config.model}",
-        "ZCODE_ADVISOR_CFG_BASE_URL": "${user_config.base_url}",
+        "ZCODE_ADVISOR_CFG_ZCODE_PROVIDER": "${user_config.zcode_provider}",
         "ZCODE_ADVISOR_CFG_REVIEW_MODE": "${user_config.review_mode}",
-        "ZCODE_ADVISOR_CFG_API_SOURCE": "${user_config.api_source}",
         "ZCODE_ADVISOR_CFG_MAX_TOKENS": "${user_config.max_tokens}"
       }
     }
   },
   "userConfig": {
-    "api_source": {
-      "type": "string",
-      "default": "manual",
-      "description": "审查 API 来源：manual（在本表单/配置面板手动维护端点与 key）或 zcode（复用 ZCode 设置里已维护的服务商）。留空/非法值按 manual 处理；仅在该键缺失时落盘，已有值不被覆盖（改 API 来源请用配置面板或角标的「完整配置」）"
-    },
-    "api_key": {
+    "zcode_provider": {
       "type": "string",
       "default": "",
-      "description": "审查模型 API key（智谱 BigModel/Z.ai 或你的服务商）。桥接进程以「只兜底填补缺失项」语义写入 ~/.zcode/advisor.config.json：仅在该键缺失/为空时落盘，已有非空配置不被表单覆盖（修改已有配置请用本地配置面板），下一轮审查即生效，无需重启"
+      "description": "全局审查服务商（ZCode 已维护的第三方 OpenAI 兼容服务商，填其 id 或名称）。留空 = 自动选择（优先含所填模型的可用服务商）。端点与 key 由 ZCode 统一维护，本插件不单独保存；ZCode 官方内置通道（BigModel/Z.ai）不用于审查。改选择也可用角标面板的「完整配置」"
     },
     "model": {
       "type": "string",
       "default": "",
-      "description": "全局审查模型 id（引擎默认 glm-5.3-flash）。在此填写并保存 = 设为全局模型：非空即生效并覆盖本地配置文件里的 model，下一轮审查即生效、无需重启；留空 = 本表单不干预模型（以配置面板/默认值为准）。会话级临时换模型：会话内运行 /advisor-model set <模型id>（仅当前会话生效，优先于全局）。建议与主对话模型形成能力差，思考型模型建议把 max_tokens 提到 4096"
-    },
-    "base_url": {
-      "type": "string",
-      "default": "",
-      "description": "OpenAI 兼容端点（引擎默认智谱官方端点）。留空 = 不经本表单写入配置；第三方端点推荐用本地配置面板维护，或在面板里把 API 来源切到「ZCode 已维护」"
+      "description": "全局审查模型 id（如 glm-5.3-flash）。非空即生效并覆盖本地配置里的模型，下一轮审查生效、无需重启；留空 = 取所选服务商的登记清单首项。建议与主对话模型形成能力差，思考型模型建议把 max_tokens 提到 4096。会话级临时换模型/服务商：角标面板「本会话的审查模型」，或 /advisor-model set <模型id> [provider:<服务商>]"
     },
     "review_mode": {
       "type": "string",

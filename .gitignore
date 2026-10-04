@@ -3,3 +3,7 @@ state/
 advisor.config.json
 dist/
 .DS_Store
+# 同步脚本隔离的「源已删除、副本残留」文件（等价回收站，不入库）
+plugins/zcode-advisor/.orphan-*/
+# 改动前的本机备份（D1：动核心文件前先备份，不入库）
+backups/

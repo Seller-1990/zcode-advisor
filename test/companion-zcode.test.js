@@ -32,32 +32,20 @@ fs.writeFileSync(V2_CFG, JSON.stringify({
 
 const controller = require('../tools/companion/controller.cjs');
 
-test('readZcodeProviders：解析 provider 字段并标记协议合格性', () => {
+test('readZcodeProviders：解析 provider 字段、标记协议合格性与官方内置', () => {
   const list = controller.readZcodeProviders();
   assert.strictEqual(list.length, 2);
   const p1 = list.find((p) => p.id === 'p1');
   assert.strictEqual(p1.eligible, true);
+  assert.strictEqual(p1.official, false);
   assert.strictEqual(p1.baseURL, 'http://10.0.0.8:8088/v1');
   assert.deepStrictEqual(p1.models, ['m-a', 'm-b']);
   assert.strictEqual(list.find((p) => p.id === 'p2').eligible, false);
 });
 
-test('effectiveTarget：manual 沿用 body > 已存配置覆盖链', () => {
-  fs.writeFileSync(USER_CFG, JSON.stringify({ baseUrl: 'http://manual.example/v1', apiKey: 'k-manual', model: 'm-manual' }));
-  const fromCfg = controller.effectiveTarget({});
-  assert.deepStrictEqual(
-    [fromCfg.apiSource, fromCfg.baseUrl, fromCfg.apiKey, fromCfg.model],
-    ['manual', 'http://manual.example/v1', 'k-manual', 'm-manual']
-  );
-  const fromBody = controller.effectiveTarget({ baseUrl: 'http://form.example/v1', model: 'm-form' });
-  assert.strictEqual(fromBody.baseUrl, 'http://form.example/v1');
-  assert.strictEqual(fromBody.model, 'm-form');
-});
-
-test('effectiveTarget：zcode 从 provider 现读端点/key/模型（key 只在本进程内使用）', () => {
-  fs.writeFileSync(USER_CFG, JSON.stringify({ apiSource: 'zcode', zcodeProvider: '内网网关', zcodeModel: 'm-b' }));
+test('effectiveTarget：显式服务商 → 现读端点/key/模型（key 只在本进程内使用）', () => {
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: '内网网关', model: 'm-b' }));
   const zc = controller.effectiveTarget({});
-  assert.strictEqual(zc.apiSource, 'zcode');
   assert.strictEqual(zc.providerFound, true);
   assert.strictEqual(zc.providerName, '内网网关'); // 容忍写名称
   assert.strictEqual(zc.baseUrl, 'http://10.0.0.8:8088/v1');
@@ -65,23 +53,65 @@ test('effectiveTarget：zcode 从 provider 现读端点/key/模型（key 只在�
   assert.strictEqual(zc.model, 'm-b');
 
   // 模型留空 → 取 provider 列表首项
-  fs.writeFileSync(USER_CFG, JSON.stringify({ apiSource: 'zcode', zcodeProvider: 'p1' }));
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'p1' }));
   assert.strictEqual(controller.effectiveTarget({}).model, 'm-a');
 
   // 找不到 provider：providerFound=false，ping 侧据此给可操作错误
-  fs.writeFileSync(USER_CFG, JSON.stringify({ apiSource: 'zcode', zcodeProvider: 'nope' }));
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'nope' }));
   const miss = controller.effectiveTarget({});
   assert.strictEqual(miss.providerFound, false);
   assert.strictEqual(miss.baseUrl, '');
+  assert.strictEqual(miss.providerError, 'provider_not_found');
 });
 
-test('saveUserConfig：apiSource 只认 manual/zcode，zcode 键照常落盘', () => {
+test('effectiveTarget：不兼容/官方内置服务商不产出凭据（防密钥交叉）', () => {
+  // 协议不兼容
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'p2', model: 'claude' }));
+  const ineligible = controller.effectiveTarget({});
+  assert.strictEqual(ineligible.providerUsable, false);
+  assert.strictEqual(ineligible.baseUrl, '');
+  assert.strictEqual(ineligible.providerError, 'provider_ineligible');
+
+  // 官方内置（builtin: 前缀）
+  const v2 = JSON.parse(fs.readFileSync(V2_CFG, 'utf8'));
+  v2.provider['builtin:bigmodel'] = {
+    name: 'BigModel 官方', kind: 'openai',
+    options: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'sk-official' },
+    models: { 'glm-5.3': {} }
+  };
+  fs.writeFileSync(V2_CFG, JSON.stringify(v2));
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'builtin:bigmodel' }));
+  const official = controller.effectiveTarget({});
+  assert.strictEqual(official.providerUsable, false);
+  assert.strictEqual(official.baseUrl, '');
+  assert.strictEqual(official.apiKey, '');
+  assert.strictEqual(official.providerError, 'provider_official');
+
+  // 复原 fixture，避免影响后续用例
+  delete v2.provider['builtin:bigmodel'];
+  fs.writeFileSync(V2_CFG, JSON.stringify(v2));
+});
+
+test('effectiveTarget：未指定服务商 → 自动选择可用第三方并标记 providerAuto', () => {
   fs.writeFileSync(USER_CFG, JSON.stringify({}));
-  const merged = controller.saveUserConfig({ apiSource: 'zcode', zcodeProvider: 'p1', zcodeModel: 'm-a', startEnabled: false });
-  assert.strictEqual(merged.apiSource, 'zcode');
+  const auto = controller.effectiveTarget({});
+  assert.strictEqual(auto.providerId, 'p1', 'p2 不兼容 → 只剩 p1');
+  assert.strictEqual(auto.providerAuto, true);
+  assert.strictEqual(auto.baseUrl, 'http://10.0.0.8:8088/v1');
+});
+
+test('saveUserConfig：只接受白名单键，旧版 apiSource/zcodeModel 被丢弃并清理残留', () => {
+  fs.writeFileSync(USER_CFG, JSON.stringify({ apiKey: 'sk-legacy', baseUrl: 'http://legacy/v1', apiSource: 'manual', zcodeModel: 'old-m' }));
+  const merged = controller.saveUserConfig({ zcodeProvider: 'p1', model: 'm-a', startEnabled: false });
   assert.strictEqual(merged.zcodeProvider, 'p1');
-  assert.strictEqual(merged.zcodeModel, 'm-a');
+  assert.strictEqual(merged.model, 'm-a');
   assert.strictEqual(merged.startEnabled, false);
-  const bad = controller.saveUserConfig({ apiSource: 'BOTH' });
-  assert.strictEqual(bad.apiSource, 'zcode', '非法 apiSource 应被丢弃，不影响既有值');
+  // 旧版手动残留写入时一并清除（0.2.17 起插件配置不参与端点/key 解析）
+  for (const k of ['apiKey', 'baseUrl', 'apiSource', 'zcodeModel']) {
+    assert.strictEqual(merged[k], undefined, `旧键 ${k} 应被清除`);
+  }
+  const bad = controller.saveUserConfig({ apiSource: 'BOTH', zcodeModel: 'm-x' });
+  assert.strictEqual(bad.apiSource, undefined, '非法/旧 apiSource 不应落盘');
+  assert.strictEqual(bad.zcodeModel, undefined);
+  assert.strictEqual(bad.zcodeProvider, 'p1', '兄弟键不受影响');
 });

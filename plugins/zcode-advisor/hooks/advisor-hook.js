@@ -20,7 +20,8 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const {
-  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey, isPlaceholderKey
+  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey, isPlaceholderKey,
+  readZcodeProviders, resolveProviderTarget
 } = require('./lib/config');
 const {
   ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, bumpPrimaryFailStreak, loadState, mutateStateExclusive,
@@ -118,44 +119,81 @@ function hashId(s) {
   return h.toString(16);
 }
 
-function effectiveModel(cfg, state) {
-  if (state && state.sessionModel) return { model: state.sessionModel, source: 'session-override' };
-  return { model: cfg.model, source: 'global-default' };
-}
+// 会话级审查目标解析（0.2.17 分层：全局 = ZCode 服务商 + 全局模型；会话 = 可各自覆盖）。
+//
+// 优先级：
+//   服务商：state.sessionProvider > cfg.zcodeProvider > 自动选择（含目标模型的服务商 → 第一个可用）
+//   模型：  state.sessionModel   > cfg.model        > 所选服务商登记清单首项
+//
+// 端点/key 永远从**最终选中的服务商**现读（不落盘、不跨服务商复用）——
+// 这从结构上消灭了旧版「手动 key 发往服务商端点」的密钥交叉面。
+// env 逃生舱（ZCODE_ADVISOR_BASE_URL/API_KEY/MODEL）在此之上最后覆盖：CI/测试用。
+function resolveTarget(cfg, state, env) {
+  const e = env || process.env;
+  const s = state && typeof state === 'object' ? state : {};
+  const sessionProvider = String(s.sessionProvider || '').trim();
+  const sessionModel = String(s.sessionModel || '').trim();
+  const providerWant = sessionProvider || String(cfg.zcodeProvider || '').trim();
+  const modelWant = sessionModel || String(cfg.model || '').trim();
 
-// 会话级 API 覆盖解析：state.sessionApi 三键（baseUrl/apiKey/model）独立可空，
-// 空键回落全局配置（含 apiSource=zcode 已解析出的值）。返回值同时兼容两种消费方：
-// reviewTurn 读扁平的 baseUrl/apiKey/model；gate()/configWarnings() 读 resolveApiKey
-// 约定的 {key, source} 形状（会话覆盖时 source=session-override，状态行用它区分）。
-function effectiveApi(cfg, apiKeyInfo, state) {
-  const ov = state && state.sessionApi && typeof state.sessionApi === 'object' ? state.sessionApi : {};
-  const baseUrl = String(ov.baseUrl || '').trim();
-  const apiKey = String(ov.apiKey || '').trim();
-  const effModel = effectiveModel(cfg, state);
-  // 会话 key 与全局 resolveApiKey 同一占位符纪律：test-*/your-api-key 一类值
-  // 视为未配置，回落全局 key，不放行去打真实请求。
-  const sessionKey = apiKey && !isPlaceholderKey(apiKey) ? apiKey : '';
-  const resolvedKey = sessionKey || (apiKeyInfo ? apiKeyInfo.key : '');
-  return {
-    baseUrl: baseUrl || cfg.baseUrl,
-    apiKey: resolvedKey,
-    key: resolvedKey,
-    source: sessionKey ? 'session-override' : ((apiKeyInfo && apiKeyInfo.source) || ''),
-    model: effModel.model,
-    modelSource: effModel.source,
-    // hasOverride/overrides 按**实际生效**的键算：apiKey 被占位符过滤后不算覆盖，
-    // 否则 status 显示「已覆盖 apiKey」而实际回落全局，排查时自相矛盾。
-    hasOverride: Boolean(baseUrl || sessionKey),
-    overrides: [baseUrl && 'baseUrl', sessionKey && 'apiKey'].filter(Boolean)
+  // 1) 服务商解析（端点/key/模型一次定稿）
+  const t = resolveProviderTarget(readZcodeProviders(e), providerWant, modelWant);
+  const out = {
+    baseUrl: t.ok ? t.baseUrl : '',
+    apiKey: t.ok ? t.apiKey : '',
+    model: t.ok ? t.model : '',
+    keySource: t.ok ? 'config' : '',
+    providerId: t.ok ? t.provider.id : '',
+    providerName: t.ok ? (t.provider.name || t.provider.id) : '',
+    providerSource: sessionProvider ? 'session-override' : (t.ok && t.auto ? 'auto' : 'global'),
+    modelSource: sessionModel ? 'session-override' : 'global',
+    problems: t.ok ? [] : [t.problem]
   };
+
+  // 2) env 逃生舱最后覆盖（显式、且只影响本次进程）。
+  // **端点与 key 必须成对覆盖**：只覆盖其一会把服务商 A 的 key 发往 env 指定的端点
+  // （或反之），这正是 0.2.17 要消灭的密钥交叉面——旧实现有这条纪律，重写时不能丢。
+  // 只给了一半时整体不生效，并挂 problem 让用户看见（不静默）。
+  const envBase = e.ZCODE_ADVISOR_BASE_URL ? String(e.ZCODE_ADVISOR_BASE_URL) : '';
+  const envKey = e.ZCODE_ADVISOR_API_KEY ? String(e.ZCODE_ADVISOR_API_KEY) : '';
+  if (envBase || envKey) {
+    if (envBase && envKey) {
+      out.baseUrl = envBase;
+      out.apiKey = envKey;
+      out.keySource = 'env:ZCODE_ADVISOR_API_KEY';
+    } else {
+      out.problems.push(`env_override_incomplete: 环境变量只提供了 ${envBase ? 'ZCODE_ADVISOR_BASE_URL' : 'ZCODE_ADVISOR_API_KEY'}——端点与 key 必须成对提供，为避免密钥交叉本次不生效`);
+    }
+  }
+  if (e.ZCODE_ADVISOR_MODEL) { out.model = String(e.ZCODE_ADVISOR_MODEL); out.modelSource = 'env'; }
+
+  // 3) key 兜底链（apiKeyEnv）：仅当服务商/env 都没给出 key 时启用——
+  //    常见于 CI 用 ZAI_API_KEY 配官方端点跑真实请求的场景。
+  if (!out.apiKey) {
+    const k = resolveApiKey({ apiKey: '', apiKeyEnv: cfg.apiKeyEnv }, e);
+    if (k.key) { out.apiKey = k.key; out.keySource = k.source; }
+  }
+
+  // 会话覆盖标记：面板据此显示「全局默认 / 本会话固定」徽标。
+  out.hasOverride = Boolean(sessionProvider || sessionModel);
+  out.overrides = [sessionProvider && '服务商', sessionModel && '模型'].filter(Boolean);
+  out.effective = t.ok || Boolean(e.ZCODE_ADVISOR_BASE_URL || e.ZCODE_ADVISOR_MODEL || e.ZCODE_ADVISOR_API_KEY);
+  return out;
 }
 
-// 门禁按会话生效值评估的统一入口：gate(cfg, ...) 检查第一参的 baseUrl/model 字段，
-// 传全局 cfg 会在「全局配空 + 会话已 set 端点/模型」时误报 missing。所有 gate
-// 调用点（stop/sync/worker/status/on）必须走这里，防止逐点手搓漏改。
+// 兼容旧签名（reviewTurn 消费方仍读扁平 baseUrl/apiKey/model）。
+function effectiveApi(cfg, apiKeyInfo, state) {
+  return resolveTarget(cfg, state, process.env);
+}
+
+// 门禁按会话生效值评估的统一入口：gate() 检查第一参的 baseUrl/model 字段，
+// 传全局 cfg 会在「全局服务商解析失败 + 会话已覆盖」时误报 missing。
+// 所有 gate 调用点（stop/sync/worker/status/on）必须走这里，防止逐点手搓漏改。
 function gateWithSession(cfg, apiKeyInfo, state) {
-  const eff = effectiveApi(cfg, apiKeyInfo, state);
-  return { eff, reasons: gate({ baseUrl: eff.baseUrl, model: eff.model }, eff) };
+  const eff = resolveTarget(cfg, state, process.env);
+  // gate() 的 key 参数读的是 .key（历史字段名），resolveTarget 产出的是 .apiKey——
+  // 直接传 eff 会让门禁恒报 missing:apiKey（所有会话静默不审查）。
+  return { eff, reasons: gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey, source: eff.keySource }) };
 }
 
 function isStopHookActive(input) {
@@ -166,19 +204,24 @@ function isStopHookActive(input) {
 
 // 控制面提示行（不受审查门禁、也不受会话启停约束——它是命令定位与可观测性的载体，
 // 停用/缺 key 的会话必须仍能用 /advisor-on、/advisor-status 自救）。
-function controlLines(cfg, apiKeyInfo, stateDir, file) {
-  const eff = effectiveModel(cfg, null);
+// 控制面提示行（不受审查门禁、也不受会话启停约束——它是命令定位与可观测性的载体，
+// 停用/缺 key 的会话必须仍能用 /advisor-on、/advisor-status 自救）。
+// state 必须传入：门禁按**会话生效值**评估（全局服务商解析失败但本会话已覆盖时不能误报）。
+function controlLines(cfg, stateDir, file, state) {
+  const eff = resolveTarget(cfg, state || null, process.env);
   const lines = [];
-  lines.push(`[advisor] 审查副模型已挂载：模型=${eff.model}，模式=${cfg.reviewMode}。控制命令：/advisor-status、/advisor-setup、/advisor-on、/advisor-off、/advisor-model、/advisor-api（会话级端点/key 覆盖）。脚本：${SCRIPT_PATH}；状态文件：${file}。`);
+  const where = eff.providerName ? `${eff.providerName} / ${eff.model || '（未定模型）'}` : '（未解析出服务商）';
+  lines.push(`[advisor] 审查副模型已挂载：${where}，模式=${cfg.reviewMode}。控制命令：/advisor-status、/advisor-setup、/advisor-on、/advisor-off、/advisor-model（全局/本会话模型与来源）。脚本：${SCRIPT_PATH}；状态文件：${file}。`);
   if (process.env.ZCODE_ADVISOR_MOCK === '1' && !mockAllowed(stateDir)) {
     lines.push('[advisor] 配置警告：检测到 ZCODE_ADVISOR_MOCK=1，但 state 目录缺少 .mock-allowed 文件——mock 未生效，将发起真实 API 调用。');
   }
   for (const p of cfg.problems || []) lines.push(`[advisor] 配置问题：${p}`);
-  const gateReasons = gate(cfg, apiKeyInfo);
+  for (const n of cfg.notices || []) lines.push(`[advisor] 配置提示：${n}`);
+  const gateReasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey, source: eff.keySource });
   if (gateReasons.length > 0) {
-    lines.push(`[advisor] 门禁未满足（${gateReasons.join(',')}）：审查暂不运行。运行 /advisor-setup 可交互式填写 API key 并验证，或手动编辑用户级配置 ~/.zcode/advisor.config.json。`);
+    lines.push(`[advisor] 门禁未满足（${gateReasons.join(',')}）：审查暂不运行。请先在 ZCode 设置里维护一个 OpenAI 兼容的第三方服务商（含端点与 key），再用 /advisor-status 或角标面板选择它。`);
   }
-  for (const w of configWarnings(cfg, apiKeyInfo)) lines.push(`[advisor] 配置警告：${w}`);
+  for (const w of configWarnings({ baseUrl: eff.baseUrl }, { key: eff.apiKey, source: eff.keySource })) lines.push(`[advisor] 配置警告：${w}`);
   return lines;
 }
 
@@ -242,17 +285,21 @@ function resolveFallbackModel(cfg, state) {
   return String(cfg.fallbackModel || '').trim();
 }
 
-// 降级是否可用：需配了备用模型、仅 async 模式、且会话没覆盖端点。
+// 降级是否可用：需配了备用模型、仅 async 模式、且本会话把审查目标换到了**别的服务商**时不可用。
 // - 仅 async：reviewBudgetMs 在 sync 下 = T，"预留子预算"会把 primary 砍到 0.5T，
 //   且 sync 单轮受 Stop 硬超时 320s 约束，切预算会复活「强杀→指针不推进→每轮重审」停滞。
-// - 会话覆盖了 baseUrl：备用模型可能不属于该端点，换 model id 可能无效；且凭据边界
-//   （禁止跨端点带 key）要求跳过。
+// - 会话换了服务商：备用模型未必属于该服务商（换 model id 可能无效），跳过。
+//   注意只覆盖**模型**（服务商仍是全局那个）时凭据边界没变（同 provider = 同端点/key），
+//   降级照常可用——按 hasOverride 一刀切会把这种常见场景的降级能力白丢掉。
 function fallbackEligibility(cfg, state, eff) {
   const model = resolveFallbackModel(cfg, state);
   if (!model) return { ok: false, reason: 'no_fallback_model' };
   if (cfg.reviewMode === 'sync') return { ok: false, reason: 'fallback_skipped:sync_mode' };
-  const ovBase = state && state.sessionApi && String(state.sessionApi.baseUrl || '').trim();
-  if (ovBase) return { ok: false, reason: 'fallback_skipped:session_endpoint' };
+  const sessProvider = String((state && state.sessionProvider) || '').trim();
+  const globalProvider = String((cfg && cfg.providerId) || '').trim();
+  if (sessProvider && sessProvider !== globalProvider) {
+    return { ok: false, reason: 'fallback_skipped:session_provider' };
+  }
   if (model === eff.model) return { ok: false, reason: 'fallback_same_model' };
   return { ok: true, model };
 }
@@ -462,7 +509,7 @@ function onUserPromptSubmit(ctx) {
       deliveredNotes = s.pendingNotes.slice(0, deliveredNoteCount).map((n) => String(n));
     }
     if (s.pendingRegistration) {
-      parts.push(controlLines(cfg, apiKeyInfo, stateDir, file).join('\n'));
+      parts.push(controlLines(cfg, stateDir, file, s).join('\n'));
     }
     // 心跳健康告警（4a）：独立于 pendingNotes/pendingRegistration 组装——
     // 仅有告警时 deliver 也不能为空，否则监督器死了用户仍然无感知。
@@ -1084,14 +1131,14 @@ async function handleCtl(args) {
       lines.push(`  门禁: 未满足 → ${gateReasons.join(',')}（审查不会运行）`);
     }
     lines.push(`  模式: ${cfg.reviewMode}`);
-    lines.push(`  模型: ${eff.model}（${eff.modelSource === 'session-override' ? '本会话覆盖' : '全局默认'}）`);
-    lines.push(`  API 来源: ${cfg.apiSourceLabel || (cfg.apiSource === 'zcode' ? 'ZCode 已维护' : '手动维护')}`);
-    // 会话级覆盖详情：哪些键被本会话覆盖、生效 key 的掩码（state 里的 key 不回显明文）
+    lines.push(`  服务商: ${eff.providerName || '（未解析出——请检查 ZCode 设置里的第三方服务商）'}${eff.providerSource === 'session-override' ? '（本会话覆盖）' : (eff.providerSource === 'auto' ? '（自动选择）' : '（全局）')}`);
+    lines.push(`  模型: ${eff.model || '（未定）'}（${eff.modelSource === 'session-override' ? '本会话覆盖' : '全局默认'}）`);
+    // 会话级覆盖详情：哪些键被本会话覆盖（端点/key 来自服务商解析，不存在覆盖语义）
     if (eff.hasOverride) {
-      lines.push(`  会话覆盖: ${eff.overrides.join(' + ')}（/advisor-api reset 恢复全局）`);
+      lines.push(`  会话覆盖: ${eff.overrides.join(' + ')}（/advisor-model reset 恢复全局）`);
     }
-    lines.push(`  端点: ${eff.baseUrl}`);
-    lines.push(`  生效 key: ${eff.apiKey ? maskKey(eff.apiKey) : '（无）'}`);
+    lines.push(`  端点: ${eff.baseUrl || '（未解析出）'}`);
+    lines.push(`  生效 key: ${eff.apiKey ? maskKey(eff.apiKey) : '（无）'}（来源 ${eff.keySource || '无'}）`);
     lines.push(`  审查次数: ${state.reviews || 0} | steer 记录: ${state.steers || 0}（sync=实际送达；async=入队数） | 冷却剩余: ${state.immuneTurns || 0} 轮`);
     lines.push(`  顺延队列: ${(state.pendingNotes || []).length} 条 | 历史顺延: ${state.deferred || 0}`);
     lines.push(`  Token 累计: 输入 ${state.tokensIn || 0} / 输出 ${state.tokensOut || 0}`);
@@ -1139,9 +1186,14 @@ async function handleCtl(args) {
     for (const h of hints) lines.push(`  提示: ${h}`);
 
     for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
+    // 会话生效值解析出的问题（如 env 逃生舱只给了一半 → env_override_incomplete）：
+    // 与 cfg.problems 分开显示，否则这类「会话侧才成立」的问题在 status 里完全不可见。
+    for (const p of eff.problems || []) lines.push(`  配置问题: ${p}`);
     // 告警按会话生效端点评估：会话把端点覆盖成 http:// 或把官方 key 指到第三方时
     // 必须能告警出来；全局告警也不应误报到已被覆盖的配置上。
-    for (const w of configWarnings({ baseUrl: eff.baseUrl }, eff)) lines.push(`  配置警告: ${w}`);
+    // 注意第二参必须是 { key, source } 显式对象——configWarnings 读的是 apiKeyInfo.source，
+    // 而 eff 的字段名是 keySource：直接传 eff 会让 sharedEnv 恒 false，告警静默失效。
+    for (const w of configWarnings({ baseUrl: eff.baseUrl }, { key: eff.apiKey, source: eff.keySource })) lines.push(`  配置警告: ${w}`);
     if (state.lastAction) lines.push(`  最近动作: ${state.lastAction}`);
     lines.push(`  最后活动: ${state.lastActivity || '(无)'}`);
     process.stdout.write(lines.join('\n') + '\n');
@@ -1150,7 +1202,7 @@ async function handleCtl(args) {
 
   if (sub === 'on') {
     // 门禁在临界区内按重读后的状态重算：锁外用旧快照算好再写回，并发
-    // /advisor-api set 改了 sessionApi 时会用过期结果覆盖 disabledReason。
+    // /advisor-model set 改了会话覆盖时会用过期结果覆盖 disabledReason。
     let reasons = [];
     let enabledModel = '';
     mutateStateExclusive(file, (s) => {
@@ -1161,7 +1213,7 @@ async function handleCtl(args) {
       s.disabledReason = reasons.length > 0 ? reasons.join(',') : '';
     });
     if (reasons.length > 0) {
-      process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 advisor.config.json、环境变量，或用 /advisor-api set 为本会话单独配置。\n`);
+      process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 ZCode 里的第三方服务商配置，或用 /advisor-model set 为本会话单独指定。\n`);
     } else {
       process.stdout.write(`advisor: 本会话已启用（模式 ${cfg.reviewMode}，模型 ${enabledModel}）。\n`);
     }
@@ -1176,127 +1228,119 @@ async function handleCtl(args) {
     return;
   }
 
+  // 会话级审查目标：本会话固定服务商/模型（或恢复全局默认）。
+  // 用法：model | model set <model-id> [provider:<id|名称>] | model reset
+  //       model provider <id|名称>（只换服务商） | model reset-provider
+  // 端点/key 永远来自服务商解析——本命令不接受也不存储任何端点/key。
   if (sub === 'model') {
     const action = args[1] || '';
+    const rest = args.slice(2).filter(Boolean);
+    const parseNamed = (toks) => {
+      let model = '';
+      let provider = '';
+      for (const tok of toks) {
+        if (/^provider:/i.test(tok)) provider = tok.slice(9).trim();
+        else if (!model) model = String(tok).trim();
+      }
+      return { model, provider };
+    };
     if (action === 'set') {
-      const model = args[2];
-      if (!model) {
-        process.stdout.write('advisor: 用法 model set <model-id>\n');
+      const { model, provider } = parseNamed(rest);
+      if (!model && !provider) {
+        process.stdout.write('advisor: 用法 model set <model-id> [provider:<服务商id或名称>]；或 model provider <id|名称> 只换服务商\n');
         return;
       }
       mutateStateExclusive(file, (s) => {
-        s.sessionModel = model;
+        if (model) s.sessionModel = model;
+        if (provider) s.sessionProvider = provider;
       });
-      process.stdout.write(`advisor: 本会话审查模型已固定为 ${model}（下一轮审查起生效；若模型无效，将在 Dropped:llm_http_4xx 中体现）。全局默认仍是 ${cfg.model}。\n`);
+      const parts = [];
+      if (provider) parts.push(`服务商=${provider}`);
+      if (model) parts.push(`模型=${model}`);
+      process.stdout.write(`advisor: 本会话审查目标已固定：${parts.join('，')}（下一轮审查起生效；模型/服务商无效会在 Dropped:llm_http_4xx 与状态行中体现）。恢复全局用 model reset。\n`);
+      return;
+    }
+    if (action === 'provider') {
+      const provider = rest[0];
+      if (!provider) {
+        process.stdout.write('advisor: 用法 model provider <服务商id或名称>\n');
+        return;
+      }
+      mutateStateExclusive(file, (s) => {
+        s.sessionProvider = provider;
+        s.sessionModel = ''; // 换服务商后旧模型多半不属于它：一并清掉，回落新服务商清单
+      });
+      process.stdout.write(`advisor: 本会话服务商已固定为 ${provider}（模型已回落该服务商默认；用 model set <模型> 再指定）。恢复全局用 model reset。\n`);
       return;
     }
     if (action === 'reset') {
       mutateStateExclusive(file, (s) => {
         s.sessionModel = '';
+        s.sessionProvider = '';
       });
-      process.stdout.write(`advisor: 已清除本会话覆盖，回到全局默认 ${cfg.model}。\n`);
+      const eff = resolveTarget(cfg, null, process.env);
+      process.stdout.write(`advisor: 已清除本会话覆盖，回到全局默认（${eff.providerName || '（未解析出服务商）'} / ${eff.model || '（未定模型）'}）。\n`);
       return;
     }
     const state = loadState(file);
-    const eff = effectiveModel(cfg, state);
-    process.stdout.write(`advisor: 当前审查模型 ${eff.model}（${eff.source === 'session-override' ? '本会话覆盖' : '全局默认'}）。修改：model set <model-id> | model reset\n`);
+    const eff = resolveTarget(cfg, state, process.env);
+    const src = eff.hasOverride ? `本会话覆盖（${eff.overrides.join(' + ')}）` : '全局默认';
+    process.stdout.write(`advisor: 当前审查目标 ${eff.providerName || '（未解析出服务商）'} / ${eff.model || '（未定模型）'}（${src}）。修改：model set <model-id> [provider:<id|名称>] | model provider <id|名称> | model reset\n`);
     return;
   }
 
-  // 会话级 API 覆盖：set <baseUrl> <apiKey> [model:<id>]（键顺序可换，model: 前缀标识模型；
-  // 两值缺省写 - 表示保留该项）| show | reset。key 只落 state 文件（0600），状态行只回显掩码。
-  if (sub === 'api') {
-    const action = args[1] || 'show';
-    if (action === 'set') {
-      const rest = args.slice(2).filter(Boolean);
-      if (rest.length === 0) {
-        process.stdout.write('advisor: 用法 api set <baseUrl|-> <apiKey|-> [model:<model-id>] [fallback:<model-id>]；- 表示保留该项现状\n');
-        return;
-      }
-      let baseUrl = '';
-      let apiKey = '';
-      let model = '';
-      let fallback = '';
-      for (const tok of rest) {
-        if (/^model:/i.test(tok)) model = tok.slice(6).trim();
-        else if (/^fallback:/i.test(tok)) fallback = tok.slice(9).trim();
-        else if (!baseUrl) baseUrl = tok.trim();
-        else if (!apiKey) apiKey = tok.trim();
-      }
-      if (baseUrl === '-' || baseUrl === 'keep') baseUrl = '';
-      if (apiKey === '-' || apiKey === 'keep') apiKey = '';
-      if (!baseUrl && !apiKey && !model && !fallback) {
-        process.stdout.write('advisor: 未提供任何要设置的值（- 表示保留现状）。\n');
-        return;
-      }
-      // 归一化端点路径（与 reviewer.js 的 normalizeChatEndpoint 同规则）：填 /v1 基地址也能直接用
-      const trimmed = baseUrl.replace(/\/+$/, '');
-      const normalized = trimmed && !/\/chat\/completions$/i.test(trimmed) && !/\/messages$/i.test(trimmed)
-        ? `${trimmed}/chat/completions`
-        : trimmed;
-      mutateStateExclusive(file, (s) => {
-        if (!s.sessionApi || typeof s.sessionApi !== 'object') s.sessionApi = { baseUrl: '', apiKey: '', model: '' };
-        if (normalized) s.sessionApi.baseUrl = normalized;
-        if (apiKey) s.sessionApi.apiKey = apiKey;
-        if (model) s.sessionModel = model; // 模型覆盖复用既有 sessionModel 通道
-        // 会话级备用模型（M4）：独立字段，不放进 sessionApi（后者是"端点/key 覆盖"语义，
-        // 且 fallbackEligibility 用它判断"是否覆盖了端点"）。
-        if (fallback) s.sessionFallbackModel = fallback;
-      });
-      const parts = [];
-      if (normalized) parts.push(`端点=${normalized}`);
-      if (apiKey) parts.push(`key=${maskKey(apiKey)}`);
-      if (model) parts.push(`模型=${model}`);
-      if (fallback) parts.push(`备用模型=${fallback}`);
-      // 占位符照单全收会让"回显成功"与"实际不生效"分叉：effectiveApi 会把
-      // test-*/your-api-key 一类值过滤回落全局 key，这里必须当场点破。
-      const placeholderHint = apiKey && isPlaceholderKey(apiKey)
-        ? `。注意：该 key 形似占位符，审查时会回落全局 key（与 resolveApiKey 同一纪律）`
-        : '';
-      process.stdout.write(`advisor: 本会话已覆盖 ${parts.join('，')}（下一轮审查起生效；/advisor-api reset 恢复全局）${placeholderHint}。\n`);
-      return;
+  // 查看/管理可用服务商（端点/key 不在本插件维护，这里只读 ZCode 配置）。
+  // 用法：providers [--all] —— 默认只列可用的第三方服务商；--all 含被排除项与原因。
+  if (sub === 'providers') {
+    const all = args.includes('--all');
+    const list = readZcodeProviders(process.env);
+    const lines = ['advisor 服务商（来自 ZCode 配置）'];
+    if (list.length === 0) {
+      lines.push('  （ZCode 里暂无服务商——请在 ZCode 设置中添加 OpenAI 兼容服务商）');
     }
-    if (action === 'reset') {
-      mutateStateExclusive(file, (s) => {
-        s.sessionApi = { baseUrl: '', apiKey: '', model: '' };
-      });
-      process.stdout.write('advisor: 已清除本会话的端点/key 覆盖，恢复跟随全局配置（模型覆盖用 /advisor-model reset 单独清除）。\n');
-      return;
+    for (const p of list) {
+      const reasons = [];
+      if (p.official) reasons.push('ZCode 官方内置通道，审查通道不使用');
+      if (!p.eligible) reasons.push(`协议 ${p.kind || '未知'} 非 OpenAI 兼容`);
+      if (!p.baseURL) reasons.push('缺端点');
+      if (!p.apiKey) reasons.push('缺 key');
+      const usable = reasons.length === 0;
+      if (!usable && !all) continue;
+      lines.push(`  ${usable ? '✓' : '✗'} ${p.name || p.id}（${p.models.length} 模型）${usable ? '' : ' —— ' + reasons.join('；')}`);
+      if (p.models.length > 0) lines.push(`      模型: ${p.models.join(', ')}`);
     }
-    const state = loadState(file);
-    const eff = effectiveApi(cfg, resolveApiKey(cfg, process.env), state);
-    if (!eff.hasOverride) {
-      process.stdout.write(`advisor: 本会话未覆盖端点/key，跟随全局配置（端点 ${cfg.baseUrl}，key ${eff.apiKey ? maskKey(eff.apiKey) : '（无）'}）。修改：api set <baseUrl|-> <apiKey|-> [model:<id>] | reset\n`);
-      return;
-    }
-    process.stdout.write(`advisor: 本会话覆盖：${eff.overrides.join(' + ')}。生效端点 ${eff.baseUrl}，key ${eff.apiKey ? maskKey(eff.apiKey) : '（无）'}。修改：api set … | reset\n`);
+    if (!all) lines.push('  （只列可用项；看全部用 providers --all）');
+    process.stdout.write(lines.join('\n') + '\n');
     return;
   }
 
-  process.stdout.write(`advisor: 未知子命令 ${sub}。可用：status | on | off | model [set <id>|reset] | api [set <baseUrl|-> <apiKey|-> [model:<id>]|show|reset] | doctor [--probe [--n 5]] [--ping] [--model <id>]\n`);
+  process.stdout.write(`advisor: 未知子命令 ${sub}。可用：status | on | off | model [set <id> [provider:<id>]|provider <id>|reset] | providers [--all] | doctor [--probe [--n 5]] [--ping] [--model <id>]\n`);
 }
 
 // 体检：展示配置解析链、key 来源（脱敏）、门禁与警告；--ping 用 max_tokens=1 的
 // 最小请求实测端点/认证/模型可用性，便于 /advisor-setup 完成后即时验证。
 async function ctlDoctor(cfg, args) {
   const apiKeyInfo = resolveApiKey(cfg, process.env);
+  const eff = resolveTarget(cfg, null, process.env);
   const lines = [];
   lines.push('advisor 体检');
   lines.push(`  配置来源: ${(cfg.configSources && cfg.configSources.length) ? cfg.configSources.join(' → ') : '(全部内置默认)'}`);
-  lines.push(`  用户级配置: ${fs.existsSync(userConfigPath()) ? userConfigPath() : '不存在（/advisor-setup 可创建，跨升级保留）'}`);
-  lines.push(`  API 来源: ${cfg.apiSourceLabel || (cfg.apiSource === 'zcode' ? 'ZCode 已维护' : '手动维护')}`);
-  lines.push(`  端点: ${cfg.baseUrl}`);
+  lines.push(`  用户级配置: ${fs.existsSync(userConfigPath()) ? userConfigPath() : '不存在（可选：/advisor-setup 可写全局模型等，跨升级保留）'}`);
+  lines.push(`  服务商: ${eff.providerName || '（未解析出）'}${eff.providerSource === 'auto' ? '（自动选择）' : ''}`);
+  lines.push(`  模型: ${eff.model || '（未定）'}`);
+  lines.push(`  端点: ${eff.baseUrl || '（未解析出）'}`);
   lines.push(`  模式: ${cfg.reviewMode} | 预算: maxTokens=${cfg.maxTokens}, 审查超时=${cfg.reviewTimeoutMs}ms`);
-  const gateReasons = gate(cfg, apiKeyInfo);
-  lines.push(`  门禁: ${gateReasons.length > 0 ? '未满足 → ' + gateReasons.join(',') : '满足'} | key 来源: ${apiKeyInfo.source || '(无)'}${apiKeyInfo.key ? `（${maskKey(apiKeyInfo.key)}）` : ''}`);
+  const gateReasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey });
+  lines.push(`  门禁: ${gateReasons.length > 0 ? '未满足 → ' + gateReasons.join(',') : '满足'} | key 来源: ${eff.keySource || '(无)'}${eff.apiKey ? `（${maskKey(eff.apiKey)}）` : ''}`);
   for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
-  for (const w of configWarnings(cfg, apiKeyInfo)) lines.push(`  配置警告: ${w}`);
+  for (const n of cfg.notices || []) lines.push(`  配置提示: ${n}`);
+  for (const w of configWarnings({ baseUrl: eff.baseUrl }, { key: eff.apiKey, source: eff.keySource })) lines.push(`  配置警告: ${w}`);
   process.stdout.write(lines.join('\n') + '\n');
 
   if (!args.includes('--ping') && !args.includes('--probe')) return;
 
   const idxModel = args.indexOf('--model');
-  const model = idxModel !== -1 && args[idxModel + 1] ? args[idxModel + 1] : cfg.model;
+  const model = idxModel !== -1 && args[idxModel + 1] ? args[idxModel + 1] : eff.model;
   if (gateReasons.length > 0) {
     process.stdout.write(`  Ping: 跳过（门禁未满足：${gateReasons.join(',')}）\n`);
     return;
@@ -1316,10 +1360,10 @@ async function ctlDoctor(cfg, args) {
     const timeoutMs = idxTo !== -1 && args[idxTo + 1]
       ? Math.min(cfg.reviewTimeoutMs, Math.max(1000, parseInt(args[idxTo + 1], 10) || cfg.reviewTimeoutMs))
       : cfg.reviewTimeoutMs;
-    if (model !== cfg.model) process.stdout.write(`  探针: 目标模型 ${model}（非配置模型）\n`);
+    if (model !== eff.model) process.stdout.write(`  探针: 目标模型 ${model}（非配置模型）\n`);
     process.stdout.write(`  探针: 正在用生产参数测试 ${model} ×${n} …\n`);
     const stat = await probeModel(
-      { baseUrl: cfg.baseUrl, model, apiKey: apiKeyInfo.key },
+      { baseUrl: eff.baseUrl, model, apiKey: eff.apiKey },
       {
         n,
         timeoutMs,
@@ -1337,9 +1381,9 @@ async function ctlDoctor(cfg, args) {
   process.stdout.write(`  Ping: 正在测试 ${model} …\n`);
   const t0 = Date.now();
   const res = await callReviewer({
-    baseUrl: cfg.baseUrl,
+    baseUrl: eff.baseUrl,
     model,
-    apiKey: apiKeyInfo.key,
+    apiKey: eff.apiKey,
     systemPrompt: 'You are a health check.',
     userContent: 'ping',
     maxTokens: 1,

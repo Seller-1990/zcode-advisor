@@ -7,11 +7,13 @@
 // 纪律：
 // - **只填补缺失键（例外：model）**：宿主会把 userConfig 声明的 default 展开进环境变量
 //   （用户没填也有值），因此这里绝不能覆盖用户级配置里已有的非空值——否则每次会话启动
-//   都会把用户在配置面板/advisor-setup 里调好的端点、模型静默改回表单默认（真机实测踩过：401）。
+//   都会把用户在配置面板里调好的设置静默改回表单默认（真机实测踩过：401）。
 //   表单是"兜底填充"，不是"权威覆盖"；显式写路径（面板保存按钮）才用覆盖语义。
 //   **model 例外**：模型是用户明确要求可从插件设置表单直接修改的全局项（0.2.14 起），
 //   表单非空即覆盖（forceKeys），其余键维持只兜底——用户在表单填模型 = 表单说了算，
 //   想以面板为准就清空表单模型字段。
+// - 0.2.17 起端点/key 不再由本插件维护（一律来自 ZCode 第三方服务商）：旧配置里的
+//   apiKey/baseUrl/apiSource 残留会在写入时清除，防止「手动 key 发往服务商端点」的交叉。
 // - 落盘失败只写 stderr，不影响 MCP 协议；
 // - 启动即落盘，然后再服务最小 MCP 协议（stdio JSON-RPC），宿主异常时也不阻塞会话。
 
@@ -22,34 +24,19 @@ const path = require('path');
 const USER_CONFIG = process.env.ZCODE_ADVISOR_USER_CONFIG
   || path.join(os.homedir(), '.zcode', 'advisor.config.json');
 
-// 旧版 plugin.json（≤0.2.7）曾把智谱官方端点写成 userConfig default——宿主会把它
-// 展开进 env，桥接再落盘，这正是「第三方端点总被改回智谱」的根因（默认值已改空串，
-// fillMissingOnly 也不再覆盖已有值）。这里再挡一道：已缓存旧表单/旧宿主展开出的
-// 官方默认端点，同样视为「未显式配置」跳过，防止降级安装路径复发。
-const LEGACY_DEFAULT_BASE_URL = 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
-
 // 从 env 提取 GUI 表单值（由 plugin.json mcpServers env 的 ${user_config.*} 模板填充）。
 function guiValuesFromEnv(env) {
   const out = {};
   const map = {
-    ZCODE_ADVISOR_CFG_API_KEY: 'apiKey',
     ZCODE_ADVISOR_CFG_MODEL: 'model',
-    ZCODE_ADVISOR_CFG_BASE_URL: 'baseUrl',
     ZCODE_ADVISOR_CFG_REVIEW_MODE: 'reviewMode',
-    ZCODE_ADVISOR_CFG_API_SOURCE: 'apiSource',
+    ZCODE_ADVISOR_CFG_ZCODE_PROVIDER: 'zcodeProvider',
     ZCODE_ADVISOR_CFG_MAX_TOKENS: 'maxTokens'
   };
   for (const [envKey, cfgKey] of Object.entries(map)) {
     const v = String(env[envKey] || '').trim();
     // 宿主可能把未填字段展开为字面模板串——同样跳过。
     if (!v || v.includes('${')) continue;
-    if (cfgKey === 'baseUrl' && v === LEGACY_DEFAULT_BASE_URL) continue;
-    // apiSource 只认白名单（非法值落盘会坏审查通道的来源解析）
-    if (cfgKey === 'apiSource') {
-      const s = v.toLowerCase();
-      if (s === 'manual' || s === 'zcode') out[cfgKey] = s;
-      continue;
-    }
     // max_tokens：default 0 = 表单未干预；0/非法/越界一律跳过（与面板保存语义一致）
     if (cfgKey === 'maxTokens') {
       const mt = parseInt(v, 10);
@@ -74,8 +61,8 @@ function mergeUserConfig(existingRaw, guiValues, opts) {
   const fillMissingOnly = !!(opts && opts.fillMissingOnly);
   // opts.forceKeys（可选数组）：fillMissingOnly 语义下仍**非空即覆盖**的键。
   // 背景：model 是用户明确要求可从插件设置表单直接修改的全局项——若同样只兜底，
-  // 配置文件里已有非空模型时表单永远改不动。其余键（尤其 apiKey/baseUrl）维持
-  // 只兜底纪律：宿主缓存旧表单值时，覆盖语义会把面板里调好的配置静默改回（真机 401 教训）。
+  // 配置文件里已有非空模型时表单永远改不动。其余键维持只兜底纪律（宿主缓存旧表单值时，
+  // 覆盖语义会把面板里调好的配置静默改回——真机 401 教训）。
   const forceKeys = opts && Array.isArray(opts.forceKeys) ? opts.forceKeys : null;
   // opts.conflicts（可选数组，传入即收集）：fillMissingOnly 语义下被跳过、且 GUI 值
   // 与既有值**不同**的键。等值跳过是稳态（表单默认 === 已保存值），不算冲突——否则
@@ -214,6 +201,11 @@ function writeUserConfig(guiValues, file, opts) {
       };
     }
     const merged = mergeUserConfig(existing || {}, values, Object.assign({}, opts, { conflicts, overwrites }));
+    // 0.2.17：端点/key 只来自 ZCode 服务商，插件配置里的手动残留（apiKey/baseUrl/apiSource/
+    // zcodeModel）写入时一并清除——留着会让用户误以为它们还在生效，且明文 key 是纯风险。
+    for (const legacy of ['apiKey', 'baseUrl', 'apiSource', 'zcodeModel']) {
+      if (Object.prototype.hasOwnProperty.call(merged, legacy)) delete merged[legacy];
+    }
     // 无实际变化就不落盘：桥接进程每次会话启动都跑一遍，无谓改写会污染 mtime
     // 并让用户误以为配置被改动（排查 401 时正是靠 mtime 定位到本缺陷）。
     if (JSON.stringify(merged) === JSON.stringify(existing || {})) {
@@ -344,16 +336,13 @@ function bridgeStatus() {
     const parsed = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) cfg = parsed;
   } catch (_) {}
-  // key 来源与 hook 的 resolveApiKey 链一致：用户级配置只是其中一环，未落盘不代表没配置。
-  const envKey = String(process.env.ZCODE_ADVISOR_API_KEY
-    || process.env.ZAI_API_KEY || process.env.Z_AI_API_KEY
-    || process.env.ZHIPUAI_API_KEY || process.env.BIGMODEL_API_KEY || '').trim();
   return {
     ok: true,
     file: USER_CONFIG,
-    configured: Boolean(String(cfg.apiKey || '').trim() || envKey),
-    fromUserConfig: Boolean(String(cfg.apiKey || '').trim()),
-    fromEnv: Boolean(envKey),
+    // 0.2.17：审查凭据一律来自 ZCode 第三方服务商（~/.zcode/v2/config.json），
+    // 本文件不再保存端点/key；这里只回报已保存的选择（服务商/模型）。
+    provider: String(cfg.zcodeProvider || ''),
+    model: String(cfg.model || ''),
     keys: Object.keys(cfg).filter((k) => k !== '__proto__')
   };
 }
@@ -383,27 +372,14 @@ function main() {
   } else if (result.lockTimeout) {
     // 归因留两种可能：锁被占用是暂时性，EROFS/ENOSPC 是永久性——旧文案只说前者会误导排障
     try { process.stderr.write('[advisor-bridge] 无法获取配置文件锁（被其他进程占用，或文件系统只读/已满），本次跳过写入\n'); } catch (_) {}
-  } else {
-    // 两条提示独立判断（可并存）：互斥 else-if 会在 model 覆盖与 apiKey 冲突同时成立时
-    // 吞掉后者的指路行（复审后端对抗者击穿点）。changed 守卫：写盘失败/未写入时
-    // 决不报「已写入」。
-    if (result.changed && Array.isArray(result.overwrites) && result.overwrites.includes('model')) {
-      // 表单模型覆盖了本地配置里已有的非空模型：这是 forceKeys 的预期行为，但用户
-      // 可能不知道两头入口在互相顶（面板刚改的模型被下次会话启动的表单值压回）。
-      // 指明优先关系与退出方式，不猜哪边是对的。
-      try {
-        process.stderr.write('[advisor-bridge] 提示：插件设置页表单的「模型」已作为全局模型写入（覆盖了本地配置此前保存的值）。'
-          + '若想以本地配置面板/角标面板为准，请清空插件设置页的模型字段并保存\n');
-      } catch (_) {}
-    }
-    if (Array.isArray(result.conflicts) && result.conflicts.includes('apiKey')) {
-      // 环境变量表单值与已保存 key 不同：用户在面板改过 key、宿主还在发旧表单默认时的
-      // 典型征兆。桥接是只填补语义，不会覆盖；这里只指路，不猜哪边是对的。
-      try {
-        process.stderr.write('[advisor-bridge] 提示：环境变量表单里的 apiKey 与已保存配置不一致，'
-          + '以配置文件为准；如需更换请在配置面板重新保存，或在插件设置页更新\n');
-      } catch (_) {}
-    }
+  } else if (result.changed && Array.isArray(result.overwrites) && result.overwrites.includes('model')) {
+    // 表单模型覆盖了本地配置里已有的非空模型：这是 forceKeys 的预期行为，但用户
+    // 可能不知道两头入口在互相顶（面板刚改的模型被下次会话启动的表单值压回）。
+    // 指明优先关系与退出方式，不猜哪边是对的。
+    try {
+      process.stderr.write('[advisor-bridge] 提示：插件设置页表单的「模型」已作为全局模型写入（覆盖了本地配置此前保存的值）。'
+        + '若想以配置面板/角标面板为准，请清空插件设置页的模型字段并保存\n');
+    } catch (_) {}
   }
   serveMcp();
 }

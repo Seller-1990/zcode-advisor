@@ -116,12 +116,13 @@ test('mergeUserConfig：不同类型但字符串化相等不算冲突（4096 vs 
 
 test('writeUserConfig：所有返回路径都带 conflicts', (t) => {
   const file = tmpFile(t);
-  fs.writeFileSync(file, JSON.stringify({ apiKey: 'user-key' }), 'utf8');
+  // 0.2.17：只剩 zcodeProvider/model 等白名单键——用 zcodeProvider 造「被跳过且值不同」的冲突。
+  fs.writeFileSync(file, JSON.stringify({ zcodeProvider: 'prov-user' }), 'utf8');
   const conflicts = [];
-  const r1 = writeUserConfig({ apiKey: 'form-key' }, file, { fillMissingOnly: true, conflicts });
+  const r1 = writeUserConfig({ zcodeProvider: 'prov-form' }, file, { fillMissingOnly: true, conflicts });
   assert.strictEqual(r1.changed, false, '冲突键被跳过，无写入');
-  assert.deepStrictEqual(r1.conflicts, ['apiKey']);
-  assert.deepStrictEqual(conflicts, ['apiKey'], '调用方数组同步填充');
+  assert.deepStrictEqual(r1.conflicts, ['zcodeProvider']);
+  assert.deepStrictEqual(conflicts, ['zcodeProvider'], '调用方数组同步填充');
 
   const r2 = writeUserConfig({}, file); // 空 GUI 值早退路径
   assert.deepStrictEqual(r2.conflicts, [], '早退路径也带 conflicts 字段');
@@ -176,7 +177,8 @@ test('mergeUserConfig：forceKeys 对既有空值照常写入（填补缺失不�
 
 test('writeUserConfig：model 覆盖语义端到端（落盘 + overwrites 带出 + 兄弟键保留）', (t) => {
   const file = tmpFile(t);
-  fs.writeFileSync(file, JSON.stringify({ apiKey: 'k', model: 'glm-5.3-flash' }), 'utf8');
+  // 兄弟键用 0.2.17 仍在白名单内的 zcodeProvider（apiKey 已不再是配置键）
+  fs.writeFileSync(file, JSON.stringify({ zcodeProvider: 'prov-user', model: 'glm-5.3-flash' }), 'utf8');
   const overwrites = [];
   const r = writeUserConfig({ model: 'kimi-k3' }, file,
     { fillMissingOnly: true, forceKeys: ['model'], overwrites });
@@ -184,7 +186,7 @@ test('writeUserConfig：model 覆盖语义端到端（落盘 + overwrites 带出
   assert.deepStrictEqual(r.overwrites, ['model']);
   const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.strictEqual(saved.model, 'kimi-k3');
-  assert.strictEqual(saved.apiKey, 'k', '兄弟键不受影响');
+  assert.strictEqual(saved.zcodeProvider, 'prov-user', '兄弟键不受影响');
 });
 
 test('writeUserConfig：损坏/非对象配置拒绝写入（不静默重建蒸发已有键）', (t) => {
@@ -213,10 +215,13 @@ test('writeUserConfig：损坏/非对象配置拒绝写入（不静默重建蒸�
   assert.strictEqual(JSON.parse(fs.readFileSync(fresh, 'utf8')).model, 'm');
 });
 
-test('bridgeStatus：无文件/坏文件时不抛错，configured 反映 env key', (t) => {
+test('bridgeStatus：无文件/坏文件时不抛错，回报已保存的服务商/模型选择', (t) => {
   const cb = require('../tools/config-bridge');
   // bridgeStatus 读 USER_CONFIG 常量；测试环境该文件在 tmpdir 下且通常不存在。
   const st = cb.bridgeStatus();
   assert.strictEqual(st.ok, true);
-  assert.strictEqual(typeof st.configured, 'boolean');
+  // 0.2.17：本文件不再保存端点/key，只回报服务商与模型选择
+  assert.strictEqual(typeof st.provider, 'string');
+  assert.strictEqual(typeof st.model, 'string');
+  assert.strictEqual(st.configured, undefined, '旧 configured 语义已随 key 一并移除');
 });

@@ -229,3 +229,38 @@ test('M4 primaryFailStreak：白名单原因交替仍累计到阈值（防漏报
   assert.strictEqual(s2.primaryFailStreak.count, 1);
   assert.strictEqual(s2.degradeAlertCount, 0, '新一轮劣化应复位降级告警阶梯');
 });
+
+// —— 0.2.17 迁移：旧版 state.sessionApi 里的明文 key 必须被剥掉 ——
+
+test('loadState：旧版 sessionApi（含明文 key）在读取时被剥除，不随写回留在盘上', (t) => {
+  const dir = tmpDir(t);
+  const file = path.join(dir, 'sess-legacy.json');
+  // 造一个 0.2.16 形状的状态文件：sessionApi 里带明文 key
+  fs.writeFileSync(file, JSON.stringify({
+    schema: 1,
+    sessionId: 'legacy',
+    enabled: true,
+    sessionApi: { baseUrl: 'http://old.example/v1', apiKey: 'sk-legacy-plaintext-key', model: 'old-m' },
+    sessionModel: 'old-m',
+    reviews: 7
+  }), 'utf8');
+
+  const st = loadState(file);
+  assert.ok(st, '旧文件必须仍能正常加载（schema 未变）');
+  assert.strictEqual(st.sessionApi, undefined, '读取时就应剥除旧 sessionApi');
+  assert.strictEqual(st.reviews, 7, '其余字段不受影响');
+
+  // 一次读-改-写后，盘上不得再出现明文 key
+  mutateStateExclusive(file, (s) => { s.reviews = 8; });
+  const onDisk = fs.readFileSync(file, 'utf8');
+  assert.ok(!onDisk.includes('sk-legacy-plaintext-key'), '落盘内容不得残留明文 key');
+  assert.ok(!onDisk.includes('sessionApi'), '落盘内容不得残留旧字段');
+  assert.strictEqual(JSON.parse(onDisk).reviews, 8);
+});
+
+test('freshState：不再产出 sessionApi（0.2.17 起状态文件不含任何凭据）', () => {
+  const st = freshState('s1', '/tmp/t.jsonl', true);
+  assert.strictEqual('sessionApi' in st, false);
+  assert.strictEqual(st.sessionProvider, '');
+  assert.strictEqual(st.sessionModel, '');
+});

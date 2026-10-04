@@ -25,54 +25,63 @@ test('guiValuesFromEnv：跳过空值与字面模板串', () => {
   const v = guiValuesFromEnv({
     ZCODE_ADVISOR_CFG_API_KEY: '  real-key-123  ',
     ZCODE_ADVISOR_CFG_MODEL: '',
-    ZCODE_ADVISOR_CFG_BASE_URL: '${user_config.base_url}',
+    ZCODE_ADVISOR_CFG_ZCODE_PROVIDER: '${user_config.zcode_provider}',
     ZCODE_ADVISOR_CFG_REVIEW_MODE: 'sync'
   });
-  assert.deepStrictEqual(v, { apiKey: 'real-key-123', reviewMode: 'sync' });
+  assert.deepStrictEqual(v, { reviewMode: 'sync' });
+});
+
+test('guiValuesFromEnv：0.2.17 起不再收集端点/key（插件不维护凭据）', () => {
+  const v = guiValuesFromEnv({
+    ZCODE_ADVISOR_CFG_API_KEY: 'sk-should-be-ignored',
+    ZCODE_ADVISOR_CFG_BASE_URL: 'http://manual.example/v1',
+    ZCODE_ADVISOR_CFG_API_SOURCE: 'manual',
+    ZCODE_ADVISOR_CFG_ZCODE_PROVIDER: 'prov-3p',
+    ZCODE_ADVISOR_CFG_MODEL: 'glm-5.3'
+  });
+  assert.deepStrictEqual(v, { zcodeProvider: 'prov-3p', model: 'glm-5.3' });
 });
 
 test('mergeUserConfig：默认覆盖语义（显式保存路径），GUI 提供的字段生效、其余保留', () => {
   const merged = mergeUserConfig(
-    { apiKey: 'old', maxTokens: 4096, systemPrompt: 'keep me' },
-    { apiKey: 'new', model: 'glm-5.3' }
+    { model: 'old', maxTokens: 4096, systemPrompt: 'keep me' },
+    { model: 'glm-5.3', zcodeProvider: 'prov-3p' }
   );
-  assert.strictEqual(merged.apiKey, 'new');
   assert.strictEqual(merged.model, 'glm-5.3');
+  assert.strictEqual(merged.zcodeProvider, 'prov-3p');
   assert.strictEqual(merged.maxTokens, 4096);
   assert.strictEqual(merged.systemPrompt, 'keep me');
 });
 
-// 回归：真机实测中 config-bridge 每次会话启动都把用户级 baseUrl 静默改回表单默认端点，
-// 导致 tokenrhythm 的 key 打到 bigmodel 端点 → llm_http_401。
+// 回归：真机实测中 config-bridge 每次会话启动都把用户级配置静默改回表单默认值。
+// 0.2.17 起表单只剩服务商/模型/模式——只兜底纪律同样适用。
 test('mergeUserConfig：fillMissingOnly 只填补缺失键，绝不覆盖已有非空值', () => {
   const merged = mergeUserConfig(
     {
-      apiKey: 'user-key',
-      baseUrl: 'https://tokenrhythm.studio/v1/chat/completions',
+      zcodeProvider: 'prov-user',
+      model: 'kimi-k3',
       maxTokens: 4096
     },
     {
-      apiKey: 'user-key',
+      zcodeProvider: 'prov-form-default',
       model: 'glm-5.3-flash',
-      baseUrl: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
       reviewMode: 'async'
     },
     { fillMissingOnly: true }
   );
-  assert.strictEqual(merged.baseUrl, 'https://tokenrhythm.studio/v1/chat/completions');
-  assert.strictEqual(merged.apiKey, 'user-key');
+  assert.strictEqual(merged.zcodeProvider, 'prov-user');
+  assert.strictEqual(merged.model, 'kimi-k3');
   assert.strictEqual(merged.maxTokens, 4096);
-  assert.strictEqual(merged.model, 'glm-5.3-flash');
   assert.strictEqual(merged.reviewMode, 'async');
 });
 
 test('mergeUserConfig：fillMissingOnly 把空串/null 视为缺失键', () => {
   const merged = mergeUserConfig(
-    { baseUrl: '   ', model: null },
-    { baseUrl: 'https://x.example/v1', model: 'glm-5.3' },
+    { zcodeProvider: '   ', model: null },
+    { zcodeProvider: 'prov-3p', model: 'glm-5.3' },
     { fillMissingOnly: true }
   );
-  assert.strictEqual(merged.baseUrl, 'https://x.example/v1');
+  assert.strictEqual(merged.zcodeProvider, 'prov-3p');
   assert.strictEqual(merged.model, 'glm-5.3');
 });
 
@@ -81,14 +90,14 @@ test('writeUserConfig：fillMissingOnly 下无可填补键时不写盘（不污�
   const file = path.join(dir, 'advisor.config.json');
   t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
 
-  fs.writeFileSync(file, JSON.stringify({ baseUrl: 'https://user.example/v1', apiKey: 'k' }), 'utf8');
-  const gui = { baseUrl: 'https://default.example/v1', apiKey: 'k', model: 'glm-5.3-flash' };
+  fs.writeFileSync(file, JSON.stringify({ zcodeProvider: 'prov-user' }), 'utf8');
+  const gui = { zcodeProvider: 'prov-form-default', model: 'glm-5.3-flash' };
   const opts = { fillMissingOnly: true };
 
   const r1 = writeUserConfig(gui, file, opts);
   assert.strictEqual(r1.changed, true);
   const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.strictEqual(saved.baseUrl, 'https://user.example/v1');
+  assert.strictEqual(saved.zcodeProvider, 'prov-user');
   assert.strictEqual(saved.model, 'glm-5.3-flash');
 
   const r2 = writeUserConfig(gui, file, opts);
@@ -101,14 +110,34 @@ test('writeUserConfig：原子合并写入，空 GUI 值不产生写动作', (t)
   t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
 
   fs.writeFileSync(file, JSON.stringify({ maxTokens: 4096 }), 'utf8');
-  const r1 = writeUserConfig({ apiKey: 'panel-key-1', model: 'glm-5.3' }, file);
+  const r1 = writeUserConfig({ zcodeProvider: 'prov-3p', model: 'glm-5.3' }, file);
   assert.strictEqual(r1.changed, true);
   const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.strictEqual(saved.apiKey, 'panel-key-1');
+  assert.strictEqual(saved.zcodeProvider, 'prov-3p');
   assert.strictEqual(saved.maxTokens, 4096);
 
   const r2 = writeUserConfig({}, file);
   assert.strictEqual(r2.changed, false);
+});
+
+test('writeUserConfig：写入时清除旧版手动端点/key 残留（防密钥交叉 + 明文留盘）', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-legacy-'));
+  const file = path.join(dir, 'advisor.config.json');
+  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
+
+  fs.writeFileSync(file, JSON.stringify({
+    apiKey: 'sk-legacy-plaintext', baseUrl: 'http://manual.example/v1',
+    apiSource: 'manual', zcodeModel: 'legacy-model', model: 'glm-5.3'
+  }), 'utf8');
+  const r = writeUserConfig({ zcodeProvider: 'prov-3p' }, file);
+  assert.strictEqual(r.changed, true);
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  for (const k of ['apiKey', 'baseUrl', 'apiSource', 'zcodeModel']) {
+    assert.strictEqual(saved[k], undefined, `旧版残留 ${k} 应被清除`);
+  }
+  assert.strictEqual(saved.model, 'glm-5.3');
+  assert.strictEqual(saved.zcodeProvider, 'prov-3p');
+  assert.ok(!fs.readFileSync(file, 'utf8').includes('sk-legacy-plaintext'), '明文 key 不得留在盘上');
 });
 
 test('配置面板 HTTP：页面与保存接口', async (t) => {
@@ -129,17 +158,19 @@ test('配置面板 HTTP：页面与保存接口', async (t) => {
 
   const html = await (await fetch(baseUrl + '/')).text();
   assert.ok(html.includes('zcode-advisor 配置面板'));
-  assert.ok(html.includes('API key'));
+  // 0.2.17：本面板不再收集端点/key（一律来自 ZCode 服务商）
+  assert.ok(html.includes('服务商'), '页面应有服务商选择');
+  assert.ok(!html.includes('id="apiKey"'), '页面不应再有 API key 输入框');
 
   const saveRes = await (await fetch(baseUrl + '/api/save', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ apiKey: 'panel-key-xyz', model: 'glm-5.3', maxTokens: 4096 })
+    body: JSON.stringify({ zcodeProvider: 'prov-3p', model: 'glm-5.3', maxTokens: 4096 })
   })).json();
   assert.strictEqual(saveRes.ok, true);
 
   const saved = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
-  assert.strictEqual(saved.apiKey, 'panel-key-xyz');
+  assert.strictEqual(saved.zcodeProvider, 'prov-3p');
   assert.strictEqual(saved.model, 'glm-5.3');
   assert.strictEqual(saved.maxTokens, 4096);
 });
@@ -167,19 +198,20 @@ test('配置面板 HTTP：一次保存恰好一次原子落盘（单次 RMW，�
   assert.strictEqual(configRenames, 1, '一次 /api/save 应恰好一次 tmp→目标 rename');
 });
 
-test('guiValuesFromEnv：旧版默认的智谱端点视为未配置（防「第三方端点被改回智谱」复发）', () => {
+test('guiValuesFromEnv：旧版端点/来源环境变量一律忽略（0.2.17 不再有这些键）', () => {
   // 回归：≤0.2.7 的 plugin.json 把官方端点写成 userConfig default，宿主展开进 env 后
-  // 桥接落盘，覆盖用户的第三方端点。默认值已改空串，这里挡住旧宿主/旧缓存展开出的值。
+  // 桥接落盘，覆盖用户的第三方端点。0.2.17 起这些键在 map 里已不存在 → 直接忽略。
   const v = guiValuesFromEnv({
-    ZCODE_ADVISOR_CFG_API_KEY: '',
+    ZCODE_ADVISOR_CFG_API_KEY: 'sk-old-key',
     ZCODE_ADVISOR_CFG_MODEL: 'glm-5.3-flash',
     ZCODE_ADVISOR_CFG_BASE_URL: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    ZCODE_ADVISOR_CFG_API_SOURCE: 'zcode',
     ZCODE_ADVISOR_CFG_REVIEW_MODE: ''
   });
   assert.deepStrictEqual(v, { model: 'glm-5.3-flash' });
 });
 
-test('配置面板 HTTP：apiSource/zcode 键可保存，非法 apiSource 被丢弃', async () => {
+test('配置面板 HTTP：只接受白名单键，旧版 apiSource/zcodeModel 被丢弃', async () => {
   try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
   const res = await (await fetch('http://127.0.0.1:8799/api/save', {
     method: 'POST',
@@ -188,18 +220,11 @@ test('配置面板 HTTP：apiSource/zcode 键可保存，非法 apiSource 被丢
   })).json();
   assert.strictEqual(res.ok, true);
   const saved = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
-  assert.strictEqual(saved.apiSource, 'zcode');
   assert.strictEqual(saved.zcodeProvider, 'prov-1');
-  assert.strictEqual(saved.zcodeModel, 'm-1');
-
-  const res2 = await (await fetch('http://127.0.0.1:8799/api/save', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ apiSource: 'BOTH' })
-  })).json();
-  assert.strictEqual(res2.ok, true);
-  const saved2 = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
-  assert.strictEqual(saved2.apiSource, 'zcode', '非法 apiSource 应被丢弃，保留既有值');
+  // 旧键不再是可保存键：即便 POST 里带了也不落盘（防旧前端/旧缓存写回）
+  assert.strictEqual(saved.apiSource, undefined);
+  assert.strictEqual(saved.zcodeModel, undefined);
+  assert.strictEqual(saved.apiSourceBad, undefined);
 });
 
 test('配置面板 HTTP：/api/zcode-models 返回服务商模型清单（不含 apiKey）', async () => {
@@ -227,10 +252,14 @@ test('配置面板 HTTP：/api/zcode-models 返回服务商模型清单（不含
   }
 });
 
-test('配置面板页面：API 来源分段与 zcode 服务商区渲染', async () => {
+test('配置面板页面：只有服务商/模型区，没有 API 来源分段', async () => {
   const html = await (await fetch('http://127.0.0.1:8799/')).text();
-  for (const marker of ['src-zcode', 'src-manual', 'zcodeProvider', 'zcodeModel', 'manualSec', 'API 来源', '启用']) {
+  for (const marker of ['zcodeProvider', 'zcodeModel', '启用', '审查模式']) {
     assert.ok(html.includes(marker), `页面应包含 ${marker}`);
+  }
+  // 取消第三方 API 适配：手动端点/来源分段必须消失
+  for (const gone of ['src-zcode', 'src-manual', 'API 来源', 'id="baseUrl"', 'id="apiKey"']) {
+    assert.ok(!html.includes(gone), `页面不应再包含 ${gone}（0.2.17 取消手动 API 维护）`);
   }
 });
 
@@ -244,7 +273,7 @@ async function postJson(url, body) {
   });
 }
 
-test('配置面板 HTTP：清除 API key（成功分支，页面元素齐备）', async () => {
+test('配置面板 HTTP：clear-key 端点保留（清理旧版残留 key，幂等）', async () => {
   try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
   const post = (url, body, origin) => fetch('http://127.0.0.1:8799' + url, {
     method: 'POST',
@@ -252,15 +281,16 @@ test('配置面板 HTTP：清除 API key（成功分支，页面元素齐备）'
     body: JSON.stringify(body || {})
   });
 
+  // 0.2.17：本插件不再维护 key，页面上没有「清除 key」按钮；
+  // 端点保留只为清理历史遗留残留（升级用户的旧配置里可能还有明文 key）。
   const html = await (await fetch('http://127.0.0.1:8799/')).text();
-  assert.ok(html.includes('清除 API key'), '页面应有清除按钮');
-  assert.ok(html.includes('/api/clear-key'), '页面应接清除接口');
-  assert.ok(html.includes('吊销'), '页面应提示清除≠作废');
+  assert.ok(!html.includes('id="apiKey"'), '页面不应再有 key 输入框');
 
   const r1 = await (await post('/api/clear-key', {})).json();
   assert.strictEqual(r1.ok, true, '配置不存在时也应 ok（幂等）');
 
-  await (await post('/api/save', { apiKey: 'to-be-cleared', model: 'glm-5.3' })).json();
+  // 直接造一份含旧 key 的配置，验证端点确实能清掉
+  fs.writeFileSync(USER_CONFIG, JSON.stringify({ apiKey: 'to-be-cleared', model: 'glm-5.3' }), 'utf8');
   const r2 = await (await post('/api/clear-key', {})).json();
   assert.strictEqual(r2.ok, true);
   assert.deepStrictEqual(r2.removed, ['apiKey']);
@@ -282,7 +312,8 @@ test('配置面板 HTTP：clear-key 拒绝非本机来源（403 JSON）', async 
 });
 
 test('配置面板 HTTP：clear-key 拒绝非 JSON body（400，不执行删除）', async () => {
-  await (await postJson('/api/save', { apiKey: 'keep-me' })).json();
+  try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
+  fs.writeFileSync(USER_CONFIG, JSON.stringify({ apiKey: 'keep-me' }), 'utf8');
   const r = await fetch('http://127.0.0.1:8799/api/clear-key', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

@@ -25,26 +25,31 @@ function runBridge(env, userConfigPath) {
   });
 }
 
-test('桥接 stderr：表单 key 与已保存 key 不同 → 一行冲突提示', (t) => {
+test('桥接 stderr：旧版表单 key 环境变量已不再收集 → 不写盘、不提示', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-stderr-'));
   const file = path.join(dir, 'advisor.config.json');
   t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
-  fs.writeFileSync(file, JSON.stringify({ apiKey: 'saved-key' }), 'utf8');
+  // 0.2.17：插件不再维护 key，旧表单 env 键已从 map 移除 → 直接忽略。
+  fs.writeFileSync(file, JSON.stringify({ model: 'glm-5.3' }), 'utf8');
 
   const r = runBridge({ ZCODE_ADVISOR_CFG_API_KEY: 'form-key' }, file);
-  assert.match(r.stderr, /apiKey 与已保存配置不一致/, `应有冲突提示：\n${r.stderr}`);
-  // 冲突不落盘：保存的 key 必须原样保留（fillMissingOnly 纪律）
-  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).apiKey, 'saved-key');
+  assert.doesNotMatch(r.stderr, /apiKey/, `不应再出现 key 相关提示：\n${r.stderr}`);
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(saved.apiKey, undefined, '旧表单 key 不得落盘');
+  assert.strictEqual(saved.model, 'glm-5.3', '兄弟键保留');
 });
 
-test('桥接 stderr：等值稳态（表单默认 === 已保存）→ 无冲突提示', (t) => {
+test('桥接 stderr：旧版残留 apiKey 在写入时被清除', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-stderr-'));
   const file = path.join(dir, 'advisor.config.json');
   t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
-  fs.writeFileSync(file, JSON.stringify({ apiKey: 'same-key' }), 'utf8');
+  fs.writeFileSync(file, JSON.stringify({ apiKey: 'saved-legacy-key', model: 'glm-5.3-flash' }), 'utf8');
 
-  const r = runBridge({ ZCODE_ADVISOR_CFG_API_KEY: 'same-key' }, file);
-  assert.doesNotMatch(r.stderr, /不一致/, `等值不应误报：\n${r.stderr}`);
+  const r = runBridge({ ZCODE_ADVISOR_CFG_MODEL: 'kimi-k3' }, file);
+  assert.match(r.stderr, /已作为全局模型写入/, `应有覆盖提示：\n${r.stderr}`);
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(saved.model, 'kimi-k3');
+  assert.strictEqual(saved.apiKey, undefined, '旧版明文 key 应被清除（纯风险，且已不生效）');
 });
 
 test('桥接 stderr：表单模型覆盖已保存模型 → 一行指路提示（forceKeys 语义）', (t) => {
@@ -82,13 +87,17 @@ test('桥接 stderr：损坏文件 → 拒绝写入并提示，绝不静默重�
   assert.match(fs.readFileSync(file, 'utf8'), /apiKey/, '损坏文件不应被改写');
 });
 
-test('桥接 stderr：model 覆盖与 apiKey 冲突同时成立 → 两行提示并存（互斥链回归）', (t) => {
+test('桥接 stderr：model 覆盖提示不被其它分支吞掉（互斥链回归）', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-stderr-'));
   const file = path.join(dir, 'advisor.config.json');
   t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
-  fs.writeFileSync(file, JSON.stringify({ apiKey: 'saved-key', model: 'glm-5.3-flash' }), 'utf8');
+  // 0.2.17：只剩 model 一个可覆盖键，apiKey 冲突分支已移除——
+  // 这条回归保证「单一提示分支」下覆盖提示仍能正常发出（历史上曾被 else-if 链吞掉）。
+  fs.writeFileSync(file, JSON.stringify({ apiKey: 'saved-legacy-key', model: 'glm-5.3-flash' }), 'utf8');
 
   const r = runBridge({ ZCODE_ADVISOR_CFG_MODEL: 'kimi-k3', ZCODE_ADVISOR_CFG_API_KEY: 'form-key' }, file);
   assert.match(r.stderr, /已作为全局模型写入/, `应有 model 覆盖提示：\n${r.stderr}`);
-  assert.match(r.stderr, /apiKey 与已保存配置不一致/, 'model 提示不得吞掉 apiKey 提示：\n' + r.stderr);
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(saved.model, 'kimi-k3');
+  assert.strictEqual(saved.apiKey, undefined, '旧版残留 key 同时被清除');
 });

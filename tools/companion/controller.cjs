@@ -694,8 +694,7 @@ function withConfigLock(target, fn) {
 
 function saveUserConfig(patch) {
   const allowed = {};
-  for (const k of ['apiKey', 'model', 'baseUrl', 'reviewMode', 'maxTokens', 'startEnabled',
-    'apiSource', 'zcodeProvider', 'zcodeModel']) {
+  for (const k of ['model', 'reviewMode', 'maxTokens', 'startEnabled', 'zcodeProvider']) {
     // 注意：v 必须在所有分支之前声明——曾把 startEnabled 分支写在 const v 之前，
     // 触发 TDZ（Cannot access 'v' before initialization），使**所有保存请求** 500。
     const v = patch[k];
@@ -709,11 +708,6 @@ function saveUserConfig(patch) {
     if (k === 'maxTokens') {
       const mt = parseInt(v, 10);
       if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) allowed[k] = mt;
-    } else if (k === 'apiSource') {
-      // API 获取方式只认 manual/zcode；切换到 zcode 时清掉手动字段由「只合并非空」语义自然保留，
-      // 用户回切 manual 时原手动配置仍在。
-      const s = String(v || '').trim().toLowerCase();
-      if (s === 'manual' || s === 'zcode') allowed[k] = s;
     } else if (typeof v === 'string' && v.trim() && !/^\$\{/.test(v)) {
       allowed[k] = v.trim();
     }
@@ -724,7 +718,12 @@ function saveUserConfig(patch) {
   fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true, mode: 0o700 });
   const outcome = withConfigLock(USER_CONFIG, () => {
     const merged = Object.assign({}, readUserConfig(), allowed);
-    // 配置含明文 apiKey：目录 0700、文件 0600（与转录快照/意见历史同级）。
+    // 配置文件可能残留旧版手动 key/端点：写入时一并清掉，避免「手动 key 发往服务商端点」
+    // 的密钥交叉面（0.2.17 起端点/key 只来自 ZCode 服务商，插件配置不参与解析）。
+    for (const legacy of ['apiKey', 'baseUrl', 'apiSource', 'zcodeModel']) {
+      if (Object.prototype.hasOwnProperty.call(merged, legacy)) delete merged[legacy];
+    }
+    // 目录 0700、文件 0600（与转录快照/意见历史同级；旧版此文件含明文 key）。
     const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), { encoding: 'utf8', mode: 0o600 });
     try {
@@ -744,11 +743,12 @@ function saveUserConfig(patch) {
   return outcome;
 }
 
-// —— ZCode 已维护的第三方 API（apiSource=zcode 的数据源）——
+// —— ZCode 已维护的第三方 API（0.2.17 起唯一审查来源）——
 // 解析规则与 hooks/lib/config.js 的 readZcodeProviders 同源：provider.<id> =
 // { name, kind, options: { baseURL, apiKey }, models: {...} }。独立实现是刻意的：
 // companion 发行包只有本目录四个文件（无 hooks/），跨目录 require 会静默失效
 // （与上方 readHistory 的先例同一理由）；规则若变更需两侧同步（测试锁住字段名）。
+// id 以 builtin: 开头的是 ZCode 官方内置通道（bigmodel/z.ai）——审查通道不使用。
 function zcodeConfigFile() {
   return process.env.ZCODE_ADVISOR_ZCODE_CONFIG
     || path.join(HOME, '.zcode', 'v2', 'config.json');
@@ -769,7 +769,8 @@ function readZcodeProviders() {
       baseURL: String(opts.baseURL || '').trim(),
       apiKey: String(opts.apiKey || '').trim(),
       models: p.models && typeof p.models === 'object' ? Object.keys(p.models) : [],
-      eligible: p.kind === 'openai' || p.kind === 'openai-compatible'
+      eligible: p.kind === 'openai' || p.kind === 'openai-compatible',
+      official: id.startsWith('builtin:')
     });
   }
   return out;
@@ -782,38 +783,39 @@ function pickZcodeProvider(want) {
   return all.find((p) => p.id === w) || all.find((p) => p.name && p.name === w) || null;
 }
 
-// 把面板保存载荷/已存配置解析为一次真实调用的 {baseUrl, apiKey, model}。
-// manual：与旧逻辑一致，body 优先、已存配置兜底；zcode：从 ZCode provider 现读，
-// key 不出进程——页面只需要模型/端点展示，永远拿不到 apiKey 明文。
+// 把面板载荷/已存配置解析为一次真实调用的 {baseUrl, apiKey, model}。
+// 与 hook 侧 resolveProviderTarget 同一规则（两侧独立实现、字段名被测试锁住）：
+// 服务商必须是非官方 + OpenAI 兼容 + 端点/key 齐备，否则不产出任何凭据
+// （调用方按 error 字段失败返回，绝不回退到硬编码端点——防密钥交叉）。
+// key 不出进程：页面只需要模型/端点展示，永远拿不到 apiKey 明文。
 function effectiveTarget(body) {
   const cfg = readUserConfig();
   const b = body || {};
-  const apiSource = String(b.apiSource || cfg.apiSource || 'manual').trim().toLowerCase();
-  if (apiSource !== 'zcode') {
-    return {
-      apiSource: 'manual',
-      baseUrl: String(b.baseUrl || cfg.baseUrl || '').trim(),
-      apiKey: String(b.apiKey || cfg.apiKey || '').trim(),
-      model: String(b.model || cfg.model || '').trim()
-    };
+  const providerWant = String(b.zcodeProvider || cfg.zcodeProvider || '').trim();
+  const modelWant = String(b.model || cfg.model || '').trim();
+  let prov = pickZcodeProvider(providerWant);
+  let auto = false;
+  if (!prov && !providerWant) {
+    const usable = readZcodeProviders().filter((p) => !p.official && p.eligible && p.baseURL && p.apiKey);
+    prov = (modelWant && usable.find((p) => p.models.includes(modelWant))) || usable[0] || null;
+    auto = Boolean(prov);
   }
-  const prov = pickZcodeProvider(b.zcodeProvider || cfg.zcodeProvider || '');
-  const model = String(b.zcodeModel || cfg.zcodeModel || (prov && prov.models[0]) || '').trim();
-  // 与审查侧 applyZcodeSource 同一规则：provider 缺失/非 OpenAI 兼容/端点或 key
-  // 缺一 → 不产出任何凭据（调用方按 error 字段失败返回）。否则 Ping 用一组、
-  // 审查用另一组，或把手动 key 发往服务商端点（密钥交叉）。
-  const usable = Boolean(prov && prov.eligible && prov.baseURL && prov.apiKey);
-  const reason = !prov ? 'provider_missing'
-    : (!prov.eligible ? 'provider_ineligible'
-      : (!prov.baseURL || !prov.apiKey ? 'provider_incomplete' : ''));
+  const model = String(modelWant || (prov && prov.models[0]) || '').trim();
+  const usable = Boolean(prov && !prov.official && prov.eligible && prov.baseURL && prov.apiKey);
+  const reason = !prov ? (providerWant ? 'provider_not_found' : 'provider_missing')
+    : (prov.official ? 'provider_official'
+      : (!prov.eligible ? 'provider_ineligible'
+        : (!prov.baseURL || !prov.apiKey ? 'provider_incomplete'
+          : (!model ? 'no_model' : ''))));
   return {
-    apiSource: 'zcode',
-    baseUrl: usable ? prov.baseURL : '',
-    apiKey: usable ? prov.apiKey : '',
+    baseUrl: usable && model ? prov.baseURL : '',
+    apiKey: usable && model ? prov.apiKey : '',
     model,
+    providerId: prov ? prov.id : '',
     providerName: prov ? (prov.name || prov.id) : '',
     providerFound: Boolean(prov),
     providerUsable: usable,
+    providerAuto: auto,
     providerError: reason || ''
   };
 }
@@ -849,19 +851,30 @@ function locateLatestSessionBeacon() {
   return null;
 }
 
-// 读取最近活动会话的状态快照（enabled / sessionModel），供角标展示与开关初始态。
+// 旧版（≤0.2.16）把会话级端点/API key 明文写在 state.sessionApi 里。该覆盖面已废弃，
+// 但 controller 的两个写入口（toggleSessionEnabled / setSessionTarget）是「读整个对象、
+// 改几个字段、整对象写回」——不剥掉的话旧明文 key 会被永久保留在盘上。
+// 与 hook 侧 hooks/lib/state.js 的 stripLegacySecrets 同一规则（两侧独立进程，各自实现）。
+function stripLegacySecrets(st) {
+  if (st && typeof st === 'object' && st.sessionApi !== undefined) delete st.sessionApi;
+  return st;
+}
+
+// 读取最近活动会话的状态快照（enabled / 会话级服务商与模型），供角标展示与开关初始态。
 function readSessionSnapshot() {
   const b = locateLatestSessionBeacon();
   if (!b) return { ok: true, hasSession: false };
   const stateFile = path.join(String(b.stateDir), `sess-${sanitizeSessionIdForState(b.sessionId)}.json`);
   let st = null;
   try { st = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch (_) {}
+  stripLegacySecrets(st);
   return {
     ok: true,
     hasSession: Boolean(st && typeof st === 'object'),
     sessionId: String(b.sessionId || ''),
     stateFile,
     enabled: st ? st.enabled !== false : true,
+    sessionProvider: st ? String(st.sessionProvider || '') : '',
     sessionModel: st ? String(st.sessionModel || '') : ''
   };
 }
@@ -904,6 +917,7 @@ function toggleSessionEnabled(enabled) {
     if (!st || typeof st !== 'object') {
       return { ok: false, error: 'state_unreadable', hint: '会话状态文件内容异常：' + stateFile };
     }
+    stripLegacySecrets(st);
     st.enabled = want;
     if (want) st.disabledReason = '';
     const tmp = `${stateFile}.tmp-${process.pid}`;
@@ -914,17 +928,20 @@ function toggleSessionEnabled(enabled) {
       try { fs.unlinkSync(tmp); } catch (_) {}
       return { ok: false, error: 'state_write_failed', hint: String(err && err.message || err).slice(0, 120) };
     }
-    return { ok: true, enabled: want, sessionId: String(b.sessionId || ''), sessionModel: String(st.sessionModel || '') };
+    return { ok: true, enabled: want, sessionId: String(b.sessionId || ''), sessionProvider: String(st.sessionProvider || ''), sessionModel: String(st.sessionModel || '') };
   } finally {
     try { if (fs.readFileSync(lock, 'utf8').trim() === myPid) fs.unlinkSync(lock); } catch (_) {}
   }
 }
 
-// 设置/重置最近活动会话的会话级模型（角标面板「本会话模型」入口）。
+// 设置/重置最近活动会话的会话级审查目标（角标面板「本会话模型」入口）。
 // 与 /advisor-model set|reset（mutateStateExclusive）同款 wrlock 互斥、同一落点：
-// 只写 state.sessionModel，审查链下一轮 effectiveModel 即取到（会话覆盖 > 全局）。
-function setSessionModel(model) {
-  const want = String(model || '').trim();
+// 只写 state.sessionProvider / state.sessionModel，审查链下一轮 resolveTarget 即取到
+// （会话覆盖 > 全局）。空串 = reset 该项（恢复跟随全局）。
+// 端点/key 不在本函数职责内——它们永远由服务商解析得到，状态文件不落任何 key。
+function setSessionTarget(provider, model) {
+  const wantProvider = String(provider || '').trim();
+  const wantModel = String(model || '').trim();
   const b = locateLatestSessionBeacon();
   if (!b) {
     return { ok: false, error: 'no_session', hint: '没有可操作的会话——先在 ZCode 里打开一个会话并让它跑起来（信标尚不存在）' };
@@ -958,7 +975,9 @@ function setSessionModel(model) {
     if (!st || typeof st !== 'object') {
       return { ok: false, error: 'state_unreadable', hint: '会话状态文件内容异常：' + stateFile };
     }
-    st.sessionModel = want; // 空 = reset（恢复全局）
+    stripLegacySecrets(st);
+    st.sessionProvider = wantProvider; // 空 = 该项 reset（恢复跟随全局）
+    st.sessionModel = wantModel;
     const tmp = `${stateFile}.tmp-${process.pid}`;
     try {
       fs.writeFileSync(tmp, JSON.stringify(st, null, 2), { encoding: 'utf8', mode: 0o600 });
@@ -967,42 +986,10 @@ function setSessionModel(model) {
       try { fs.unlinkSync(tmp); } catch (_) {}
       return { ok: false, error: 'state_write_failed', hint: String(err && err.message || err).slice(0, 120) };
     }
-    return { ok: true, sessionModel: want, sessionId: String(b.sessionId || '') };
+    return { ok: true, sessionProvider: wantProvider, sessionModel: wantModel, sessionId: String(b.sessionId || '') };
   } finally {
     try { if (fs.readFileSync(lock, 'utf8').trim() === myPid) fs.unlinkSync(lock); } catch (_) {}
   }
-}
-
-// 清除用户级配置的 apiKey（完整面板「清除 API key」入口）。语义与 config-bridge 的
-// removeUserConfigKeys 一致：走同一把配置锁；损坏/非对象报失败（绝不静默重建蒸发键）；
-// 键不存在 = 幂等成功。controller 与 config-bridge 是跨目录独立副本（发行包无 hooks/）。
-function removeApiKeyFromUserConfig() {
-  fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true, mode: 0o700 });
-  const outcome = withConfigLock(USER_CONFIG, () => {
-    let existing;
-    try {
-      existing = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
-    } catch (err) {
-      if (err && err.code === 'ENOENT') return { changed: false, removed: [] };
-      return { changed: false, removed: [], error: '配置文件已损坏，无法安全删除；请手动检查 ' + USER_CONFIG };
-    }
-    if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
-      return { changed: false, removed: [], error: '配置文件不是 JSON 对象，无法安全删除' };
-    }
-    if (!Object.prototype.hasOwnProperty.call(existing, 'apiKey')) return { changed: false, removed: [] };
-    const rebuilt = {};
-    for (const k of Object.keys(existing)) {
-      if (k === '__proto__' || k === 'apiKey') continue;
-      rebuilt[k] = existing[k];
-    }
-    const tmp = `${USER_CONFIG}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(rebuilt, null, 2), { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(tmp, USER_CONFIG);
-    try { fs.chmodSync(USER_CONFIG, 0o600); } catch (_) {}
-    return { changed: true, removed: ['apiKey'] };
-  });
-  if (outcome === false) return { changed: false, lockTimeout: true, removed: [] };
-  return outcome;
 }
 
 // —— 本机 API ——
@@ -1030,19 +1017,22 @@ function normalizeChatEndpoint(baseUrl) {
 
 async function ping(body) {
   const t = effectiveTarget(body);
-  // zcode 模式 provider 不可用时按审查侧同一语义失败，绝不把空端点替换成
-  // 硬编码默认（那会把服务商 key 发到智谱官方端点）。
-  if (t.apiSource === 'zcode' && !t.providerUsable) {
+  // 服务商不可用时按审查侧同一语义失败，绝不把空端点替换成硬编码默认
+  // （那会把服务商 key 发到别的端点——密钥交叉）。
+  if (!t.providerUsable || !t.model) {
     const hints = {
-      provider_missing: 'ZCode 配置里找不到所选服务商，请重新选择',
+      provider_missing: 'ZCode 里没有可用的第三方服务商（需 OpenAI 兼容且已填端点与 key）',
+      provider_not_found: 'ZCode 配置里找不到所选服务商，请刷新列表或重新选择',
+      provider_official: 'ZCode 官方内置通道不用于审查，请选择第三方服务商',
       provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
-      provider_incomplete: 'provider 的 baseURL/apiKey 缺一，为避免密钥与端点交叉使用，Ping 已中止'
+      provider_incomplete: '服务商的端点/key 缺一，Ping 已中止',
+      no_model: '该服务商未登记模型，请在 ZCode 设置里添加'
     };
-    return { ok: false, error: t.providerError, hint: hints[t.providerError] || '' };
+    return { ok: false, error: t.providerError || 'provider_unusable', hint: hints[t.providerError] || '' };
   }
-  const baseUrl = normalizeChatEndpoint(t.baseUrl || 'https://open.bigmodel.cn/api/paas/v4/chat/completions');
-  const model = t.model || 'glm-5.3-flash';
-  const apiKey = t.apiKey || '';
+  const baseUrl = normalizeChatEndpoint(t.baseUrl);
+  const model = t.model;
+  const apiKey = t.apiKey;
   const t0 = Date.now();
   try {
     const ctl = new AbortController();
@@ -1063,89 +1053,59 @@ async function ping(body) {
       return { ok: false, error: `llm_http_${r.status}`, hint, endpoint: baseUrl };
     }
     const note = '；响应体为空是 max_tokens=1 下的正常现象';
-    return { ok: true, ms: Date.now() - t0, note };
+    return { ok: true, ms: Date.now() - t0, note, provider: t.providerName, model };
   } catch (err) {
     const aborted = err && (err.name === 'AbortError' || String(err).includes('abort'));
     return { ok: false, error: aborted ? 'llm_timeout' : 'llm_error', hint: aborted ? '端点无响应（超时）' : '网络失败' };
   }
 }
 
+// 模型清单。两条路径：
+// - 默认：ZCode 配置里该服务商的**登记清单**（页面展示即所配）；
+// - body.zcodeFetch=true：绕过登记清单直接请求服务商端点 /models 拿实时全量
+//   （背景：用户实测 8788 网关登记 2 个、端点实际 23 个，登记清单可能严重滞后）。
 async function fetchModels(body) {
   const t = effectiveTarget(body);
-  // zcode 模式：模型列表直接来自 ZCode provider 数据，无需请求端点 /models。
-  if (t.apiSource === 'zcode') {
-    // zcodeFetch=true：绕过 ZCode 配置里的**静态登记清单**，直接请求服务商端点的
-    // /models 实时列表。背景（用户实测）：登记清单可能远小于端点真实可用集
-    // （8788 网关登记 2 个、实际 23 个），且 ZCode 侧改配置后这里不会自动同步。
-    if (body && body.zcodeFetch) {
-      if (!t.providerUsable) {
-        const hints = {
-          provider_missing: 'ZCode 配置里找不到所选服务商，请刷新列表或重新选择',
-          provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
-          provider_incomplete: 'provider 的 baseURL/apiKey 缺一，无法向端点拉取模型'
-        };
-        return { ok: false, error: t.providerError, hint: hints[t.providerError] || '' };
-      }
-      const url = modelsUrl(t.baseUrl);
-      if (!url) return { ok: false, error: 'baseUrl 为空' };
-      let r;
-      const ctl = new AbortController();
-      const timer = setTimeout(() => ctl.abort(), 12000);
-      try {
-        r = await fetch(url, { headers: { Authorization: `Bearer ${t.apiKey}` }, signal: ctl.signal });
-      } finally {
-        clearTimeout(timer);
-      }
-      try {
-        if (!r.ok) {
-          const hint = r.status === 401 || r.status === 403 ? '服务商 key 无效' : '该端点可能不提供 /models';
-          return { ok: false, error: `http_${r.status}`, hint };
-        }
-        const parsed = parseModels(await r.json());
-        if (!parsed.ok && parsed.error === 'unexpected_envelope') parsed.hint = '响应信封无法识别';
-        return parsed;
-      } catch (err) {
-        const aborted = err && (err.name === 'AbortError' || String(err).includes('abort'));
-        return { ok: false, error: aborted ? 'models_timeout' : 'models_error', hint: '拉取失败：' + (err && err.message || err).slice(0, 80) };
-      }
-    }
-    if (!t.providerUsable) {
-      const hints = {
-        provider_missing: 'ZCode 配置里找不到所选服务商，请重新选择',
-        provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
-        provider_incomplete: 'provider 的 baseURL/apiKey 缺一，已按审查侧同一规则中止'
-      };
-      return { ok: false, error: t.providerError, hint: hints[t.providerError] || '' };
-    }
-    if (!t.model) return { ok: false, error: 'no_models', hint: '该服务商未配置模型，请在 ZCode 设置里添加' };
-    // 整表返回（当前选中项排前）：多模型服务商不再只剩一项
-    const prov = pickZcodeProvider(body && (body.zcodeProvider || readUserConfig().zcodeProvider) || '');
-    const all = (prov && prov.models) || [];
-    const models = [t.model, ...all.filter((m) => m !== t.model)];
-    return { ok: true, models, source: 'zcode' };
+  if (!t.providerUsable) {
+    const hints = {
+      provider_missing: 'ZCode 里没有可用的第三方服务商（需 OpenAI 兼容且已填端点与 key）',
+      provider_not_found: 'ZCode 配置里找不到所选服务商，请刷新列表或重新选择',
+      provider_official: 'ZCode 官方内置通道不用于审查，请选择第三方服务商',
+      provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+      provider_incomplete: '服务商的端点/key 缺一，无法拉取模型'
+    };
+    return { ok: false, error: t.providerError || 'provider_unusable', hint: hints[t.providerError] || '' };
   }
-  const url = modelsUrl(t.baseUrl);
-  if (!url) return { ok: false, error: 'baseUrl 为空' };
-  let r;
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 12000);
-  try {
-    r = await fetch(url, { headers: { Authorization: `Bearer ${t.apiKey}` }, signal: ctl.signal });
-  } finally {
-    clearTimeout(timer);
-  }
-  try {
-    if (!r.ok) {
-      const hint = r.status === 401 || r.status === 403 ? 'key 无效' : '该端点可能不提供 /models，请手动输入模型 id';
-      return { ok: false, error: `http_${r.status}`, hint };
+  if (body && body.zcodeFetch) {
+    const url = modelsUrl(t.baseUrl);
+    if (!url) return { ok: false, error: 'baseUrl 为空' };
+    let r;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 12000);
+    try {
+      r = await fetch(url, { headers: { Authorization: `Bearer ${t.apiKey}` }, signal: ctl.signal });
+    } finally {
+      clearTimeout(timer);
     }
-    const parsed = parseModels(await r.json());
-    if (!parsed.ok && parsed.error === 'unexpected_envelope') parsed.hint = '响应信封无法识别，请手动输入模型 id';
-    return parsed;
-  } catch (err) {
-    const aborted = err && (err.name === 'AbortError' || String(err).includes('abort'));
-    return { ok: false, error: aborted ? 'models_timeout' : 'models_error', hint: '拉取失败，请手动输入模型 id' };
+    try {
+      if (!r.ok) {
+        const hint = r.status === 401 || r.status === 403 ? '服务商 key 无效' : '该端点可能不提供 /models';
+        return { ok: false, error: `http_${r.status}`, hint };
+      }
+      const parsed = parseModels(await r.json());
+      if (!parsed.ok && parsed.error === 'unexpected_envelope') parsed.hint = '响应信封无法识别';
+      return parsed;
+    } catch (err) {
+      const aborted = err && (err.name === 'AbortError' || String(err).includes('abort'));
+      return { ok: false, error: aborted ? 'models_timeout' : 'models_error', hint: '拉取失败：' + (err && err.message || err).slice(0, 80) };
+    }
   }
+  // 登记清单：当前选中项排前（多模型服务商不再只剩一项）
+  const prov = pickZcodeProvider(t.providerId) || pickZcodeProvider(body && body.zcodeProvider);
+  const all = (prov && prov.models) || [];
+  if (!t.model && all.length === 0) return { ok: false, error: 'no_models', hint: '该服务商未配置模型，请在 ZCode 设置里添加，或点「从端点拉取」' };
+  const models = t.model ? [t.model, ...all.filter((m) => m !== t.model)] : all.slice();
+  return { ok: true, models, source: 'zcode', provider: t.providerName };
 }
 
 function startApi(cdpPort, apiPort, token) {
@@ -1174,24 +1134,30 @@ function startApi(cdpPort, apiPort, token) {
     try {
       if (req.method === 'GET' && req.url === '/api/config') {
         const c = readUserConfig();
+        const t = effectiveTarget({});
         return done(200, {
           ok: true,
           config: {
-            model: c.model || '', baseUrl: c.baseUrl || '', reviewMode: c.reviewMode || 'async',
-            maxTokens: c.maxTokens || 4096, keyMasked: c.apiKey ? maskKey(c.apiKey) : '（未设置）',
-            enabled: c.startEnabled !== false,
-            apiSource: c.apiSource === 'zcode' ? 'zcode' : 'manual',
-            zcodeProvider: c.zcodeProvider || '', zcodeModel: c.zcodeModel || ''
+            // 全局审查目标（0.2.17）：服务商 + 模型。端点/key 来自服务商解析，不落配置。
+            zcodeProvider: c.zcodeProvider || '',
+            providerName: t.providerName,
+            providerAuto: t.providerAuto,
+            providerUsable: t.providerUsable,
+            providerError: t.providerError || '',
+            model: t.model || '',
+            reviewMode: c.reviewMode || 'async',
+            maxTokens: c.maxTokens || 4096,
+            enabled: c.startEnabled !== false
           },
           cdpPort
         });
       }
-      // ZCode 已维护的第三方 API 列表（apiSource=zcode 的选择数据源）。
-      // 只回传 id/名称/协议/端点/模型清单——apiKey 明文永不出进程。
+      // ZCode 已维护的服务商列表（审查来源的数据源）。只回传 id/名称/协议/端点/模型清单——
+      // apiKey 明文永不出进程。official 标记官方内置通道（审查不使用，面板置灰展示）。
       if (req.method === 'GET' && req.url === '/api/zcode-providers') {
         const providers = readZcodeProviders().map((p) => ({
           id: p.id, name: p.name, kind: p.kind, baseURL: p.baseURL,
-          models: p.models, eligible: p.eligible, hasApiKey: Boolean(p.apiKey)
+          models: p.models, eligible: p.eligible, official: p.official, hasApiKey: Boolean(p.apiKey)
         }));
         return done(200, { ok: true, providers, file: zcodeConfigFile() });
       }
@@ -1208,7 +1174,7 @@ function startApi(cdpPort, apiPort, token) {
         const body = await readBody();
         return done(200, await fetchModels(body));
       }
-      // 最近活动会话的快照（enabled / sessionModel）：角标面板展示与开关初始态。
+      // 最近活动会话的快照（enabled / 会话级服务商与模型）：角标面板展示与开关初始态。
       // 注意归属语义：是「最近活动的会话」，不一定是用户正看着的那个（controller 无法
       // 感知焦点）；多会话并行时 UI 必须标注会话 id，避免把另一个会话的开关当自己的。
       if (req.method === 'GET' && req.url === '/api/session') {
@@ -1218,18 +1184,11 @@ function startApi(cdpPort, apiPort, token) {
         const body = await readBody();
         return done(200, toggleSessionEnabled(body && body.enabled));
       }
-      // 会话级模型（角标面板「本会话模型」）：body.model 空 = reset 恢复全局。
-      // 与 /advisor-model set|reset 同一落点（state.sessionModel），优先级：会话覆盖 > 全局。
-      if (req.method === 'POST' && req.url === '/api/session-model') {
+      // 会话级审查目标（角标面板「本会话模型」）：provider/model 传空串 = 该项 reset 恢复全局。
+      // 与 /advisor-model set|reset 同一落点（state.sessionProvider / state.sessionModel）。
+      if (req.method === 'POST' && req.url === '/api/session-target') {
         const body = await readBody();
-        return done(200, setSessionModel(body && body.model));
-      }
-      // 清除已保存的 apiKey（完整面板入口；与配置面板「清除 API key」同一落点）。
-      if (req.method === 'POST' && req.url === '/api/remove-key') {
-        const r = removeApiKeyFromUserConfig();
-        if (r.lockTimeout) return done(503, { ok: false, error: '配置文件被占用，请稍后重试' });
-        if (r.error) return done(500, { ok: false, error: r.error });
-        return done(200, { ok: true, changed: r.changed });
+        return done(200, setSessionTarget(body && body.provider, body && body.model));
       }
       if (req.method === 'POST' && req.url === '/api/ping') {
         const body = await readBody();
@@ -1362,7 +1321,7 @@ if (require.main === module) {
   });
 }
 
-module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi,
-  readSessionSnapshot, toggleSessionEnabled, setSessionModel,
+module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, pickZcodeProvider, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi,
+  readSessionSnapshot, toggleSessionEnabled, setSessionTarget,
   // 供单测直接验证单实例锁与主实例探测（不启动进程）
   _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, exitCodeFor, classifySpawnError, RETRY_EXIT_CODE, SUPERVISED, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS } };

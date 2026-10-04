@@ -30,12 +30,21 @@ const ITEMS = [
   'package.json', 'README.md', 'advisor.config.example.json'
 ];
 
-// 递归比较两个目录，返回差异列表
+// 递归比较两个目录，返回差异列表。
+// 同时做**反向检查**（目标有、源没有 = 源里删过但副本残留）：只做单向比对会让
+// 「源删了文件、副本还在」这种漂移永远查不出来，宿主装出的插件就带着幽灵文件
+//（实测踩过：0.2.17 删掉 commands/advisor-api.md，副本里还留着旧命令文档）。
 function diffTree(a, b, rel, out) {
   let st;
   try { st = fs.statSync(a); } catch (_) { out.push(`缺失: ${rel}`); return out; }
   if (st.isDirectory()) {
-    for (const name of fs.readdirSync(a)) {
+    const srcNames = fs.readdirSync(a);
+    let destNames = [];
+    try { destNames = fs.readdirSync(b); } catch (_) { /* 目标缺失：下面的 diffTree 会记 */ }
+    for (const name of destNames) {
+      if (!srcNames.includes(name)) out.push(`多余（源已删除）: ${path.join(rel, name)}`);
+    }
+    for (const name of srcNames) {
       diffTree(path.join(a, name), path.join(b, name), path.join(rel, name), out);
     }
     return out;
@@ -101,12 +110,53 @@ function copyIfChanged(src, dest) {
   }
 }
 
+// 清理「源已删除、副本残留」的幽灵文件。
+// 不直接删除：移入副本内的 .orphan-<时间戳>/ 隔离目录（等价回收站语义，误删可回捞），
+// 该目录名以 . 开头且不参与 ITEMS 递归，不会被后续同步当成插件内容。
+// 返回清理条数。宿主按目录拷贝，残留的旧命令文档/旧代码会被真的装进去——必须清。
+function quarantineOrphans() {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const bin = path.join(DEST, `.orphan-${stamp}`);
+  let moved = 0;
+  const walk = (srcDir, destDir, rel) => {
+    let srcNames = [];
+    try { srcNames = fs.readdirSync(srcDir); } catch (_) { return; }
+    let destNames = [];
+    try { destNames = fs.readdirSync(destDir); } catch (_) { return; }
+    for (const name of destNames) {
+      if (name.startsWith('.orphan-')) continue;
+      const destPath = path.join(destDir, name);
+      const relPath = path.join(rel, name);
+      if (!srcNames.includes(name)) {
+        const target = path.join(bin, relPath);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        try { fs.renameSync(destPath, target); moved++; } catch (_) {}
+      } else if (fs.statSync(destPath).isDirectory()) {
+        walk(path.join(srcDir, name), destPath, relPath);
+      }
+    }
+  };
+  for (const item of ITEMS) {
+    const src = path.join(ROOT, item);
+    if (!fs.existsSync(src)) continue;
+    const dest = path.join(DEST, item);
+    if (!fs.existsSync(dest)) continue;
+    if (fs.statSync(src).isDirectory() && fs.statSync(dest).isDirectory()) walk(src, dest, item);
+  }
+  if (moved === 0) { try { fs.rmdirSync(bin); } catch (_) {} }
+  return moved;
+}
+
 function sync() {
   fs.mkdirSync(DEST, { recursive: true });
   for (const item of ITEMS) {
     const src = path.join(ROOT, item);
     if (!fs.existsSync(src)) continue;
     copyIfChanged(src, path.join(DEST, item));
+  }
+  const moved = quarantineOrphans();
+  if (moved > 0) {
+    process.stdout.write(`[sync-plugin] 隔离 ${moved} 个源已删除的残留文件（副本内 .orphan-* 目录）\n`);
   }
 }
 

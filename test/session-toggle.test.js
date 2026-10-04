@@ -36,40 +36,49 @@ function writeState(patch) {
   return file;
 }
 
-test('setSessionModel：设置/重置会话级模型，与 hook 的 sessionModel 落点一致', () => {
+test('setSessionTarget：设置/重置会话级服务商+模型，与 hook 的落点一致', () => {
   writeBeacon();
-  const file = writeState({ enabled: true, sessionModel: '' });
+  const file = writeState({ enabled: true, sessionProvider: '', sessionModel: '' });
   // 设置
-  const r1 = controller.setSessionModel('kimi-k3');
+  const r1 = controller.setSessionTarget('prov-3p', 'kimi-k3');
   assert.strictEqual(r1.ok, true);
   assert.strictEqual(r1.sessionModel, 'kimi-k3');
-  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sessionModel, 'kimi-k3');
-  // 重置（空 = 恢复全局）
-  const r2 = controller.setSessionModel('');
+  assert.strictEqual(r1.sessionProvider, 'prov-3p');
+  const s1 = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(s1.sessionModel, 'kimi-k3');
+  assert.strictEqual(s1.sessionProvider, 'prov-3p');
+  // 重置（空 = 恢复跟随全局）
+  const r2 = controller.setSessionTarget('', '');
   assert.strictEqual(r2.ok, true);
   assert.strictEqual(r2.sessionModel, '');
-  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sessionModel, '');
+  assert.strictEqual(r2.sessionProvider, '');
+  const s2 = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(s2.sessionModel, '');
+  assert.strictEqual(s2.sessionProvider, '');
   assert.ok(!fs.existsSync(`${file}.wrlock`), '锁应释放');
   // 空白字符串等同重置（trim 语义）
-  controller.setSessionModel('   ');
-  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sessionModel, '');
+  controller.setSessionTarget('  ', '   ');
+  const s3 = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.strictEqual(s3.sessionModel, '');
+  assert.strictEqual(s3.sessionProvider, '');
 });
 
-test('setSessionModel：无会话 → no_session（不静默成功）', () => {
+test('setSessionTarget：无会话 → no_session（不静默成功）', () => {
   for (const f of fs.readdirSync(healthDir)) fs.unlinkSync(path.join(healthDir, f));
-  const r = controller.setSessionModel('m1');
+  const r = controller.setSessionTarget('', 'm1');
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.error, 'no_session');
 });
 
-test('readSessionSnapshot：经信标 stateDir 定位状态文件，返回 enabled/sessionModel', () => {
+test('readSessionSnapshot：经信标 stateDir 定位状态文件，返回 enabled/sessionProvider/sessionModel', () => {
   writeBeacon();
-  writeState({ enabled: true, sessionModel: 'kimi-k3' });
+  writeState({ enabled: true, sessionProvider: 'prov-3p', sessionModel: 'kimi-k3' });
   const snap = controller.readSessionSnapshot();
   assert.strictEqual(snap.ok, true);
   assert.strictEqual(snap.hasSession, true);
   assert.strictEqual(snap.enabled, true);
   assert.strictEqual(snap.sessionModel, 'kimi-k3');
+  assert.strictEqual(snap.sessionProvider, 'prov-3p');
   assert.match(snap.stateFile, /sess-sess_test0001\.json$/, '状态文件名应与 hook 的 stateFilePath 规则一致');
 });
 

@@ -58,12 +58,32 @@ test('eligibility：sync 模式 → 禁用（并标注原因）', () => {
   assert.strictEqual(r.reason, 'fallback_skipped:sync_mode');
 });
 
-test('eligibility：会话覆盖了端点 → 禁用（凭据边界）', () => {
+test('eligibility：会话换到了别的服务商 → 禁用（凭据边界）', () => {
   const H = require('../hooks/advisor-hook');
-  const state = { sessionApi: { baseUrl: 'https://other.example/v1', apiKey: '', model: '' } };
-  const r = H.fallbackEligibility(mkCfg({ fallbackModel: 'fb' }), state, { model: 'primary-model' });
+  // 0.2.17：会话覆盖是「服务商 + 模型」。换了服务商 = 换了端点/key 对——
+  // 备用模型若沿用主模型凭据会打到别的服务商，因此跳过。
+  const state = { sessionProvider: 'prov-b', sessionModel: '' };
+  const r = H.fallbackEligibility(
+    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state, { model: 'primary-model', hasOverride: true });
   assert.strictEqual(r.ok, false);
-  assert.strictEqual(r.reason, 'fallback_skipped:session_endpoint');
+  assert.strictEqual(r.reason, 'fallback_skipped:session_provider');
+});
+
+test('eligibility：只覆盖模型、服务商仍是全局那个 → 降级照常可用（同 provider = 同凭据）', () => {
+  const H = require('../hooks/advisor-hook');
+  const state = { sessionProvider: '', sessionModel: 'model-x' };
+  const r = H.fallbackEligibility(
+    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state, { model: 'model-x', hasOverride: true });
+  assert.strictEqual(r.ok, true, '同服务商下换模型不应丢掉降级能力');
+  assert.strictEqual(r.model, 'fb');
+});
+
+test('eligibility：会话服务商与全局解析出的服务商相同（显式写了一遍）→ 仍可用', () => {
+  const H = require('../hooks/advisor-hook');
+  const state = { sessionProvider: 'prov-a', sessionModel: 'model-x' };
+  const r = H.fallbackEligibility(
+    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state, { model: 'model-x', hasOverride: true });
+  assert.strictEqual(r.ok, true, '同名服务商不算换服务商');
 });
 
 test('eligibility：备用与主模型同名 → 不可用（换了个寂寞）', () => {

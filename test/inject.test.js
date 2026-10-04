@@ -12,7 +12,14 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+
+// 隔离本机真实配置：本文件只跑 DOM 桩（不 require controller/hook），当前不会读配置；
+// 但它是角标/面板断言的主战场，一旦将来加 effectiveTarget/providerUsable 类断言就会
+// 读到开发者本机真实的 ~/.zcode/v2/config.json（断言漂移 + 明文 key 进测试输出）。
+process.env.ZCODE_ADVISOR_ZCODE_CONFIG = path.join(os.tmpdir(), `zcadv-inject-no-zcode-${Date.now()}.json`);
+process.env.ZCODE_ADVISOR_USER_CONFIG = path.join(os.tmpdir(), `zcadv-inject-no-user-${Date.now()}.json`);
 
 const INJECT_SRC = fs.readFileSync(
   path.join(__dirname, '..', 'tools', 'companion', 'inject.js'),
@@ -117,6 +124,11 @@ function makeDom() {
       const i = this.children.indexOf(c);
       if (i >= 0) this.children.splice(i, 1);
       return c;
+    }
+    // <select> 的 options 集合。真实 DOM 里 innerHTML 重建后 options 反映新子项；
+    // 0.2.17 的本会话模型块用 options 判断「服务商是否在下拉里」并回填 value。
+    get options() {
+      return this.children.filter((c) => String(c.tagName).toUpperCase() === 'OPTION');
     }
     // 类选择器：面板历史上用 innerHTML 渲染（无 id），脚本随后用 querySelectorAll('.h-note')
     // 取节点填正文。桩需返回**稳定**节点（缓存），否则脚本的 textContent/setAttribute 写到
@@ -323,19 +335,23 @@ test('inject.js：点击角标创建面板，面板带 zca-panel class', () => {
   assert.strictEqual(panel.className, 'zca-panel', '面板必须带 zca-panel class');
 });
 
-test('panel.cjs：完整配置面板接管全局配置控件（0.2.15 从角标迁出）', () => {
-  // 0.2.15 角标瘦身：全局配置（API 来源/端点/key/模型/模式/max_tokens/保存/Ping/拉取）
-  // 的 GUI 载体迁到 controller 的 GET /panel（tools/companion/panel.cjs）。
+test('panel.cjs：完整配置面板接管全局配置控件（0.2.17 只剩服务商/模型/模式）', () => {
+  // 0.2.17：全局配置的 GUI 载体是 controller 的 GET /panel（tools/companion/panel.cjs）。
+  // 审查来源只剩「ZCode 第三方服务商」——端点/key/API 来源分段已移除。
   const PANEL = require('../tools/companion/panel.cjs');
-  for (const id of ['baseUrl', 'apiKey', 'model', 'modelManual', 'reviewMode', 'maxTokens',
-    'save', 'ping', 'fetchModels', 'zprovider', 'zmodel', 'zrefresh', 'zfetch',
-    'removeKey', 'msg', 'st', 'hist']) {
+  for (const id of ['modelManual', 'reviewMode', 'maxTokens',
+    'save', 'ping', 'zprovider', 'zmodel', 'zrefresh', 'zfetch',
+    'msg', 'st', 'hist']) {
     assert.ok(PANEL.includes(`id="${id}"`), `panel 应包含 #${id}`);
+  }
+  // 取消第三方 API 适配：手动端点/key/来源控件必须不存在
+  for (const gone of ['id="baseUrl"', 'id="apiKey"', 'id="removeKey"', 'id="fetchModels"', 'src-zcode', 'src-manual']) {
+    assert.ok(!PANEL.includes(gone), `panel 不应再包含 ${gone}（0.2.17 取消手动 API 维护）`);
   }
   // 关键功能点：刷新服务商列表、从端点拉取模型（登记清单可能远小于端点真实可用集）、
   // 令牌经 hash 传入（不进服务器日志）、会话级命令指引
   assert.ok(PANEL.includes('/api/zcode-providers'), 'panel 应拉取服务商列表');
-  assert.ok(PANEL.includes('zcodeFetch'), 'panel 应支持从端点实时拉取模型');
+  assert.ok(PANEL.includes('zfetch'), 'panel 应支持从端点实时拉取模型');
   assert.ok(PANEL.includes('location.hash'), 'panel 令牌应从 URL hash 读取');
   assert.ok(PANEL.includes('/advisor-model'), 'panel 应给出会话级换模型命令指引');
 });
@@ -349,10 +365,16 @@ test('inject.js：角标面板已瘦身（只含会话控制，不含全局配�
     'zca-fullpanel', 'zca-msg', 'zca-history', 'zca-close']) {
     assert.ok(html.includes(id), `角标面板应包含 #${id}`);
   }
-  // 瘦身断言：这些全局配置控件必须不在角标面板里（防止旧形态回潮）
-  for (const id of ['zca-baseUrl', 'zca-apiKey', 'zca-model', 'zca-reviewMode', 'zca-maxTokens',
-    'zca-save', 'zca-ping', 'zca-models', 'zca-apiSource']) {
+  // 瘦身断言：这些全局配置控件必须不在角标面板里（防止旧形态回潮）。
+  // 0.2.17：本会话模型块用的是 zca-provider-sel / zca-model-sel / zca-pin-model /
+  // zca-use-global，旧版输入框 #zca-session-model 已移除。
+  for (const id of ['zca-baseUrl', 'zca-apiKey', 'zca-reviewMode', 'zca-maxTokens',
+    'zca-save', 'zca-ping', 'zca-models', 'zca-apiSource', 'zca-session-model']) {
     assert.ok(!html.includes(id), `角标面板不应再包含 #${id}（已迁往 /panel 完整配置）`);
+  }
+  // 本会话模型块必须在角标面板里（用户要求：会话级 model 设置是角标的核心能力）
+  for (const id of ['zca-provider-sel', 'zca-model-sel', 'zca-pin-model', 'zca-use-global', 'zca-model-badge']) {
+    assert.ok(html.includes(id), `角标面板应包含 #${id}`);
   }
 });
 
@@ -698,60 +720,83 @@ test('inject.js：会话开关初始态回填自 /api/session，切换请求发 
   assert.match(msgEl.textContent, /已停用/, '应提示本会话已停用');
 });
 
-test('inject.js：会话覆盖模型优先展示（sessionModel 非空时标注「本会话覆盖」）', async () => {
+test('inject.js：会话覆盖优先展示（sessionProvider/sessionModel 非空时标注「本会话固定」）', async () => {
   const fetchStub = async (url) => {
     const u = String(url);
+    if (u.includes('/api/zcode-providers')) {
+      return { json: async () => ({ ok: true, providers: [
+        { id: 'prov-a', name: '第三方A', kind: 'openai-compatible', baseURL: 'http://a/v1', models: ['model-a1', 'model-a2'], eligible: true, official: false, hasApiKey: true },
+        { id: 'prov-b', name: '第三方B', kind: 'openai', baseURL: 'http://b/v1', models: ['model-b1'], eligible: true, official: false, hasApiKey: true }
+      ] }) };
+    }
     if (u.includes('/api/session')) {
-      return { json: async () => ({ ok: true, hasSession: true, sessionId: 'sess_y2', enabled: true, sessionModel: 'kimi-k3' }) };
+      return { json: async () => ({ ok: true, hasSession: true, sessionId: 'sess_y2', enabled: true, sessionProvider: 'prov-b', sessionModel: 'model-b1' }) };
     }
     if (u.includes('/api/config')) {
-      return { json: async () => ({ ok: true, config: { model: 'glm-5.3-flash', reviewMode: 'async', apiSource: 'manual' } }) };
+      return { json: async () => ({ ok: true, config: { model: 'model-a1', providerName: '第三方A', zcodeProvider: 'prov-a', providerUsable: true, reviewMode: 'async' } }) };
     }
     return { json: async () => ({ ok: false }) };
   };
   const dom = runInject({ fetch: fetchStub });
   dom.byId.get('zca-badge')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 20));
+  await new Promise((r) => setTimeout(r, 30));
   const st = dom.byId.get('zca-status');
-  assert.match(st.textContent, /kimi-k3（本会话覆盖）/, '会话覆盖模型应优先于全局展示');
-  const sm = dom.byId.get('zca-session-model');
-  assert.strictEqual(sm.value, 'kimi-k3', '会话模型输入框应回填当前覆盖值');
+  assert.match(st.textContent, /第三方B \/ model-b1/, '会话覆盖的服务商/模型应优先于全局展示');
+  const cur = dom.byId.get('zca-model-current');
+  assert.match(cur.textContent, /model-b1/, '当前生效模型块应显示覆盖值');
+  const badge = dom.byId.get('zca-model-badge');
+  assert.match(badge.textContent, /本会话固定/, '覆盖态应带「本会话固定」徽标');
 });
 
-test('inject.js：会话级模型控件（0.2.16 补 UI）：回填当前覆盖值，保存发 /api/session-model', async () => {
+test('inject.js：本会话模型块 —— 固定此模型发 /api/session-target，使用全局默认发空值 reset', async () => {
   const setCalls = [];
   const fetchStub = async (url, opt) => {
     const u = String(url);
-    if (u.includes('/api/session-model')) {
+    if (u.includes('/api/session-target')) {
       setCalls.push(JSON.parse((opt && opt.body) || '{}'));
-      return { json: async () => ({ ok: true, sessionModel: 'kimi-k3' }) };
+      return { json: async () => ({ ok: true, sessionProvider: 'prov-a', sessionModel: 'model-a2' }) };
+    }
+    if (u.includes('/api/zcode-providers')) {
+      return { json: async () => ({ ok: true, providers: [
+        { id: 'prov-a', name: '第三方A', kind: 'openai-compatible', baseURL: 'http://a/v1', models: ['model-a1', 'model-a2'], eligible: true, official: false, hasApiKey: true }
+      ] }) };
     }
     if (u.includes('/api/session')) {
-      return { json: async () => ({ ok: true, hasSession: true, sessionId: 'sess_m1', enabled: true, sessionModel: 'glm-5.3-flash' }) };
+      return { json: async () => ({ ok: true, hasSession: true, sessionId: 'sess_m1', enabled: true, sessionProvider: '', sessionModel: '' }) };
     }
-    if (u.includes('/api/config')) return { json: async () => ({ ok: true, config: { model: 'glm-5.3-flash', reviewMode: 'async', apiSource: 'manual' } }) };
+    if (u.includes('/api/config')) return { json: async () => ({ ok: true, config: { model: 'model-a1', providerName: '第三方A', zcodeProvider: 'prov-a', providerUsable: true, reviewMode: 'async' } }) };
     return { json: async () => ({ ok: false }) };
   };
   const dom = runInject({ fetch: fetchStub });
   dom.byId.get('zca-badge')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 20));
+  await new Promise((r) => setTimeout(r, 30));
 
-  const input = dom.byId.get('zca-session-model');
-  assert.ok(input, '面板应有本会话模型输入框 #zca-session-model');
-  assert.strictEqual(input.value, 'glm-5.3-flash', '应回填当前会话覆盖模型');
-  // 修改并保存
-  input.value = 'kimi-k3';
-  dom.byId.get('zca-panel').querySelector('#zca-session-model-save')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 20));
-  assert.strictEqual(setCalls.length, 1, '应发出会话模型设置请求');
-  assert.strictEqual(setCalls[0].model, 'kimi-k3');
+  const pSel = dom.byId.get('zca-provider-sel');
+  const mSel = dom.byId.get('zca-model-sel');
+  assert.ok(pSel, '面板应有本会话服务商下拉 #zca-provider-sel');
+  assert.ok(mSel, '面板应有本会话模型下拉 #zca-model-sel');
+  // 无覆盖时徽标为「全局默认」
+  assert.match(dom.byId.get('zca-model-badge').textContent, /全局默认/);
+
+  // 选择服务商 + 模型 → 固定到本会话
+  pSel.value = 'prov-a';
+  pSel._listeners.change[0]();
+  mSel.value = 'model-a2';
+  dom.byId.get('zca-panel').querySelector('#zca-pin-model')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.strictEqual(setCalls.length, 1, '应发出会话目标设置请求');
+  assert.strictEqual(setCalls[0].provider, 'prov-a');
+  assert.strictEqual(setCalls[0].model, 'model-a2');
   const msgEl = dom.byId.get('zca-msg');
-  assert.match(msgEl.textContent, /本会话模型已设为/, '应确认设置成功');
-  // 空值保存 = 恢复全局
-  input.value = '';
-  dom.byId.get('zca-panel').querySelector('#zca-session-model-save')._listeners.click[0]();
-  await new Promise((r) => setTimeout(r, 20));
-  assert.strictEqual(setCalls[1].model, '', '空值保存 = reset 恢复全局');
+  assert.match(msgEl.textContent, /本会话已固定/, '应确认设置成功');
+
+  // 「使用全局默认」= 清空覆盖（provider/model 都传空）
+  dom.byId.get('zca-panel').querySelector('#zca-use-global')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 30));
+  assert.strictEqual(setCalls.length, 2, '应发出恢复全局请求');
+  assert.strictEqual(setCalls[1].provider, '', 'reset 应清空服务商覆盖');
+  assert.strictEqual(setCalls[1].model, '', 'reset 应清空模型覆盖');
+  assert.match(msgEl.textContent, /已恢复跟随全局默认/);
 });
 
 test('inject.js：完整配置按钮以 hash 令牌打开 /panel（全局配置唯一 GUI 入口）', async () => {

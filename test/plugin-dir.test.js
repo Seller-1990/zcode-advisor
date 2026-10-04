@@ -12,6 +12,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
@@ -34,6 +35,39 @@ test('plugins/zcode-advisor 含插件运行必需文件', () => {
   const dest = path.join(ROOT, 'plugins', 'zcode-advisor');
   for (const f of ['.zcode-plugin/plugin.json', 'hooks/hooks.json', 'hooks/advisor-hook.js', 'commands']) {
     assert.ok(fs.existsSync(path.join(dest, f)), `plugins/zcode-advisor/${f} 应存在`);
+  }
+});
+
+test('同步脚本能发现「源已删除、副本残留」的幽灵文件（0.2.17 删除 advisor-api 的教训）', () => {
+  // 回归：diffTree 原先只做单向比对（源→目标），源里删掉的文件在副本里永远不会被报出来，
+  // 宿主按目录拷贝就会把旧命令文档一起装进去。这里用临时幽灵文件验证反向检查已生效。
+  const dest = path.join(ROOT, 'plugins', 'zcode-advisor');
+  const ghost = path.join(dest, 'commands', '__ghost-test__.md');
+  const orphanDirs = () => fs.readdirSync(dest).filter((n) => n.startsWith('.orphan-'));
+  const before = new Set(orphanDirs());
+  const run = () => {
+    try {
+      execFileSync(process.execPath, [SYNC, '--check'], { encoding: 'utf8', stdio: 'pipe' });
+      return 0;
+    } catch (err) {
+      return err.status;
+    }
+  };
+  try {
+    fs.writeFileSync(ghost, '# ghost\n', 'utf8');
+    assert.notStrictEqual(run(), 0, '副本里的幽灵文件必须让 --check 失败');
+    // 走同步：应把幽灵文件隔离到 .orphan-*（不是直接删）
+    execFileSync(process.execPath, [SYNC], { encoding: 'utf8', stdio: 'pipe' });
+    assert.ok(!fs.existsSync(ghost), '同步应把幽灵文件移出插件目录');
+    assert.strictEqual(run(), 0, '隔离后应恢复无漂移');
+  } finally {
+    // 本次测试自己造的隔离目录不留痕：移到系统临时目录（等价回收站，不直接删）
+    try { if (fs.existsSync(ghost)) fs.unlinkSync(ghost); } catch (_) {}
+    const trash = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-orphan-'));
+    for (const name of orphanDirs()) {
+      if (before.has(name)) continue;
+      try { fs.renameSync(path.join(dest, name), path.join(trash, name)); } catch (_) {}
+    }
   }
 });
 

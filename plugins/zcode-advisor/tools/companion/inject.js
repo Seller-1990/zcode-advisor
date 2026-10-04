@@ -95,12 +95,21 @@
 /* 启用开关：面板正文第一行的独立控件。曾在标题栏里挤着——难点中、又像关闭按钮的邻居（位置不对的来源） */
 .zca-toggle-row{display:flex;align-items:center;justify-content:space-between;
  padding:7px 10px;background:#242833;border-radius:8px}
-/* 会话级模型行：label + 输入框 + 保存按钮同行，紧贴启用开关下方 */
-.zca-session-model-row{display:flex;align-items:center;gap:8px;margin-top:8px;
- padding:7px 10px;background:#242833;border-radius:8px}
-.zca-session-model-row .zca-label{flex:0 0 auto}
-.zca-session-model-row input{flex:1 1 auto;padding:4px 8px;font-size:12px}
-.zca-session-model-row .zca-btn{font-size:12px}
+/* 会话级模型块：当前生效模型 + 来源徽标（全局默认/本会话固定）+ 服务商/模型下拉 + 两个动作按钮。
+   对齐 dsh-advisor 的「本会话的审阅模型」卡片：先亮出当前用什么，再给「使用全局默认 / 固定此模型」。 */
+.zca-model-block{margin-top:8px;padding:8px 10px;background:#242833;border-radius:8px}
+.zca-model-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.zca-model-label{color:#8b94a3;font-size:12px}
+.zca-model-badge{flex:0 0 auto;padding:1px 7px;border-radius:999px;font-size:10.5px;
+ border:1px solid rgba(127,127,127,.35);color:#8b94a3}
+.zca-model-badge.zca-global{border-color:rgba(59,130,246,.5);color:#93c5fd}
+.zca-model-badge.zca-session{border-color:rgba(16,185,129,.5);color:#6ee7b7}
+.zca-model-current{margin:5px 0 0;color:#e6e8ec;font-size:12.5px;font-weight:600;word-break:break-all}
+.zca-model-row{display:flex;gap:6px;margin-top:8px}
+.zca-model-row select{flex:1 1 0;min-width:0;padding:4px 6px;font-size:12px}
+.zca-model-actions{display:flex;gap:6px;margin-top:8px}
+.zca-model-actions .zca-btn{font-size:12px;padding:5px 0}
+.zca-model-actions .zca-btn[disabled]{opacity:.5;cursor:default}
 .zca-switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
 .zca-switch input{position:absolute;opacity:0;width:0;height:0}
 .zca-track{width:30px;height:17px;border-radius:9px;background:#4a5160;position:relative;transition:background .15s;flex:0 0 auto}
@@ -337,11 +346,96 @@
     }
   }
 
-  // 面板运行期状态（0.2.15 瘦身后只保留会话级控制）：
-  // curCfg — /api/config 的已存**全局**配置（状态行展示用，不再提供编辑控件）
-  // session — /api/session 的最近活动会话快照（enabled / sessionModel）
+  // 面板运行期状态（0.2.17 起 = 会话级控制 + 全局只读展示）：
+  // curCfg — /api/config 的已存**全局**配置（服务商/模型/模式）
+  // session — /api/session 的最近活动会话快照（enabled / sessionProvider / sessionModel）
+  // providers — /api/zcode-providers 的服务商清单（含官方标记；官方置灰）
   let curCfg = null;
   let session = null;
+  let providers = null;
+
+  // 服务商清单：打开面板时现读一次（在 ZCode 里改过服务商后重开面板即新列表）。
+  async function loadProviders() {
+    try {
+      const r = await api('/api/zcode-providers');
+      providers = (r && r.ok && Array.isArray(r.providers)) ? r.providers : [];
+    } catch (_) { providers = []; }
+    const sel = document.getElementById('zca-provider-sel');
+    if (!sel) return;
+    const usable = (providers || []).filter((p) => !p.official && p.eligible && p.baseURL && p.hasApiKey);
+    sel.innerHTML = '';
+    if (usable.length === 0) {
+      const o = document.createElement('option');
+      o.value = ''; o.textContent = '（无可用第三方服务商）';
+      sel.appendChild(o);
+      return;
+    }
+    for (const p of usable) {
+      const o = document.createElement('option');
+      o.value = p.id;
+      o.textContent = `${p.name || p.id}（${p.models.length} 模型）`;
+      sel.appendChild(o);
+    }
+  }
+
+  // 按所选服务商填充模型下拉（数据来自 ZCode 登记清单；清单可能滞后，
+  // 「完整配置」里可「从端点拉取」看实时全量）。
+  function fillModels(preferProvider, preferModel) {
+    const pSel = document.getElementById('zca-provider-sel');
+    const mSel = document.getElementById('zca-model-sel');
+    if (!pSel || !mSel) return;
+    if (preferProvider != null) {
+      const hit = Array.from(pSel.options).some((o) => o.value === preferProvider);
+      if (hit) pSel.value = preferProvider;
+    }
+    const prov = (providers || []).find((p) => p.id === pSel.value);
+    mSel.innerHTML = '';
+    const models = (prov && prov.models) || [];
+    for (const m of models) {
+      const o = document.createElement('option'); o.value = m; o.textContent = m; mSel.appendChild(o);
+    }
+    if (models.length === 0) {
+      const o = document.createElement('option'); o.value = ''; o.textContent = '（该服务商未登记模型）';
+      mSel.appendChild(o);
+    }
+    if (preferModel && models.includes(preferModel)) mSel.value = preferModel;
+  }
+
+  // 本会话模型块的展示：当前生效（会话覆盖 > 全局）+ 来源徽标。
+  function paintModelBlock() {
+    const cur = document.getElementById('zca-model-current');
+    const badge = document.getElementById('zca-model-badge');
+    if (!cur || !badge) return;
+    const g = curCfg || {};
+    const s = session || {};
+    const globalModel = g.model || '';
+    const globalProv = g.providerName || '';
+    const sessModel = s.hasSession ? String(s.sessionModel || '') : '';
+    const sessProv = s.hasSession ? String(s.sessionProvider || '') : '';
+    const isOverride = Boolean(sessModel || sessProv);
+    let text;
+    if (isOverride) {
+      const provName = sessProv
+        ? ((providers || []).find((p) => p.id === sessProv || p.name === sessProv) || {}).name || sessProv
+        : (globalProv || '自动选择');
+      text = `${provName} / ${sessModel || '（服务商默认模型）'}`;
+    } else {
+      text = `${globalProv || '（自动选择服务商）'} / ${globalModel || '（服务商默认模型）'}`;
+    }
+    cur.textContent = text;
+    badge.textContent = isOverride ? '本会话固定' : '全局默认';
+    badge.className = 'zca-model-badge ' + (isOverride ? 'zca-session' : 'zca-global');
+    // 下拉回填：会话覆盖时选覆盖值，否则选全局值（无则第一项）
+    if (providers && providers.length) {
+      fillModels(sessProv || g.zcodeProvider || '', sessModel || (!isOverride ? globalModel : ''));
+    }
+    // 无会话数据时两个动作按钮置灰（没有可写的状态文件）
+    const disabled = !(session && session.hasSession);
+    const pin = document.getElementById('zca-pin-model');
+    const useG = document.getElementById('zca-use-global');
+    if (pin) pin.disabled = disabled;
+    if (useG) useG.disabled = disabled || !isOverride;
+  }
 
   async function refreshStatus() {
     try {
@@ -365,33 +459,37 @@
         const s = await api('/api/session');
         session = (s && s.ok) ? s : null;
       } catch (_) { session = null; }
+      if (!providers) await loadProviders();
       const c = curCfg;
       const st = document.getElementById('zca-status');
-      // 状态行只读展示：当前生效模型 + 归属（会话覆盖 > 全局）+ API 来源 + 会话标注。
+      // 状态行只读展示：当前生效目标 + 来源 + 会话标注。
       // 多会话并行的归属语义：session 是「最近活动的会话」，controller 感知不到焦点，
       // 必须把会话 id 短码亮出来，避免用户把别的会话的开关/模型当成自己的。
       if (st) {
-        const zcode = c.apiSource === 'zcode';
-        const globalModel = zcode ? (c.zcodeModel || '（服务商默认）') : (c.model || '（默认）');
-        const sessionModel = session && session.hasSession ? String(session.sessionModel || '') : '';
-        const modelShown = sessionModel ? `${sessionModel}（本会话覆盖）` : globalModel;
-        const srcShown = zcode ? 'ZCode 已维护' : '手动';
-        const sid = session && session.hasSession && session.sessionId
-          ? ` ｜ 会话 ${String(session.sessionId).replace(/^sess_/, '').slice(0, 8)}` : '';
-        st.textContent = `模型 ${modelShown} ｜ 模式 ${c.reviewMode || 'async'} ｜ 来源 ${srcShown}${sid}`;
+        const s = session || {};
+        const sessModel = s.hasSession ? String(s.sessionModel || '') : '';
+        const sessProv = s.hasSession ? String(s.sessionProvider || '') : '';
+        const provShown = sessProv
+          ? ((providers || []).find((p) => p.id === sessProv || p.name === sessProv) || {}).name || sessProv
+          : (c.providerName || '（未解析出服务商）');
+        const modelShown = sessModel || c.model || '（服务商默认）';
+        const sid = s.hasSession && s.sessionId
+          ? ` ｜ 会话 ${String(s.sessionId).replace(/^sess_/, '').slice(0, 8)}` : '';
+        st.textContent = `${provShown} / ${modelShown} ｜ 模式 ${c.reviewMode || 'async'}${sid}`;
       }
       // 会话启用开关初始态：必须回填，否则用户打开面板看到"未启用"、一点就静默停用
       const en = document.getElementById('zca-session-enabled');
       if (en) en.checked = session ? session.enabled !== false : true;
-      // 会话级模型输入框回填当前覆盖值（空 = 跟随全局）
-      const sm = document.getElementById('zca-session-model');
-      if (sm && session) sm.value = String(session.sessionModel || '');
+      // 本会话模型块（当前模型 + 来源徽标 + 下拉 + 动作按钮）
+      paintModelBlock();
       // 开关旁的会话标注：无会话数据时置灰提示
       const hint = document.getElementById('zca-session-hint');
       if (hint) {
         hint.textContent = (!session || !session.hasSession)
           ? '暂无活动会话（先在 ZCode 里跑一轮对话）'
-          : '保存后自下一轮审查生效；模型可从「完整配置」的模型列表里复制';
+          : (c.providerUsable === false && !(session && (session.sessionProvider || session.sessionModel))
+            ? '全局目标不可用：请在「完整配置」里选择服务商'
+            : '保存后自下一轮审查生效；模型清单来自 ZCode 登记，可在「完整配置」从端点拉取实时清单');
       }
     } catch (err) {
       // 网络层失败才可能是"外挂未运行"；此时把原因也带上，便于排查
@@ -399,17 +497,13 @@
     }
   }
 
-  // 保存/重置会话级模型（写 state.sessionModel，与 /advisor-model set|reset 同一落点）
-  async function saveSessionModel() {
-    const input = document.getElementById('zca-session-model');
-    if (!input) return;
-    const model = String(input.value || '').trim();
+  // 会话级目标写入口（两个按钮共用）：写 state.sessionProvider / state.sessionModel，
+  // 与 /advisor-model set|reset 同一落点。端点/key 不在请求里——永远由服务商解析得到。
+  async function setSessionTarget(provider, model, okMsg) {
     try {
-      const r = await api('/api/session-model', { model });
+      const r = await api('/api/session-target', { provider, model });
       if (r && r.ok) {
-        msg(model
-          ? `本会话模型已设为 ${model}（自下一轮审查生效；不影响其他会话）`
-          : '已恢复跟随全局模型（自下一轮审查生效）', true);
+        msg(okMsg, true);
         refreshStatus();
       } else {
         msg('设置失败：' + (r && (r.hint || r.error) || '未知'), false);
@@ -417,6 +511,21 @@
     } catch (e) {
       msg('设置失败：' + (e && e.message ? e.message : e), false);
     }
+  }
+
+  function pinModel() {
+    const pSel = document.getElementById('zca-provider-sel');
+    const mSel = document.getElementById('zca-model-sel');
+    if (!pSel || !mSel) return;
+    const provider = String(pSel.value || '').trim();
+    const model = String(mSel.value || '').trim();
+    if (!provider) { msg('先在「完整配置」里添加一个第三方服务商（ZCode 设置 → 服务商）', false); return; }
+    const pName = ((providers || []).find((p) => p.id === provider) || {}).name || provider;
+    setSessionTarget(provider, model, `本会话已固定：${pName} / ${model || '（服务商默认模型）'}（自下一轮审查生效，不影响其他会话）`);
+  }
+
+  function useGlobalModel() {
+    setSessionTarget('', '', '已恢复跟随全局默认（自下一轮审查生效）');
   }
 
   async function toggleSession(checked) {
@@ -460,14 +569,24 @@
           <span class="zca-switch-text">启用顾问（本会话）</span>
         </label>
       </div>
-      <div class="zca-session-model-row">
-        <label class="zca-label" for="zca-session-model" style="margin:0" title="留空并保存 = 恢复全局模型；仅当前会话生效，优先于全局">本会话模型</label>
-        <input id="zca-session-model" placeholder="（使用全局模型）" title="填模型 id 覆盖本会话审查模型；留空 = 跟随全局">
-        <button type="button" class="zca-btn alt" id="zca-session-model-save" style="flex:0 0 auto;padding:5px 10px">保存</button>
+      <div class="zca-model-block" id="zca-model-block">
+        <div class="zca-model-head">
+          <span class="zca-model-label">本会话的审查模型</span>
+          <span class="zca-model-badge" id="zca-model-badge">…</span>
+        </div>
+        <div class="zca-model-current" id="zca-model-current">读取中…</div>
+        <div class="zca-model-row">
+          <select id="zca-provider-sel" title="审查用哪个 ZCode 服务商（非官方第三方）"><option value="">（服务商载入中…）</option></select>
+          <select id="zca-model-sel" title="该服务商的模型"><option value="">（模型）</option></select>
+        </div>
+        <div class="zca-model-actions">
+          <button type="button" class="zca-btn alt" id="zca-use-global" title="清除本会话覆盖，跟随全局默认">使用全局默认</button>
+          <button type="button" class="zca-btn" id="zca-pin-model" title="把所选服务商/模型固定到本会话（不影响其他会话）">固定此模型</button>
+        </div>
+        <div class="zca-hint" id="zca-session-hint" style="margin-top:6px"></div>
       </div>
-      <div class="zca-hint" id="zca-session-hint" style="margin-top:6px"></div>
       <div class="zca-row">
-        <button class="zca-btn" id="zca-fullpanel" title="全局配置（API 来源 / 端点 / key / 全局模型 / 拉取模型 / Ping）在浏览器中打开">完整配置…</button>
+        <button class="zca-btn" id="zca-fullpanel" title="全局配置（审查服务商 / 模型 / 从端点拉取 / 审查模式 / max_tokens / Ping）在浏览器中打开">完整配置…</button>
       </div>
       <div class="zca-msg" id="zca-msg" role="status" aria-live="polite"></div>
       <div class="zca-history" id="zca-history">
@@ -484,11 +603,10 @@
     // Esc 关闭（对话框惯例）：键盘用户不必去够右上角小叉
     p.addEventListener('keydown', (ev) => { if (ev && ev.key === 'Escape') closePanel(); });
     p.querySelector('#zca-session-enabled').addEventListener('change', (ev) => toggleSession(!!(ev && ev.target && ev.target.checked)));
-    p.querySelector('#zca-session-model-save').addEventListener('click', saveSessionModel);
-    // Enter 直接送出（与保存按钮等价）
-    p.querySelector('#zca-session-model').addEventListener('keydown', (ev) => {
-      if (ev && ev.key === 'Enter') { ev.preventDefault(); saveSessionModel(); }
-    });
+    p.querySelector('#zca-pin-model').addEventListener('click', pinModel);
+    p.querySelector('#zca-use-global').addEventListener('click', useGlobalModel);
+    // 服务商切换：模型下拉跟随刷新（登记清单）
+    p.querySelector('#zca-provider-sel').addEventListener('change', () => fillModels());
     // 完整配置：全局配置的唯一 GUI 载体（宿主不渲染插件设置表单，见 panel.cjs 头注释）。
     // 令牌经 URL hash 传递：不进服务器日志、不落 referer（GET /panel 本身不含敏感数据）。
     p.querySelector('#zca-fullpanel').addEventListener('click', () => {
