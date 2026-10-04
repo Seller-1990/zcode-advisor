@@ -802,14 +802,20 @@ function effectiveTarget(body) {
   }
   const model = String(modelWant || (prov && prov.models[0]) || '').trim();
   const usable = Boolean(prov && !prov.official && prov.eligible && prov.baseURL && prov.apiKey);
-  const reason = !prov ? (providerWant ? 'provider_not_found' : 'provider_missing')
-    : (prov.official ? 'provider_official'
-      : (!prov.eligible ? 'provider_ineligible'
-        : (!prov.baseURL || !prov.apiKey ? 'provider_incomplete'
-          : (!model ? 'no_model' : ''))));
+  // 分层原因：先判「服务商本身能不能用」（usable），再判「模型是否定得下来」（model）。
+  // 分开的原因是「从端点拉取模型」这条路径**恰恰用于模型还没定下来的时候**——
+  // 端点/key 必须给得出去，否则用户永远拉不到清单（曾把两者混在 baseUrl 的赋值里，
+  // 导致 model 为空时 baseUrl 也被清空，拉取功能整体失效）。
+  let reason = '';
+  if (!prov) reason = providerWant ? 'provider_not_found' : 'provider_missing';
+  else if (prov.official) reason = 'provider_official';
+  else if (!prov.eligible) reason = 'provider_ineligible';
+  else if (!prov.baseURL || !prov.apiKey) reason = 'provider_incomplete';
+  else if (!model) reason = 'no_model';
   return {
-    baseUrl: usable && model ? prov.baseURL : '',
-    apiKey: usable && model ? prov.apiKey : '',
+    // 凭据随「服务商可用」给出（不含 model 条件）；真正发起审查调用的一方自己保证 model 非空。
+    baseUrl: usable ? prov.baseURL : '',
+    apiKey: usable ? prov.apiKey : '',
     model,
     providerId: prov ? prov.id : '',
     providerName: prov ? (prov.name || prov.id) : '',

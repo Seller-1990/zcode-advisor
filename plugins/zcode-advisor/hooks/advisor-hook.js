@@ -20,7 +20,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const {
-  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey, isPlaceholderKey,
+  loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey,
   readZcodeProviders, resolveProviderTarget
 } = require('./lib/config');
 const {
@@ -147,7 +147,10 @@ function resolveTarget(cfg, state, env) {
     providerName: t.ok ? (t.provider.name || t.provider.id) : '',
     providerSource: sessionProvider ? 'session-override' : (t.ok && t.auto ? 'auto' : 'global'),
     modelSource: sessionModel ? 'session-override' : 'global',
-    problems: t.ok ? [] : [t.problem]
+    problems: t.ok ? [] : [t.problem],
+    // 透传服务商解析的提示（自动选择 / 模型不在登记清单里）——此前丢掉，
+    // 导致 status 里看不到「其实是自动挑的」这类信息。
+    notices: t.ok ? (t.notices || []) : []
   };
 
   // 2) env 逃生舱最后覆盖（显式、且只影响本次进程）。
@@ -181,7 +184,6 @@ function resolveTarget(cfg, state, env) {
 }
 
 // 兼容旧签名（reviewTurn 消费方仍读扁平 baseUrl/apiKey/model）。
-// 兼容旧签名（reviewTurn 消费方仍读扁平 baseUrl/apiKey/model）。
 // apiKeyInfo 形参已不再使用——凭据一律由 resolveTarget 从服务商解析得到；
 // 保留位置参数是为了不动现有调用点（改动面越小越安全）。
 function effectiveApi(cfg, apiKeyInfo, state) {
@@ -204,8 +206,6 @@ function isStopHookActive(input) {
   return v === true || String(v).toLowerCase() === 'true' || v === 1 || v === '1';
 }
 
-// 控制面提示行（不受审查门禁、也不受会话启停约束——它是命令定位与可观测性的载体，
-// 停用/缺 key 的会话必须仍能用 /advisor-on、/advisor-status 自救）。
 // 控制面提示行（不受审查门禁、也不受会话启停约束——它是命令定位与可观测性的载体，
 // 停用/缺 key 的会话必须仍能用 /advisor-on、/advisor-status 自救）。
 // state 必须传入：门禁按**会话生效值**评估（全局服务商解析失败但本会话已覆盖时不能误报）。
@@ -279,7 +279,9 @@ function reviewBudgetMs(cfg) {
 // 端点故障/限流/超时/与模型无关的错**不触发**——换模型只会加剧或无效。
 const FALLBACK_TRIGGER_REASONS = new Set(['llm_empty_response', 'unparsed', 'llm_http_404']);
 
-// 备用模型的目标解析：会话级 sessionFallbackModel 优先，其次全局 cfg.fallbackModel。
+// 备用模型的目标解析：全局 cfg.fallbackModel。
+// （0.2.17 起没有会话级备用模型——旧 /advisor-api 的 fallback: 覆盖已随该命令删除；
+//  state.sessionFallbackModel 也不再写入，读取仅作向后兼容。）
 function resolveFallbackModel(cfg, state) {
   const s = state && typeof state === 'object' ? state : {};
   const sess = String(s.sessionFallbackModel || '').trim();
@@ -297,10 +299,16 @@ function fallbackEligibility(cfg, state, eff) {
   const model = resolveFallbackModel(cfg, state);
   if (!model) return { ok: false, reason: 'no_fallback_model' };
   if (cfg.reviewMode === 'sync') return { ok: false, reason: 'fallback_skipped:sync_mode' };
+  // sessionProvider 可以是 id 或名称（面板/命令都容忍写名称），而 cfg.providerId 恒为 id——
+  // 因此不能只比 id。用 eff.providerId（会话生效值解析出的真实 id）与全局 id 比较。
   const sessProvider = String((state && state.sessionProvider) || '').trim();
-  const globalProvider = String((cfg && cfg.providerId) || '').trim();
-  if (sessProvider && sessProvider !== globalProvider) {
-    return { ok: false, reason: 'fallback_skipped:session_provider' };
+  if (sessProvider) {
+    const sessResolved = String((eff && eff.providerId) || '').trim();
+    const globalProvider = String((cfg && cfg.providerId) || '').trim();
+    // 两者都解析出来了就比真实 id；会话解析不出（无效服务商）时保守跳过降级。
+    if (!sessResolved || (globalProvider && sessResolved !== globalProvider)) {
+      return { ok: false, reason: 'fallback_skipped:session_provider' };
+    }
   }
   if (model === eff.model) return { ok: false, reason: 'fallback_same_model' };
   return { ok: true, model };
@@ -1195,6 +1203,7 @@ async function handleCtl(args) {
     // 会话生效值解析出的问题（如 env 逃生舱只给了一半 → env_override_incomplete）：
     // 与 cfg.problems 分开显示，否则这类「会话侧才成立」的问题在 status 里完全不可见。
     for (const p of eff.problems || []) lines.push(`  配置问题: ${p}`);
+    for (const n of eff.notices || []) lines.push(`  配置提示: ${n}`);
     // 告警按会话生效端点评估：会话把端点覆盖成 http:// 或把官方 key 指到第三方时
     // 必须能告警出来；全局告警也不应误报到已被覆盖的配置上。
     // 注意第二参必须是 { key, source } 显式对象——configWarnings 读的是 apiKeyInfo.source，
@@ -1235,8 +1244,7 @@ async function handleCtl(args) {
   }
 
   // 会话级审查目标：本会话固定服务商/模型（或恢复全局默认）。
-  // 用法：model | model set <model-id> [provider:<id|名称>] | model reset
-  //       model provider <id|名称>（只换服务商） | model reset-provider
+  // 用法：model | model set <model-id> [provider:<id|名称>] | model provider <id|名称> | model reset
   // 端点/key 永远来自服务商解析——本命令不接受也不存储任何端点/key。
   if (sub === 'model') {
     const action = args[1] || '';
@@ -1344,6 +1352,7 @@ async function ctlDoctor(cfg, args, state) {
   for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);
   for (const p of eff.problems || []) lines.push(`  配置问题: ${p}`);
   for (const n of cfg.notices || []) lines.push(`  配置提示: ${n}`);
+  for (const n of eff.notices || []) lines.push(`  配置提示: ${n}`);
   for (const w of configWarnings({ baseUrl: eff.baseUrl }, { key: eff.apiKey, source: eff.keySource })) lines.push(`  配置警告: ${w}`);
   process.stdout.write(lines.join('\n') + '\n');
 

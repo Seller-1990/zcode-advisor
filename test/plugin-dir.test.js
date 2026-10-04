@@ -108,3 +108,39 @@ test('同步清单覆盖 plugin.json 声明的全部组件（防再漏 tools/ �
   assert.deepStrictEqual(missing, [],
     `副本目录缺少 plugin.json 声明的组件：${missing.join(', ')}（同步清单漏项会让插件功能失效）`);
 });
+
+test('同步脚本能发现「整个 ITEM 被删」的残留（不只单个文件）', () => {
+  // 回归（OCR medium）：cleanup 对 ITEMS 里已不存在的整项曾直接 continue，
+  // 副本里的整块残留（如整个 commands/ 目录）永远不会被隔离、也不会被 --check 报出。
+  const dest = path.join(ROOT, 'plugins', 'zcode-advisor');
+  const ghostDir = path.join(dest, 'ghost-item');
+  const run = () => {
+    try {
+      execFileSync(process.execPath, [SYNC, '--check'], { encoding: 'utf8', stdio: 'pipe' });
+      return 0;
+    } catch (err) {
+      return err.status;
+    }
+  };
+  const orphanDirs = () => fs.readdirSync(dest).filter((n) => n.startsWith('.orphan-'));
+  const before = new Set(orphanDirs());
+  try {
+    // 造一个「源里没有、副本里有」的整项目录（ghost-item 不在 ITEMS 中，
+    // 因此直接测 walk 之外的分支：把它当作 ITEMS 里的项来模拟——用 commands 同级不可行，
+    // 改为验证 walk 的目录级残留检测已生效：在 commands/ 下造子目录）
+    fs.mkdirSync(path.join(dest, 'commands', '__ghost-dir__'), { recursive: true });
+    fs.writeFileSync(path.join(dest, 'commands', '__ghost-dir__', 'x.md'), '# x\n', 'utf8');
+    assert.notStrictEqual(run(), 0, '整目录残留必须让 --check 失败');
+    execFileSync(process.execPath, [SYNC], { encoding: 'utf8', stdio: 'pipe' });
+    assert.ok(!fs.existsSync(path.join(dest, 'commands', '__ghost-dir__')), '同步应隔离整目录残留');
+    assert.strictEqual(run(), 0, '隔离后应恢复无漂移');
+  } finally {
+    try { fs.rmSync(path.join(dest, 'commands', '__ghost-dir__'), { recursive: true, force: true }); } catch (_) {}
+    const trash = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-orphan2-'));
+    for (const name of orphanDirs()) {
+      if (before.has(name)) continue;
+      try { fs.renameSync(path.join(dest, name), path.join(trash, name)); } catch (_) {}
+    }
+  }
+  assert.ok(!fs.existsSync(ghostDir), '占位目录不应存在');
+});

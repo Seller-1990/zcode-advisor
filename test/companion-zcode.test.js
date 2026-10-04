@@ -115,3 +115,27 @@ test('saveUserConfig：只接受白名单键，旧版 apiSource/zcodeModel 被�
   assert.strictEqual(bad.zcodeModel, undefined);
   assert.strictEqual(bad.zcodeProvider, 'p1', '兄弟键不受影响');
 });
+
+test('effectiveTarget：「从端点拉取」场景——模型未定时仍必须给出端点/key（否则拉取永远失败）', () => {
+  // 回归（OCR high）：baseUrl/apiKey 曾被 `usable && model` 卡住，而「从端点拉取」
+  // 恰恰用于模型还没定下来的时候（登记清单为空/滞后）——端点给不出去就永远拉不到。
+  const v2 = JSON.parse(fs.readFileSync(V2_CFG, 'utf8'));
+  v2.provider.p3 = {
+    name: '空清单网关', kind: 'openai-compatible',
+    options: { baseURL: 'http://10.0.0.9:8088/v1', apiKey: 'sk-p3' },
+    models: {} // 登记清单为空：用户只能靠「从端点拉取」
+  };
+  fs.writeFileSync(V2_CFG, JSON.stringify(v2));
+  try {
+    fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'p3' }));
+    const t = controller.effectiveTarget({ zcodeProvider: 'p3', zcodeFetch: true });
+    assert.strictEqual(t.providerUsable, true, '服务商本身可用');
+    assert.strictEqual(t.model, '', '模型未定');
+    assert.strictEqual(t.providerError, 'no_model', '原因应精确指向「没有模型」而非服务商不可用');
+    assert.strictEqual(t.baseUrl, 'http://10.0.0.9:8088/v1', '端点必须给得出去（拉取模型要用）');
+    assert.strictEqual(t.apiKey, 'sk-p3', 'key 必须给得出去（拉取模型要用）');
+  } finally {
+    delete v2.provider.p3;
+    fs.writeFileSync(V2_CFG, JSON.stringify(v2));
+  }
+});

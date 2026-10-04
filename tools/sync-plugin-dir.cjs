@@ -59,8 +59,13 @@ function check() {
   const diffs = [];
   for (const item of ITEMS) {
     const src = path.join(ROOT, item);
-    if (!fs.existsSync(src)) continue;
-    diffTree(src, path.join(DEST, item), item, diffs);
+    const dest = path.join(DEST, item);
+    // 整个 ITEM 在源里已不存在：副本里若还留着就是漂移（否则宿主会装出已被删除的整块内容）
+    if (!fs.existsSync(src)) {
+      if (fs.existsSync(dest)) diffs.push(`多余（源已删除）: ${item}`);
+      continue;
+    }
+    diffTree(src, dest, item, diffs);
   }
   return diffs;
 }
@@ -131,17 +136,37 @@ function quarantineOrphans() {
         const target = path.join(bin, relPath);
         fs.mkdirSync(path.dirname(target), { recursive: true });
         try { fs.renameSync(destPath, target); moved++; } catch (_) {}
-      } else if (fs.statSync(destPath).isDirectory()) {
-        walk(path.join(srcDir, name), destPath, relPath);
+        continue;
       }
+      // statSync 必须守卫：readdirSync 与 statSync 之间条目可能被并发删掉
+      //（杀毒/索引器/用户手动操作），未守卫会抛错并让整轮隔离中止。
+      let isDir = false;
+      try { isDir = fs.statSync(destPath).isDirectory(); } catch (_) { continue; }
+      if (isDir) walk(path.join(srcDir, name), destPath, relPath);
     }
   };
   for (const item of ITEMS) {
     const src = path.join(ROOT, item);
-    if (!fs.existsSync(src)) continue;
     const dest = path.join(DEST, item);
-    if (!fs.existsSync(dest)) continue;
-    if (fs.statSync(src).isDirectory() && fs.statSync(dest).isDirectory()) walk(src, dest, item);
+    // 整项在源里已不存在（如整个 commands/ 目录被移除）时，副本里的残留必须一并隔离——
+    // 此前 `if (!fs.existsSync(src)) continue;` 直接跳过，残留会永远留在副本里被宿主装出去。
+    if (!fs.existsSync(src)) {
+      if (fs.existsSync(dest)) {
+        const target = path.join(bin, item);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        try { fs.renameSync(dest, target); moved++; } catch (_) {}
+      }
+      continue;
+    }
+    let srcIsDir = false;
+    let destIsDir = false;
+    try { srcIsDir = fs.statSync(src).isDirectory(); } catch (_) { continue; }
+    try { destIsDir = fs.existsSync(dest) && fs.statSync(dest).isDirectory(); } catch (_) {}
+    if (srcIsDir && destIsDir) walk(src, dest, item);
+    else if (!srcIsDir && fs.existsSync(dest)) {
+      // 单文件项：内容不同由 copyIfChanged 处理，这里只处理类型冲突（源是文件、目标是目录）
+      try { if (fs.statSync(dest).isDirectory()) { fs.renameSync(dest, path.join(bin, item)); moved++; } } catch (_) {}
+    }
   }
   if (moved === 0) { try { fs.rmdirSync(bin); } catch (_) {} }
   return moved;

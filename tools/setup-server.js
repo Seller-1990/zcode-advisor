@@ -49,11 +49,10 @@ function saveUserConfig(patch) {
     const mt = parseInt(patch.maxTokens, 10);
     if (Number.isFinite(mt) && mt >= 64 && mt <= 16384) allowed.maxTokens = mt;
   }
-  // 旧版残留（手动端点/key/来源）一并清除：0.2.17 起插件配置不参与端点/key 解析，
-  // 留着只会让用户误以为它们还在生效（且明文 key 留在盘上是纯风险）。
-  const r = writeUserConfig(allowed);
-  if (r && r.ok !== false && !r.lockTimeout && !r.error) removeUserConfigKeys(['apiKey', 'baseUrl', 'apiSource', 'zcodeModel'], USER_CONFIG);
-  return r;
+  // 旧版残留（手动端点/key/来源）由 writeUserConfig 在写盘时统一清除（0.2.17）——
+  // 这里不再重复调 removeUserConfigKeys：那是第二次读-改-写，会多占一次配置锁，
+  // 且失败时状态与返回值不一致（writeUserConfig 已保证清理）。
+  return writeUserConfig(allowed);
 }
 
 function esc(s) {
@@ -284,6 +283,8 @@ const server = http.createServer((req, res) => {
     return;
   }
   // 清除历史遗留的手动 apiKey（0.2.17 起本插件不再维护 key；保留此端点用于清理旧配置残留）。
+  // 注意：页面上**没有**对应按钮（0.2.17 已移除「清除 key」UI），这是有意保留的无 UI 端点——
+  // 升级用户盘上可能还有 0.2.16 写入的明文 key，脚本/curl 可一键清掉；幂等、且只删这一个键。
   if (req.method === 'POST' && req.url === '/api/clear-key') {
     if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';

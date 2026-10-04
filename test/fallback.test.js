@@ -64,7 +64,30 @@ test('eligibility：会话换到了别的服务商 → 禁用（凭据边界）'
   // 备用模型若沿用主模型凭据会打到别的服务商，因此跳过。
   const state = { sessionProvider: 'prov-b', sessionModel: '' };
   const r = H.fallbackEligibility(
-    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state, { model: 'primary-model', hasOverride: true });
+    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state,
+    { model: 'primary-model', hasOverride: true, providerId: 'prov-b' });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'fallback_skipped:session_provider');
+});
+
+test('eligibility：会话写的是服务商**名称**、解析出的 id 与全局相同 → 不算换服务商', () => {
+  const H = require('../hooks/advisor-hook');
+  // sessionProvider 容忍写名称（面板/命令都允许），cfg.providerId 恒为 id：
+  // 必须用 eff.providerId（真实解析结果）比较，否则「写名称」会被误判成换了服务商。
+  const state = { sessionProvider: '第三方网关', sessionModel: 'model-x' };
+  const r = H.fallbackEligibility(
+    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state,
+    { model: 'model-x', hasOverride: true, providerId: 'prov-a' });
+  assert.strictEqual(r.ok, true, '名称解析成同一个 id 时不应误判');
+  assert.strictEqual(r.model, 'fb');
+});
+
+test('eligibility：会话指定的服务商解析不出（无效）→ 保守跳过降级', () => {
+  const H = require('../hooks/advisor-hook');
+  const state = { sessionProvider: 'no-such-provider', sessionModel: '' };
+  const r = H.fallbackEligibility(
+    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state,
+    { model: 'primary-model', hasOverride: true, providerId: '' });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.reason, 'fallback_skipped:session_provider');
 });
@@ -73,17 +96,19 @@ test('eligibility：只覆盖模型、服务商仍是全局那个 → 降级照�
   const H = require('../hooks/advisor-hook');
   const state = { sessionProvider: '', sessionModel: 'model-x' };
   const r = H.fallbackEligibility(
-    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state, { model: 'model-x', hasOverride: true });
+    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state,
+    { model: 'model-x', hasOverride: true, providerId: 'prov-a' });
   assert.strictEqual(r.ok, true, '同服务商下换模型不应丢掉降级能力');
   assert.strictEqual(r.model, 'fb');
 });
 
-test('eligibility：会话服务商与全局解析出的服务商相同（显式写了一遍）→ 仍可用', () => {
+test('eligibility：会话显式写了与全局相同的服务商 id → 仍可用', () => {
   const H = require('../hooks/advisor-hook');
   const state = { sessionProvider: 'prov-a', sessionModel: 'model-x' };
   const r = H.fallbackEligibility(
-    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state, { model: 'model-x', hasOverride: true });
-  assert.strictEqual(r.ok, true, '同名服务商不算换服务商');
+    mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }), state,
+    { model: 'model-x', hasOverride: true, providerId: 'prov-a' });
+  assert.strictEqual(r.ok, true, '同一个服务商不算换服务商');
 });
 
 test('eligibility：备用与主模型同名 → 不可用（换了个寂寞）', () => {

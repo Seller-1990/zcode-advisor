@@ -15,7 +15,7 @@ const DEFAULTS = {
   // zcodeProvider：全局服务商（id 或名称）；留空 = 自动选择（优先含 cfg.model 的服务商）。
   zcodeProvider: '',
   // 全局审查模型（id）。留空 = 取所选服务商登记清单首项。
-  // 会话级覆盖：state.sessionModel / state.sessionZcodeProvider（角标面板或 /advisor-model）。
+  // 会话级覆盖：state.sessionProvider / state.sessionModel（角标面板或 /advisor-model）。
   model: '',
   // 环境变量逃生舱（CI/测试/特殊部署）：ZCODE_ADVISOR_BASE_URL/API_KEY/MODEL 显式覆盖解析结果。
   // 注意：baseUrl/apiKey **不是**可落盘配置键（applyLayer 只拷贝 DEFAULTS 里登记的键）——

@@ -459,7 +459,9 @@
         const s = await api('/api/session');
         session = (s && s.ok) ? s : null;
       } catch (_) { session = null; }
-      if (!providers) await loadProviders();
+      // 服务商清单每次打开面板都重读：用户在 ZCode 设置里改过服务商后，
+      // 不重开会话也能在下拉里看到新列表（此前只加载一次，列表会被缓存到面板生命周期结束）。
+      await loadProviders();
       const c = curCfg;
       const st = document.getElementById('zca-status');
       // 状态行只读展示：当前生效目标 + 来源 + 会话标注。

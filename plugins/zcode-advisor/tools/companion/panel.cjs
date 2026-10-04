@@ -151,6 +151,10 @@ details summary:hover{color:#e6e8ec}
     const want = curCfg && curCfg.model;
     if (want && list.includes(want)) sel.value = want;
     else if (list.length) sel.value = list[0];
+    // 模型清单刚被换过（切服务商 / 拉取实时清单）：手填框里的旧值不再代表用户意图，
+    // 不清空会盖住用户接下来在下拉里的选择（currentModelId 手填优先）。
+    const manual = $('modelManual');
+    if (manual && manual.value && !list.includes(String(manual.value).trim())) manual.value = '';
     $('zendpoint').textContent = p ? ('端点：' + (p.baseURL || '（该服务商未配置 baseURL）')) : '先在 ZCode 设置里添加 OpenAI 兼容服务商';
   }
 
@@ -166,6 +170,9 @@ details summary:hover{color:#e6e8ec}
     } catch (e) { msg('拉取失败：' + (e && e.message || e), false); }
   }
 
+  // 当前选中的模型：手填框**优先于**下拉，因为手填是「清单里没有」时的显式意图。
+  // 但手填框必须在下拉变化时清空——否则用户先手填过一个、之后又在下拉里选了别的，
+  // 保存的仍会是那个陈旧的手填值（静默忽略用户刚做的选择）。
   function currentModelId() {
     const fromSel = $('zmodel').value ? String($('zmodel').value).trim() : '';
     const fromManual = $('modelManual').value ? String($('modelManual').value).trim() : '';
