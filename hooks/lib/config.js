@@ -286,9 +286,20 @@ function loadConfig(pluginRoot, env) {
   // 服务商解析：端点/key/模型一次定稿（全局层）。env 逃生舱在下一段覆盖。
   applyZcodeTarget(cfg, problems, sources, notices, env);
 
-  if (env.ZCODE_ADVISOR_BASE_URL) cfg.baseUrl = env.ZCODE_ADVISOR_BASE_URL;
+  // env 逃生舱覆盖全局层。**端点与 key 必须成对**（与 advisor-hook 的 resolveTarget 同一纪律）：
+  // 只覆盖其一会把服务商 A 的 key 发往 env 端点（或反之）——这正是 0.2.17 要消灭的密钥交叉。
+  // 只给了一半时整体不覆盖，并挂 problem 让用户看见（不静默）。
+  const envBase = env.ZCODE_ADVISOR_BASE_URL ? String(env.ZCODE_ADVISOR_BASE_URL) : '';
+  const envKeyRaw = env.ZCODE_ADVISOR_API_KEY ? String(env.ZCODE_ADVISOR_API_KEY) : '';
+  // 占位符样式的 env key 视为未配置（防 `test-*`/`your-api-key` 这类误配被当真 key 发出去）
+  const envKey = envKeyRaw && !isPlaceholderKey(envKeyRaw) ? envKeyRaw : '';
+  if (envBase && envKey) {
+    cfg.baseUrl = envBase;
+    cfg.apiKey = envKey;
+  } else if (envBase || envKeyRaw) {
+    problems.push(`env_override_incomplete: 环境变量只提供了 ${envBase ? 'ZCODE_ADVISOR_BASE_URL' : 'ZCODE_ADVISOR_API_KEY'}（或 key 形似占位符）——端点与 key 必须成对且真实，为避免密钥交叉本次不生效`);
+  }
   if (env.ZCODE_ADVISOR_MODEL) cfg.model = env.ZCODE_ADVISOR_MODEL;
-  if (env.ZCODE_ADVISOR_API_KEY) cfg.apiKey = env.ZCODE_ADVISOR_API_KEY;
   if (env.ZCODE_ADVISOR_REVIEW_MODE) cfg.reviewMode = env.ZCODE_ADVISOR_REVIEW_MODE === 'sync' ? 'sync' : 'async';
   if (env.ZCODE_ADVISOR_FALLBACK_MODEL != null) cfg.fallbackModel = String(env.ZCODE_ADVISOR_FALLBACK_MODEL).trim();
   for (const k of INT_KEYS) {

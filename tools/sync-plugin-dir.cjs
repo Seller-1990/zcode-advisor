@@ -125,11 +125,30 @@ function copyIfChanged(src, dest) {
 // 清理「源已删除、副本残留」的幽灵文件。
 // 不直接删除：移入副本内的 .orphan-<时间戳>/ 隔离目录（等价回收站语义，误删可回捞），
 // 该目录名以 . 开头且不参与 ITEMS 递归，不会被后续同步当成插件内容。
-// 返回清理条数。宿主按目录拷贝，残留的旧命令文档/旧代码会被真的装进去——必须清。
+// 返回 { moved, failed }。宿主按目录拷贝，残留的旧命令文档/旧代码会被真的装进去——必须清。
+// ⚠️ rename 失败**绝不静默吞掉**：早期实现 `try{rename}catch(_){}` 会让函数谎报"已隔离"，
+// 幽灵文件其实还在 DEST 里、照样被宿主装出去（这正是本功能要防的事，反而被掩盖）。
+// 失败项收集到 failed 里由调用方报出并以非零退出码结束（CI/测试能拦住）。
 function quarantineOrphans() {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const bin = path.join(DEST, `.orphan-${stamp}`);
   let moved = 0;
+  const failed = [];
+  const retire = (from, relPath) => {
+    const target = path.join(bin, relPath);
+    try {
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      // rename 在目标已存在（EEXIST/EPERM，Windows 常见）或跨卷时失败：
+      // 先清掉残留目标再重试一次，仍失败则记录（而不是假装成功）。
+      try { fs.rmSync(target, { recursive: true, force: true }); } catch (_) {}
+      fs.renameSync(from, target);
+      moved++;
+      return true;
+    } catch (err) {
+      failed.push(`${relPath}（${(err && err.code) || err}）`);
+      return false;
+    }
+  };
   const walk = (srcDir, destDir, rel) => {
     let srcNames = [];
     try { srcNames = fs.readdirSync(srcDir); } catch (_) { return; }
@@ -140,9 +159,7 @@ function quarantineOrphans() {
       const destPath = path.join(destDir, name);
       const relPath = path.join(rel, name);
       if (!srcNames.includes(name)) {
-        const target = path.join(bin, relPath);
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        try { fs.renameSync(destPath, target); moved++; } catch (_) {}
+        retire(destPath, relPath);
         continue;
       }
       // statSync 必须守卫：readdirSync 与 statSync 之间条目可能被并发删掉
@@ -158,11 +175,7 @@ function quarantineOrphans() {
     // 整项在源里已不存在（如整个 commands/ 目录被移除）时，副本里的残留必须一并隔离——
     // 此前 `if (!fs.existsSync(src)) continue;` 直接跳过，残留会永远留在副本里被宿主装出去。
     if (!fs.existsSync(src)) {
-      if (fs.existsSync(dest)) {
-        const target = path.join(bin, item);
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        try { fs.renameSync(dest, target); moved++; } catch (_) {}
-      }
+      if (fs.existsSync(dest)) retire(dest, item);
       continue;
     }
     let srcIsDir = false;
@@ -172,11 +185,11 @@ function quarantineOrphans() {
     if (srcIsDir && destIsDir) walk(src, dest, item);
     else if (!srcIsDir && fs.existsSync(dest)) {
       // 单文件项：内容不同由 copyIfChanged 处理，这里只处理类型冲突（源是文件、目标是目录）
-      try { if (fs.statSync(dest).isDirectory()) { fs.renameSync(dest, path.join(bin, item)); moved++; } } catch (_) {}
+      try { if (fs.statSync(dest).isDirectory()) retire(dest, item); } catch (_) {}
     }
   }
-  if (moved === 0) { try { fs.rmdirSync(bin); } catch (_) {} }
-  return moved;
+  if (moved === 0 && failed.length === 0) { try { fs.rmdirSync(bin); } catch (_) {} }
+  return { moved, failed };
 }
 
 function sync() {
@@ -186,10 +199,19 @@ function sync() {
     if (!fs.existsSync(src)) continue;
     copyIfChanged(src, path.join(DEST, item));
   }
-  const moved = quarantineOrphans();
+  const { moved, failed } = quarantineOrphans();
   if (moved > 0) {
     process.stdout.write(`[sync-plugin] 隔离 ${moved} 个源已删除的残留文件（副本内 .orphan-* 目录）\n`);
   }
+  if (failed.length > 0) {
+    // 隔离失败 = 幽灵文件仍在副本里、会被宿主装出去。必须报错且非零退出，
+    // 不能只写一行提示（否则 CI/测试看不见、用户也以为干净了）。
+    process.stderr.write(`[sync-plugin] ✗ ${failed.length} 个残留文件隔离失败（仍留在副本目录，会被宿主装出）：\n`);
+    for (const f of failed) process.stderr.write(`  - ${f}\n`);
+    process.stderr.write('  请手动移走这些文件（如权限/占用问题），再重跑同步\n');
+    return 1;
+  }
+  return 0;
 }
 
 function main() {
@@ -205,7 +227,8 @@ function main() {
     process.stderr.write('  运行 node tools/sync-plugin-dir.cjs 修复\n');
     return 1;
   }
-  sync();
+  const rc = sync();
+  if (rc !== 0) return rc;
   process.stdout.write('[sync-plugin] 已同步 plugins/zcode-advisor/\n');
   return 0;
 }

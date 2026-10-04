@@ -130,6 +130,10 @@ function page() {
 <script>
 // 自带请求函数且走 GET：服务端 /api/history 只收 GET（POST 会 404），
 // 且本 IIFE 先于底部主脚本执行，引用主脚本的 post 会 ReferenceError（实测截图抓到）
+// ⚠️ 本段在**浏览器**里执行：服务端那个 esc() 属 Node 作用域，在这里**不存在**。
+// 历史行是拼 innerHTML 的，必须自带转义函数——曾直接调 esc() 导致 ReferenceError，
+// 整个历史区渲染失败、只显示"读取失败"。本页能改写配置，不可给注入留口。
+const esc=(v)=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 (async()=>{
   const getJSON=async(url)=>{const r=await fetch(url);return r.json();};
   try{
