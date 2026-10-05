@@ -388,3 +388,22 @@ test('MAC_INSTALL_SH：装配 .app 后剥离 quarantine（否则 macOS 15 双击
   assert.match(sh, /未能自动移除隔离属性/, '失败时应提示');
   assert.match(sh, /隐私与安全性/, '应给出系统设置路径作为兜底说明');
 });
+
+test('MAC_FIRST_INSTALL：DMG 卷内「首次安装.command」关键行为', () => {
+  // DMG 是纯拖拽分发，没有任何脚本执行机会 → .app 带着下载来的 quarantine 落进
+  // /Applications，被 Gatekeeper 拦。这个 .command 给用户一条"双击/一命令即修好"的路径。
+  const sh = T.MAC_FIRST_INSTALL('0.2.20');
+  assert.match(sh, /^#!\/bin\/bash/, '应是 bash 脚本');
+  // 装到 /Applications（DMG 的落点），而不是 install.sh 的 ~/Applications
+  assert.match(sh, /APP_DST="\/Applications\/ZCode Advisor\.app"/, '目标应是 /Applications');
+  // 核心作用：剥离目标 .app 的隔离属性
+  assert.match(sh, /xattr -dr com\.apple\.quarantine "\$APP_DST"/, '应剥离目标 app 的 quarantine');
+  // 自保：先去掉自身的隔离属性，这样"经 bash 跑过一次"后双击也能执行
+  assert.match(sh, /xattr -dr com\.apple\.quarantine "\$0"/, '应先去自身的 quarantine');
+  // 失败要有可操作指引（不留"装不上又不知道怎么办"）
+  assert.match(sh, /隐私与安全性/, '应给出系统设置兜底路径');
+  assert.match(sh, /xattr -dr com\.apple\.quarantine/, '应给出明确的 xattr 命令');
+  assert.match(sh, /按回车关闭/, '报错后应等待用户看到信息（不是闪退）');
+  // 版本号应被替换（模板占位由调用方传入）
+  assert.ok(sh.includes('0.2.20'), '应含传入的版本号');
+});

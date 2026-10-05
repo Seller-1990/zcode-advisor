@@ -371,7 +371,8 @@ async function buildMac(arch, opts) {
         const r = P.buildDmg({
           stageDir: stage,
           outFile: dmgPath,
-          volumeName: `ZCode Advisor ${VERSION}`
+          volumeName: `ZCode Advisor ${VERSION}`,
+          version: VERSION
         });
         if (r.ok) {
           log(`产物：${path.basename(dmgPath)}（${(r.bytes / 1048576).toFixed(1)} MB，DMG 安装包）`);

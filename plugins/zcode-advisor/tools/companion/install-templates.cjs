@@ -211,12 +211,81 @@ echo "已配置登录自启动（LaunchAgent: ~/Library/LaunchAgents/local.zcode
 echo "打开应用即以角标模式启动 ZCode；日志：~/.zcode/advisor-companion.log"
 `;
 
+// DMG 卷内的「首次安装.command」：DMG 是纯拖拽分发，**没有任何脚本执行机会**，
+// 因此.app 会带着下载来的 com.apple.quarantine 落进 /Applications，
+// macOS 15 的 Gatekeeper 会拒绝启动（提示「无法验证开发者」）。
+// 本脚本给用户一条"双击即修好"的路径：把 .app 拷进 /Applications 并剥掉隔离属性。
+//
+// ⚠️ 已知局限（实测记录，勿夸大效果）：
+//   从浏览器下载的 DMG 挂载后，卷内文件**会**继承 quarantine（实测：DMG 本体打标后，
+//   把卷内 .command 复制出来，其 xattr 也带 com.apple.quarantine），
+//   因此这个 .command **本身也可能被同一机制拦下**（spctl 对它报 rejected）。
+//   本机实测 `open` 能执行它，但那是在已被放行的终端上下文里，不等价于 Finder 双击 ——
+//   所以双击若仍被拦，用户在 Terminal 里执行下面这行即可（bash 解释执行不经 Gatekeeper）：
+//     bash "/Volumes/ZCode Advisor <版本>/首次安装.command"
+//   脚本第一段就是"去掉自身的隔离属性"，因此经 bash 跑过一次后，双击也会正常。
+const MAC_FIRST_INSTALL = (version) => `#!/bin/bash
+# ZCode Advisor 首次安装（v${version}）
+# 作用：把同卷的 .app 装进 /Applications，并剥掉 Gatekeeper 隔离属性，
+# 让此后双击应用不再提示「无法验证开发者」。
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+APP_SRC="$HERE/ZCode Advisor.app"
+APP_DST="/Applications/ZCode Advisor.app"
+
+echo "ZCode Advisor ${version} — 首次安装"
+echo
+
+# ── 先自保：去掉本脚本自身的隔离属性 ──
+# 这样"经 bash 跑过一次"之后，后续双击也能正常执行。
+if command -v xattr >/dev/null 2>&1; then
+  xattr -dr com.apple.quarantine "$0" 2>/dev/null || true
+fi
+
+if [ ! -d "$APP_SRC" ]; then
+  echo "[错误] 同目录下找不到 ZCode Advisor.app，请确认从 DMG 卷内运行本脚本。" >&2
+  read -r -p "按回车关闭…" _ || true
+  exit 1
+fi
+
+# ── 拷贝到 /Applications（覆盖旧版）──
+if [ -d "$APP_DST" ]; then
+  echo "检测到已安装的旧版本，正在替换…"
+  rm -rf "$APP_DST"
+fi
+if cp -R "$APP_SRC" "$APP_DST" 2>/dev/null; then
+  echo "已安装到 /Applications"
+else
+  echo "[错误] 复制到 /Applications 失败（可能没有写权限）。" >&2
+  echo "        请改用拖拽方式把 .app 拖进「应用程序」，然后手动执行：" >&2
+  echo "        xattr -dr com.apple.quarantine \\"$APP_DST\\"" >&2
+  read -r -p "按回车关闭…" _ || true
+  exit 1
+fi
+
+# ── 剥离隔离属性：这一步才是"双击不再被拦"的关键 ──
+if command -v xattr >/dev/null 2>&1 && xattr -dr com.apple.quarantine "$APP_DST" 2>/dev/null; then
+  echo "已移除 Gatekeeper 隔离属性"
+else
+  echo "[提示] 未能自动移除隔离属性，若双击仍提示无法验证开发者，请执行：" >&2
+  echo "        xattr -dr com.apple.quarantine \\"$APP_DST\\"" >&2
+  echo "        或：系统设置 → 隐私与安全性 → 仍要打开" >&2
+fi
+
+echo
+echo "安装完成。现在可以："
+echo "  1) 退出本 DMG（在 Finder 侧边栏推出 ZCode Advisor ${version}）"
+echo "  2) 打开「应用程序」里的 ZCode Advisor（会自动配置登录自启动与角标）"
+read -r -p "按回车关闭…" _ || true
+`;
+
 module.exports = {
   INSTALL_SHORTCUT_VBS,
   INSTALL_CMD,
   winReadme,
   macReadme,
   MAC_INSTALL_SH,
+  MAC_FIRST_INSTALL,
   MAC_BUILD_INFO: (arch, embedded) => `zcode-advisor 发行包（macOS）
 version: ${VERSION}
 arch: ${arch}
