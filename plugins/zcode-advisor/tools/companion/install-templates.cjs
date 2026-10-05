@@ -188,6 +188,24 @@ nohup "$NODE" "$SUPPORT/controller.cjs" >>"$LOG" 2>&1 &
 exit 0
 LAUNCH
 chmod +x "$APP/Contents/MacOS/ZCodeAdvisor"
+
+# ── 剥离 quarantine：让双击不再被 Gatekeeper 拦下 ──
+# 用户从浏览器下载 tar.gz 后解出的文件带 com.apple.quarantine，装配出的 .app 会继承它。
+# 本项目未做 Apple 开发者签名与公证（也无证书），macOS 15 会直接拒绝启动并提示
+# 「无法验证开发者」或「已损坏」。
+# 安装脚本是用户**已明确执行**的路径，因此这里清掉隔离属性等价于「仍要打开」，
+# 但省掉手动步骤。失败不阻断，但要如实给出可操作指引——不留"装好了却打不开"的困惑。
+APP_PATH="$APP"
+if command -v xattr >/dev/null 2>&1; then
+  if xattr -dr com.apple.quarantine "$APP_PATH" 2>/dev/null; then
+    echo "已移除 Gatekeeper 隔离属性（双击即可打开，不再提示无法验证开发者）"
+  else
+    echo "[提示] 未能自动移除隔离属性。若双击提示无法验证开发者，请执行：" >&2
+    echo "        xattr -dr com.apple.quarantine \\"$APP_PATH\\"" >&2
+    echo "        或：系统设置 → 隐私与安全性 → 仍要打开" >&2
+  fi
+fi
+
 echo "已安装：~/Applications/ZCode Advisor.app（启动台可见）"
 echo "已配置登录自启动（LaunchAgent: ~/Library/LaunchAgents/local.zcode.advisor.plist）"
 echo "打开应用即以角标模式启动 ZCode；日志：~/.zcode/advisor-companion.log"

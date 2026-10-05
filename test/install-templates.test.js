@@ -372,3 +372,19 @@ test('winReadme：未内嵌 Node 时给出补救说明（与构建日志陈述�
   const withNode = T.winReadme(true);
   assert.ok(!/未内嵌/.test(withNode), '内嵌时不应出现缺失警告');
 });
+
+test('MAC_INSTALL_SH：装配 .app 后剥离 quarantine（否则 macOS 15 双击必被 Gatekeeper 拦）', () => {
+  // 回归：本项目未做 Apple 签名与公证，从浏览器下载的 tar.gz 解出的文件带
+  // com.apple.quarantine，装配出的 .app 会继承 → macOS 15 直接拒绝启动
+  //（用户实测提示「无法验证开发者」）。安装脚本是用户已明确执行的路径，
+  // 因此在这里清掉隔离属性，省掉手动 xattr 步骤。
+  const sh = T.MAC_INSTALL_SH(COMPANION_FILES);
+  assert.match(sh, /xattr -dr com\.apple\.quarantine/, '应剥离 quarantine 属性');
+  // 必须在 chmod 之后（.app 已装配完成）才执行，否则清的是不存在的路径
+  const chmodAt = sh.indexOf('chmod +x "$APP/Contents/MacOS/ZCodeAdvisor"');
+  const xattrAt = sh.indexOf('xattr -dr com.apple.quarantine');
+  assert.ok(chmodAt !== -1 && xattrAt > chmodAt, '剥离应发生在 .app 装配完成之后');
+  // 失败不阻断，但要给出可操作指引（不留"装好了却打不开"的困惑）
+  assert.match(sh, /未能自动移除隔离属性/, '失败时应提示');
+  assert.match(sh, /隐私与安全性/, '应给出系统设置路径作为兜底说明');
+});
