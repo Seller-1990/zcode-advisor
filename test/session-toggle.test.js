@@ -121,7 +121,10 @@ test('toggleSessionEnabled：状态文件不存在 → no_session（不静默成
   try { fs.unlinkSync(file); } catch (_) {} // 前序用例可能写过状态文件
   const r = controller.toggleSessionEnabled(false);
   assert.strictEqual(r.ok, false);
-  assert.strictEqual(r.error, 'state_unreadable');
+  // 0.2.20 起：stateDir 里没有该会话状态文件的信标**不算有效会话**（locateLatestSessionBeacon
+  // 会跳过它，避免旧代码写错 stateDir 的信标让按钮恒灰），因此这里报 no_session
+  // 而不是 state_unreadable —— 语义上"找不到会话"比"状态不可读"更准确。
+  assert.strictEqual(r.error, 'no_session');
 });
 
 test('toggleSessionEnabled：无信标 → no_session', () => {
@@ -157,4 +160,45 @@ test('toggleSessionEnabled：陈旧锁接管（持锁者已死）', () => {
   const r = controller.toggleSessionEnabled(false);
   assert.strictEqual(r.ok, true, '陈旧锁应被接管');
   assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).enabled, false);
+});
+
+test('信标校验：stateDir 指向无效目录的旧信标被跳过（按钮恒灰的根因回归）', () => {
+  // 回归（用户实测）：0.2.19 及更早把信标的 stateDir 错写成 healthDir（~/.zcode），
+  // controller 拿它去找 sess-*.json 必然失败 → hasSession:false →
+  // 角标「使用全局默认 / 固定此模型」恒灰。仅判"字段存在"会让升级用户的旧信标继续被采纳，
+  // 表现为「升了版却没修复」。这里要求 stateDir 目录里真的有该会话的状态文件。
+  for (const f of fs.readdirSync(healthDir)) fs.unlinkSync(path.join(healthDir, f));
+  const beacon = {
+    sessionId: SESSION_ID,
+    stateDir: '/nonexistent/definitely-not-here',   // 旧代码写错的那种值
+    state: 'ok',
+    lastAttemptAt: new Date().toISOString()
+  };
+  fs.writeFileSync(path.join(healthDir, `advisor-health-${SESSION_ID}.json`), JSON.stringify(beacon));
+  try {
+    const snap = controller.readSessionSnapshot();
+    assert.strictEqual(snap.hasSession, false, 'stateDir 无效的信标不得被当成有效会话');
+  } finally {
+    for (const f of fs.readdirSync(healthDir)) { try { fs.unlinkSync(path.join(healthDir, f)); } catch (_) {} }
+  }
+});
+
+test('信标校验：stateDir 有效但状态文件缺失 → 同样不算有效会话', () => {
+  for (const f of fs.readdirSync(healthDir)) fs.unlinkSync(path.join(healthDir, f));
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-nostate-'));
+  const beacon = {
+    sessionId: SESSION_ID,
+    stateDir: empty,                                // 目录存在但没有 sess-*.json
+    state: 'ok',
+    lastAttemptAt: new Date().toISOString()
+  };
+  fs.writeFileSync(path.join(healthDir, `advisor-health-${SESSION_ID}.json`), JSON.stringify(beacon));
+  try {
+    const snap = controller.readSessionSnapshot();
+    assert.strictEqual(snap.hasSession, false, '没有状态文件的会话不算有会话');
+  } finally {
+    // 清掉本用例写的信标：后续用例依赖 healthDir 为空（曾因此污染出失败）。
+    for (const f of fs.readdirSync(healthDir)) { try { fs.unlinkSync(path.join(healthDir, f)); } catch (_) {} }
+    try { fs.rmSync(empty, { recursive: true, force: true }); } catch (_) {}
+  }
 });

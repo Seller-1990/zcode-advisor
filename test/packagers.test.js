@@ -260,3 +260,18 @@ test('buildDmg：产出可被 hdiutil verify 的 DMG，并含 Applications 符�
     execFileSync('hdiutil', ['detach', mp, '-quiet'], { stdio: 'pipe' });
   }
 });
+
+test('MAC_APP_LAUNCHER：auto-enable 必须在 launchd 早退分支之前（否则插件永不升级）', () => {
+  // 回归（用户实测）：.app 启动器原先把 auto-enable 放在回退路径里，
+  // 而前面有 `if launchd status == loaded=是 → exit 0`。LaunchAgent 一旦装好（正常状态），
+  // 启动器每次都从早退分支返回，auto-enable **永不执行** → 插件缓存停在旧版本，
+  // 用户表现为「装了新版却还是老行为」（实测：.app 已 0.2.20，缓存仍 0.2.19）。
+  const P = require('../tools/companion/packagers.cjs');
+  const sh = P.MAC_APP_LAUNCHER;
+  const iExit = sh.indexOf("grep -q 'loaded=是'");
+  const iAuto = sh.indexOf('auto-enable.cjs');
+  assert.ok(iExit !== -1, '启动器应保留 launchd 早退分支');
+  assert.ok(iAuto !== -1, '启动器应调用 auto-enable');
+  assert.ok(iAuto < iExit,
+    'auto-enable 必须排在 launchd 早退之前——否则已装 LaunchAgent 的用户永远不升级插件');
+});

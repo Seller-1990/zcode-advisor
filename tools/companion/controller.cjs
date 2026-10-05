@@ -911,6 +911,23 @@ function sanitizeSessionIdForState(sessionId) {
   return cleaned || 'default';
 }
 
+// 信标是否可用：sessionId 与 stateDir 齐备，且 stateDir 确实指向**该会话的状态文件**。
+// 为什么必须校验 stateDir（0.2.20 修）：0.2.19 及更早把 stateDir 错写成 healthDir（~/.zcode），
+// 于是 controller 拿到它去找 sess-*.json 必然找不到 → hasSession:false →
+// 角标「使用全局默认 / 固定此模型」**恒灰**。
+// 只按"字段存在"判定的话，升级用户的旧信标仍会被接受，表现为"升了版却没修复"——
+// 正是用户实测报障的样子。因此这里要求 stateDir 目录里**真的有本会话的状态文件**，
+// 否则视为旧信标跳过（继续找更新的那一个）。
+function beaconUsable(b) {
+  if (!b || !b.sessionId || !b.stateDir) return false;
+  try {
+    const f = path.join(String(b.stateDir), `sess-${sanitizeSessionIdForState(b.sessionId)}.json`);
+    return fs.existsSync(f);
+  } catch (_) {
+    return false;
+  }
+}
+
 function locateLatestSessionBeacon() {
   try {
     if (!fs.existsSync(HEALTH_DIR)) return null;
@@ -924,7 +941,11 @@ function locateLatestSessionBeacon() {
     for (const { full } of withMtime.slice(0, 20)) {
       try {
         const b = JSON.parse(fs.readFileSync(full, 'utf8'));
-        if (b && b.sessionId && b.stateDir) return b;
+        // 只接受 stateDir 确实指向本会话状态文件的信标。旧代码把 stateDir 写成 healthDir
+        // （~/.zcode），那种信标一律跳过——否则升级用户会一直看到"按钮恒灰"。
+        // 不做"兜底返回失效信标"：那会让下游误以为存在会话（readSessionSnapshot 仍会
+        // hasSession:false），徒增两处语义分叉。
+        if (beaconUsable(b)) return b;
       } catch (_) { /* 跳过坏文件/旧格式信标 */ }
     }
   } catch (_) {}

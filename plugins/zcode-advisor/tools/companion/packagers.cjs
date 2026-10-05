@@ -199,6 +199,14 @@ fi
 # --now 让本次点击即生效；已加载且配置未变时不重载（不打断正在跑的实例）。
 "$NODE" "$DIR/app/launchd.cjs" install --now >>"$LOG" 2>&1 || true
 
+# ── 插件自动启用（幂等；失败不阻断）──
+# ⚠️ 必须在下面那个 launchd 早退**之前**执行：早退分支会直接 exit 0，
+# 把这一句留在回退路径里会导致「LaunchAgent 已加载的用户永远不升级插件」
+#（实测踩到：.app 已更新到 0.2.20，插件缓存却仍停在 0.2.19，用户表现为"修了没生效"）。
+# 升级是幂等的（auto-enable 内部有单飞锁 + 「已装版本不低于包内则跳过」判据），
+# 且与 controller 是否由 launchd 托管无关，放在最前面安全。
+"$NODE" "$DIR/app/auto-enable.cjs" >>"$LOG" 2>&1 || true
+
 # LaunchAgent 已加载时，常驻与重启交给 launchd，启动器不再自己拉起 controller。
 # 为什么必须二选一：两个 owner 会互抢单实例锁，被监督者每 30s 重启一次刷日志，
 # 且角标可能随抢占闪烁。
@@ -207,8 +215,6 @@ if "$NODE" "$DIR/app/launchd.cjs" status 2>/dev/null | grep -q 'loaded=是'; the
 fi
 
 # ── 回退路径：launchd 不可用（bootstrap 失败 / 非 GUI 会话）时自行拉起 ──
-# 插件自动启用（幂等；失败不阻断角标外挂的启动）
-"$NODE" "$DIR/app/auto-enable.cjs" >>"$LOG" 2>&1 || true
 
 nohup "$NODE" "$DIR/app/controller.cjs" >>"$LOG" 2>&1 &
 # 快速失败探测：controller 用退出码区分「正常让位」与「真失败」——
