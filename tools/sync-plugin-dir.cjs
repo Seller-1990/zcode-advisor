@@ -28,6 +28,12 @@ const DEST = process.env.ZCODE_ADVISOR_SYNC_DEST
   ? path.resolve(process.env.ZCODE_ADVISOR_SYNC_DEST)
   : path.join(ROOT, 'plugins', 'zcode-advisor');
 
+// 不参与同步/比对/隔离的目录名（跑工具链产生的副产品，不属于插件 payload）。
+// Python 字节码缓存最典型：跑过一次 tools/*.py 就会生成，被当成"副本缺该文件"的漂移
+//（CI 上实测踩到：本机 3.9 不生成、CI 的 3.12 生成，本地复现不出）。
+// 集中一处，将来要加 .pytest_cache/.mypy_cache 等只改这里。
+const IGNORED_DIRS = new Set(['__pycache__']);
+
 // 插件运行必需的文件/目录。
 // **必须与 .zcode-plugin/plugin.json 的声明一致**——尤其 tools/：
 // plugin.json 的 mcpServers 声明 config-bridge 从 ${CLAUDE_PLUGIN_ROOT}/tools/config-bridge.js
@@ -45,12 +51,12 @@ function diffTree(a, b, rel, out) {
   let st;
   try { st = fs.statSync(a); } catch (_) { out.push(`缺失: ${rel}`); return out; }
   if (st.isDirectory()) {
-    const srcNames = fs.readdirSync(a).filter((n) => n !== '__pycache__');
+    const srcNames = fs.readdirSync(a).filter((n) => !IGNORED_DIRS.has(n));
     let destNames = [];
     try { destNames = fs.readdirSync(b); } catch (_) { /* 目标缺失：下面的 diffTree 会记 */ }
     for (const name of destNames) {
-      // __pycache__ 不参与比对：它是跑 Python 的副产品，不属于插件 payload。
-      if (name === '__pycache__') continue;
+      // 忽略项不参与比对（见 IGNORED_DIRS 的说明）。
+      if (IGNORED_DIRS.has(name)) continue;
       if (!srcNames.includes(name)) out.push(`多余（源已删除）: ${path.join(rel, name)}`);
     }
     for (const name of srcNames) {
@@ -93,7 +99,7 @@ function copyIfChanged(src, dest) {
     for (const name of fs.readdirSync(src)) {
       // Python 字节码缓存不属于插件 payload：跑过 tools/*.py 就会生成，
       // 同步进副本只会制造"副本缺 .pyc"的伪漂移（CI 上实测踩到）。跳过。
-      if (name === '__pycache__') continue;
+      if (IGNORED_DIRS.has(name)) continue;
       copyIfChanged(path.join(src, name), path.join(dest, name));
     }
     return;
@@ -165,8 +171,8 @@ function quarantineOrphans() {
     try { destNames = fs.readdirSync(destDir); } catch (_) { return; }
     for (const name of destNames) {
       if (name.startsWith('.orphan-')) continue;
-      // __pycache__ 不是 payload（跑 Python 的副产品）：既不该同步、也不该被"隔离"。
-      if (name === '__pycache__') continue;
+      // 忽略项不是 payload：既不该同步、也不该被"隔离"。
+      if (IGNORED_DIRS.has(name)) continue;
       const destPath = path.join(destDir, name);
       const relPath = path.join(rel, name);
       if (!srcNames.includes(name)) {
