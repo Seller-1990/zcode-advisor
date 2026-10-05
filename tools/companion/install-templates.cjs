@@ -272,11 +272,57 @@ else
   echo "        或：系统设置 → 隐私与安全性 → 仍要打开" >&2
 fi
 
+# ── 装完直接打开：免掉"装好还要自己再找一次"的第二步 ──
+# 用 open（走 LaunchServices），等价于用户双击 —— 因此这同时是对"剥离是否生效"的
+# 第一次真实验证：若仍被拦，下面的提示会让用户知道该走哪条兜底。
 echo
-echo "安装完成。现在可以："
-echo "  1) 退出本 DMG（在 Finder 侧边栏推出 ZCode Advisor ${version}）"
-echo "  2) 打开「应用程序」里的 ZCode Advisor（会自动配置登录自启动与角标）"
-read -r -p "按回车关闭…" _ || true
+echo "正在启动 ZCode Advisor…"
+if open "$APP_DST" 2>/dev/null; then
+  echo "已启动（首次启动会自动配置登录自启动与角标，稍等片刻）"
+else
+  echo "[提示] 自动打开失败，请手动打开「应用程序 → ZCode Advisor」" >&2
+fi
+
+echo
+echo "安装完成。可以退出本 DMG 了（Finder 侧边栏点推出）。"
+echo "若日后双击应用提示「无法验证开发者」，执行一次即是根治："
+echo "  xattr -dr com.apple.quarantine \\"$APP_DST\\""
+read -r -p "按回车关闭本窗口…" _ || true
+`;
+
+// DMG 卷内的引导说明。为什么必须有：卷里同时有 .app 与 .command，
+// 用户的直觉是"把 .app 拖进 Applications"——而那条路会带回 Gatekeeper 拦截
+//（.app 未签名，双击提示"无法验证开发者"）。必须显式告诉用户该双击哪个。
+const MAC_DMG_README = (version) => `ZCode Advisor ${version} — 安装说明
+========================================
+
+【请这样做】
+  双击本窗口里的「1-双击安装.command」
+
+  它会自动完成：把应用装进「应用程序」+ 移除 Gatekeeper 隔离属性 + 启动应用。
+  装完之后双击「应用程序」里的 ZCode Advisor 就能正常打开，不会再提示
+  「无法验证开发者」。
+
+【不要直接拖拽 .app】
+  把 ZCode Advisor.app 直接拖进 Applications 也能装上，但**未签名**，
+  macOS 15 会拒绝启动并提示「无法验证开发者」。
+  若你已经这样拖了，执行下面这行即可修好（打开「终端」粘贴回车）：
+
+    xattr -dr com.apple.quarantine "/Applications/ZCode Advisor.app"
+
+【如果双击 .command 也被拦】
+  在「终端」里粘贴执行（bash 解释执行不受 Gatekeeper 校验）：
+
+    bash "/Volumes/ZCode Advisor ${version}/1-双击安装.command"
+
+【为什么会这样】
+  本项目没有 Apple 开发者签名（需付费账号），因此 macOS 会对下载来的应用
+  施加"隔离"标记并要求人工放行。上面两种方式都是把这个标记去掉，属于正常操作。
+
+【装好之后】
+  ZCode Advisor 会作为外挂常驻（自动配置登录自启动）。
+  打开 ZCode 后，输入框旁会出现 🛡️ 角标，点开即可配置审查服务商与模型。
+  日志：~/.zcode/advisor-companion.log
 `;
 
 module.exports = {
@@ -286,6 +332,7 @@ module.exports = {
   macReadme,
   MAC_INSTALL_SH,
   MAC_FIRST_INSTALL,
+  MAC_DMG_README,
   MAC_BUILD_INFO: (arch, embedded) => `zcode-advisor 发行包（macOS）
 version: ${VERSION}
 arch: ${arch}

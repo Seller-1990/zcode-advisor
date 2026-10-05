@@ -531,7 +531,25 @@ function verifyDmg(name, filePath, expectNode = true) {
       if (!fs.existsSync(launchdMod)) {
         throw new Error(`${name}: .app 缺少 launchd.cjs（自启动绑定将静默失效）`);
       }
-      log(`校验通过（hdiutil verify + .app 结构与依赖闭包）：${name}，${(fs.statSync(filePath).size / 1048576).toFixed(1)} MB`);
+      // **必须校验卷内的安装引导**：它是 DMG 用户解决 Gatekeeper 拦截的唯一自助路径
+      //（.app 未签名时双击会被拒）。本 DMG 是用户下载安装的主形态，漏放会让
+      //「双击打不开」无从自救——而结构校验此前不看根目录，漏放会静默放行。
+      const firstInstall = path.join(mountPoint, '1-双击安装.command');
+      if (!fs.existsSync(firstInstall)) {
+        throw new Error(`${name}: DMG 根目录缺少「1-双击安装.command」（用户将无法自助解决 Gatekeeper 拦截）`);
+      }
+      if ((fs.statSync(firstInstall).mode & 0o111) === 0) {
+        throw new Error(`${name}: 「1-双击安装.command」缺少执行位（双击不会运行）`);
+      }
+      if (!fs.existsSync(path.join(mountPoint, '安装说明.txt'))) {
+        throw new Error(`${name}: DMG 缺少「安装说明.txt」（用户会本能地拖 .app，绕回 Gatekeeper 拦截）`);
+      }
+      // Applications 符号链接：拖拽安装的落点提示
+      const appsLink = path.join(mountPoint, 'Applications');
+      if (!fs.existsSync(appsLink)) {
+        throw new Error(`${name}: DMG 缺少 /Applications 符号链接（拖拽安装路径不完整）`);
+      }
+      log(`校验通过（hdiutil verify + .app 结构与依赖闭包 + 安装引导）：${name}，${(fs.statSync(filePath).size / 1048576).toFixed(1)} MB`);
     } finally {
       execFileSync('hdiutil', ['detach', mountPoint, '-quiet'], { stdio: 'pipe' });
     }

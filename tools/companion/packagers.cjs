@@ -307,17 +307,19 @@ function buildDmg(opts) {
     if (!fs.existsSync(link)) fs.symlinkSync('/Applications', link);
   } catch (_) { /* 已存在或权限问题：不阻断 DMG 制作 */ }
 
-  // 卷内放「首次安装.command」：见 MAC_FIRST_INSTALL 的注释——
-  // 拖拽分发没有任何脚本执行机会，.app 会带着 quarantine 落进 /Applications 被 Gatekeeper 拦；
-  // 这个脚本给用户一条"双击即修好"的路径（并自带终端兜底说明）。
-  // 有版本号才写（缺版本时该脚本的运行提示会不完整，宁可不放）。
+  // 卷内放「1-双击安装.command」与说明：见 MAC_FIRST_INSTALL 的注释——
+  // 拖拽分发没有任何脚本执行机会，.app 会带着 quarantine 落进 /Applications 被 Gatekeeper 拦。
+  // 数字前缀让它排在 .app 之前（Finder 默认按名称排序），引导用户先看到它；
+  // 说明文件则解释"为什么不直接拖 .app"——否则用户的直觉操作会绕回被拦的老路。
+  // 有版本号才写（缺版本时脚本提示不完整，宁可不放）。
   if (version) {
     try {
-      const cmdPath = path.join(stageDir, '首次安装.command');
+      const cmdPath = path.join(stageDir, '1-双击安装.command');
       fs.writeFileSync(cmdPath, T.MAC_FIRST_INSTALL(version), { encoding: 'utf8', mode: 0o755 });
+      fs.writeFileSync(path.join(stageDir, '安装说明.txt'), T.MAC_DMG_README(version), { encoding: 'utf8', mode: 0o644 });
     } catch (err) {
       // 放不进去不阻断 DMG 制作：拖拽仍可用（只是用户需手动处理 Gatekeeper）
-      if (typeof warn === 'function') warn(`首次安装.command 写入失败：${String(err && err.message).slice(0, 120)}`);
+      if (typeof warn === 'function') warn(`安装引导文件写入失败：${String(err && err.message).slice(0, 120)}`);
     }
   }
 

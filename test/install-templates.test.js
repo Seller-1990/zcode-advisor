@@ -407,3 +407,21 @@ test('MAC_FIRST_INSTALL：DMG 卷内「首次安装.command」关键行为', () 
   // 版本号应被替换（模板占位由调用方传入）
   assert.ok(sh.includes('0.2.20'), '应含传入的版本号');
 });
+
+test('MAC_FIRST_INSTALL：装完自动启动 + 失败留兜底（真正的"双击就能用"）', () => {
+  const sh = T.MAC_FIRST_INSTALL('0.2.20');
+  // 装完直接 open：免掉"装好还要自己再找一次"，也让剥离效果当场得到验证
+  assert.match(sh, /open "\$APP_DST"/, '应在装好后自动打开应用');
+  assert.match(sh, /自动打开失败/, 'open 失败要有可读提示');
+  // 用户日后仍可能看到拦截提示 —— 必须留可复制的根治命令
+  assert.match(sh, /日后双击应用提示/, '应保留日后兜底说明');
+});
+
+test('MAC_DMG_README：引导用户双击 .command 而非拖 .app（否则绕回 Gatekeeper 拦截）', () => {
+  const txt = T.MAC_DMG_README('0.2.20');
+  assert.match(txt, /1-双击安装\.command/, '应指向正确的安装入口');
+  assert.match(txt, /不要直接拖拽/, '应明确劝阻拖 .app（用户的本能操作）');
+  assert.match(txt, /xattr -dr com\.apple\.quarantine/, '应给出已拖拽后的补救命令');
+  assert.match(txt, /bash "\/Volumes/, '应给出"双击也被拦"时的终端兜底');
+  assert.match(txt, /0\.2\.20/, '应含版本号（终端兜底路径需要它）');
+});
