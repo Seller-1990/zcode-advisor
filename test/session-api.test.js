@@ -60,7 +60,9 @@ function makeEnv(stateDir, zcodeCfg, extra) {
     ZCODE_ADVISOR_NO_SPAWN: '1',
     // 隔离本机真实配置：用户级配置为空、ZCode 服务商用 fixture
     ZCODE_ADVISOR_USER_CONFIG: path.join(stateDir, 'no-user.json'),
-    ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg
+    ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg,
+    // 隔离 provider_config.json（第二个数据源），避免读开发机真实配置。
+    ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(stateDir, 'no-such-provider-config.json')
   }, extra || {});
 }
 

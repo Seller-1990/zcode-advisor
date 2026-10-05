@@ -517,3 +517,36 @@ test('readBeacons：非法时间戳不产生 NaN 排序（与 controller 比较�
   assert.strictEqual(got.count, 2, '非法时间戳不得导致条目丢失');
   assert.strictEqual(got.sorted, 'a,b', '两条都应在结果中');
 });
+
+// —— 回归：信标里的 stateDir 必须是【会话状态目录】，不能是【健康信标目录】 ——
+// 用户实测报障：角标「本会话的审查模型」里「使用全局默认 / 固定此模型」两个按钮恒灰。
+// 根因：writeAttempt/writeResult 的第一参 dir 既当"信标存放目录"、又被当 stateDir 写进信标，
+// 而调用方传的是 healthDir（~/.zcode）。0.2.13 起 state 迁到宿主插件数据目录后二者不再同值，
+// controller 拿信标里的 stateDir 去找 sess-*.json 必然找不到 → hasSession:false → 按钮恒灰。
+test('writeAttempt：stateDir 显式传入时写入它，而不是信标目录（按钮恒灰的根因回归）', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-hb-'));
+  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
+  const healthDir = path.join(dir, 'health');
+  const stateDir = path.join(dir, 'cli', 'plugins', 'data', 'zcode-advisor', 'state');
+  fs.mkdirSync(healthDir, { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  HEALTH.writeAttempt(healthDir, 'sX', { model: 'm1' }, stateDir);
+  const beacon = JSON.parse(fs.readFileSync(path.join(healthDir, 'advisor-health-sX.json'), 'utf8'));
+  assert.strictEqual(beacon.stateDir, stateDir,
+    'stateDir 必须是传入的会话状态目录——写成信标目录会让 controller 找不到 sess-*.json');
+  assert.notStrictEqual(beacon.stateDir, healthDir, '不得退化成信标目录');
+
+  // writeResult 同理
+  HEALTH.writeResult(healthDir, 'sX', { ok: true, reviews: 1 }, stateDir);
+  const b2 = JSON.parse(fs.readFileSync(path.join(healthDir, 'advisor-health-sX.json'), 'utf8'));
+  assert.strictEqual(b2.stateDir, stateDir, 'writeResult 也必须写入正确的 stateDir');
+});
+
+test('writeAttempt：未传 stateDir 时回退到 dir（兼容旧调用，不写空值）', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-hb2-'));
+  t.after(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) {} });
+  HEALTH.writeAttempt(dir, 'sY', { model: 'm1' });
+  const beacon = JSON.parse(fs.readFileSync(path.join(dir, 'advisor-health-sY.json'), 'utf8'));
+  assert.strictEqual(beacon.stateDir, dir, '旧签名应回退到 dir，而不是空串');
+});

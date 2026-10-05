@@ -17,7 +17,9 @@ function tmpRoot() {
 function hermeticEnv(extra) {
   return Object.assign({
     ZCODE_ADVISOR_USER_CONFIG: path.join(os.tmpdir(), `zcadv-no-user-${Date.now()}.json`),
-    ZCODE_ADVISOR_ZCODE_CONFIG: path.join(os.tmpdir(), `zcadv-no-zcode-${Date.now()}.json`)
+    ZCODE_ADVISOR_ZCODE_CONFIG: path.join(os.tmpdir(), `zcadv-no-zcode-${Date.now()}.json`),
+    // 隔离第二个数据源（provider_config.json）——不然会读开发机真实服务商
+    ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(os.tmpdir(), `zcadv-no-zpc-${Date.now()}.json`)
   }, extra);
 }
 
@@ -257,7 +259,7 @@ test('旧版手动残留（apiSource/baseUrl/apiKey/zcodeModel）不再参与解
 
 test('listZcodeProviders：剔除 apiKey 明文并给出 eligible/official/hasApiKey 标记', () => {
   const file = zcodeFixtureFile(tmpRoot());
-  const list = listZcodeProviders({ ZCODE_ADVISOR_ZCODE_CONFIG: file });
+  const list = listZcodeProviders({ ZCODE_ADVISOR_ZCODE_CONFIG: file, ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(os.tmpdir(), 'zcadv-no-zpc-lp.json') });
   assert.strictEqual(list.length, 3);
   const p3p = list.find((p) => p.id === 'prov-3p');
   assert.strictEqual(p3p.eligible, true);
@@ -285,7 +287,7 @@ test('占位符 key：ZCode 服务商里粘了模板占位符 → 视为未配�
       }
     }
   }));
-  const list = listZcodeProviders({ ZCODE_ADVISOR_ZCODE_CONFIG: file });
+  const list = listZcodeProviders({ ZCODE_ADVISOR_ZCODE_CONFIG: file, ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(os.tmpdir(), 'zcadv-no-zpc-lp.json') });
   const p = list.find((x) => x.id === 'prov-ph');
   assert.strictEqual(p.hasApiKey, false, '占位符 key 不得算作"已配置"');
 
@@ -319,4 +321,76 @@ test('env 逃生舱：端点与 key 必须成对（与 hook 侧 resolveTarget �
   }));
   assert.strictEqual(ph.baseUrl, undefined);
   assert.ok(ph.problems.some((p) => p.startsWith('env_override_incomplete')));
+});
+
+// —— 回归：provider_config.json 是第二个数据源，漏读会看不到「界面新建的服务商」 ——
+// 用户实测报障「抓不到我 zcode 里所有第三方 api」：内网 workbuddy 只存在于
+// provider_config.json（providerId='new-provider'），config.json 里没有它。
+test('readZcodeProviders：合并 provider_config.json（界面新建的服务商只写在那里）', () => {
+  const dir = tmpRoot();
+  const cfgFile = path.join(dir, 'config.json');
+  const pcFile = path.join(dir, 'provider_config.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({
+    provider: {
+      'uuid-old': {
+        name: '老服务商', kind: 'openai-compatible',
+        options: { baseURL: 'http://old/v1', apiKey: 'sk-old-key-1234' },
+        models: { 'm-old': {} }
+      }
+    }
+  }));
+  fs.writeFileSync(pcFile, JSON.stringify({
+    config: { providerConfigRules: { providerRules: [
+      // 新数据源独有：config.json 里完全没有
+      { providerId: 'new-provider', providerName: 'workbuddy',
+        config: { group: 'standard-personal',
+          access: { type: 'api-key', apiKey: 'sk-wb-key-5678' },
+          api: { type: 'openai-chat-completions', baseUrl: 'http://127.0.0.1:18787/v1' },
+          personalModelIds: ['deepseek-v4.1-flash', 'glm-5.3-flash'] } },
+      // 与 config.json 重叠：模型清单更全，应补全而非丢弃
+      { providerId: 'uuid-old', providerName: '老服务商',
+        config: { access: { type: 'api-key', apiKey: 'sk-old-key-1234' },
+          api: { type: 'openai-chat-completions', baseUrl: 'http://old/v1' },
+          personalModelIds: ['m-old', 'm-new-extra'] } },
+      // anthropic：不该被当成可用
+      { providerId: 'new-provider-2', providerName: 'AIPM',
+        config: { access: { type: 'api-key', apiKey: 'sk-ant-999' },
+          api: { type: 'anthropic-messages', baseUrl: 'https://aipm.example' },
+          personalModelIds: ['claude-x'] } }
+    ] } }
+  }));
+
+  const list = listZcodeProviders({
+    ZCODE_ADVISOR_ZCODE_CONFIG: cfgFile,
+    ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: pcFile
+  });
+  const wb = list.find((p) => p.name === 'workbuddy');
+  assert.ok(wb, '必须能发现只存在于 provider_config.json 的服务商');
+  assert.strictEqual(wb.baseURL, 'http://127.0.0.1:18787/v1');
+  assert.strictEqual(wb.eligible, true, 'openai-chat-completions 必须判为可用（= 界面的 openai-compatible）');
+  assert.strictEqual(wb.hasApiKey, true);
+  assert.deepStrictEqual(wb.models, ['deepseek-v4.1-flash', 'glm-5.3-flash']);
+
+  const old = list.find((p) => p.id === 'uuid-old');
+  assert.deepStrictEqual(old.models, ['m-old', 'm-new-extra'],
+    '重叠项的模型清单应取并集（provider_config 侧更全）');
+
+  const aipm = list.find((p) => p.name === 'AIPM');
+  assert.strictEqual(aipm.eligible, false, 'anthropic-messages 不得判为可用');
+
+  assert.strictEqual(list.length, 3, '不应重复列出重叠项');
+  assert.strictEqual(JSON.stringify(list).includes('sk-wb-key'), false, '列表不得携带 key 明文');
+});
+
+test('readZcodeProviders：provider_config.json 缺失/损坏时只返回 config.json 的结果', () => {
+  const dir = tmpRoot();
+  const cfgFile = path.join(dir, 'config.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({
+    provider: { 'p1': { name: 'A', kind: 'openai', options: { baseURL: 'http://a/v1', apiKey: 'sk-a-1234' }, models: { m: {} } } }
+  }));
+  const list = listZcodeProviders({
+    ZCODE_ADVISOR_ZCODE_CONFIG: cfgFile,
+    ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(dir, 'does-not-exist.json')
+  });
+  assert.strictEqual(list.length, 1, '第二个源不可用时应正常降级，不抛错、不挂空条目');
 });

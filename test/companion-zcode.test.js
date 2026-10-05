@@ -15,6 +15,8 @@ const USER_CFG = path.join(dir, 'advisor.config.json');
 const V2_CFG = path.join(dir, 'v2-config.json');
 process.env.ZCODE_ADVISOR_USER_CONFIG = USER_CFG;
 process.env.ZCODE_ADVISOR_ZCODE_CONFIG = V2_CFG;
+// 隔离第二个数据源（provider_config.json）：否则会读到开发机真实配置，断言随环境漂移。
+process.env.ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG = path.join(dir, 'no-such-provider-config.json');
 fs.writeFileSync(V2_CFG, JSON.stringify({
   provider: {
     p1: {

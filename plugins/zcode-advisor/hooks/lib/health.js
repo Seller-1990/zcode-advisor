@@ -83,13 +83,19 @@ function mergeBeacon(file, patch) {
 }
 
 // Stop 父进程在 spawn worker 前调用：记录「本轮尝试了审查」。
-function writeAttempt(dir, sessionId, info) {
+// ⚠️ dir 与 stateDir 是**两个不同目录**，必须分别传入：
+//   dir      = 健康信标存放目录（health.resolveHealthDir，仅用于 beaconPath）
+//   stateDir = 会话状态文件目录（resolveStateDir），随信标下发给 controller，
+//              供角标定位同一会话的 state（会话级开关/模型覆盖展示）。
+// 历史上二者合成一参（调用方传的是 healthDir），当时恰好同值所以没暴露；
+// 0.2.13 起 state 迁到宿主插件数据目录后，信标里的 stateDir 就是错的 →
+// controller 找不到状态文件 → hasSession:false → 角标「使用全局默认 / 固定此模型」
+// **两个按钮恒灰**（用户实测报障）。
+function writeAttempt(dir, sessionId, info, stateDir) {
   const i = info || {};
   return mergeBeacon(beaconPath(dir, sessionId), {
     sessionId: String(sessionId || ''),
-    // stateDir 随信标下发：角标 controller 借此定位同一会话的状态文件，
-    // 实现跨进程的会话级开关/模型覆盖展示（controller 与 hook 无共享模块）。
-    stateDir: String(dir || ''),
+    stateDir: String(stateDir || dir || ''),
     lastAttemptAt: new Date().toISOString(),
     model: String(i.model || ''),
     effectiveModel: String(i.effectiveModel || i.model || '')
@@ -101,11 +107,12 @@ function writeAttempt(dir, sessionId, info) {
 // degraded（黄）：审查靠备用模型完成——服务未中断，但主模型在劣化。它**优先于 ok**：
 // 调用方可能同时传 ok:true（本次确有产出）与 degraded:true（非主模型产出），
 // 此时角标必须显示黄（降级可见），不能因 ok 而显示绿（那会把持续劣化藏起来）。
-function writeResult(dir, sessionId, result) {
+// stateDir 语义同 writeAttempt（见上方注释）。
+function writeResult(dir, sessionId, result, stateDir) {
   const r = result || {};
   const patch = {
     sessionId: String(sessionId || ''),
-    stateDir: String(dir || ''),
+    stateDir: String(stateDir || dir || ''),
     state: r.degraded ? 'degraded' : (r.ok ? 'ok' : 'down'),
     reason: String(r.reason || ''),
     model: String(r.model || ''),

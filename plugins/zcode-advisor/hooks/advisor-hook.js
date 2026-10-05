@@ -672,7 +672,7 @@ function onStopAsync(ctx) {
     const effAttempt = effectiveApi(cfg, apiKeyInfo, current);
     health.writeAttempt(health.resolveHealthDir(process.env), sessionId, {
       model: effAttempt.model, effectiveModel: effAttempt.model
-    });
+    }, stateDir);
   }
 
   // —— 转录快照（ZCode 宿主契约适配）——
@@ -809,7 +809,7 @@ async function onStopSync(ctx) {
   // 健康信标（M1）：sync 路径无分发 worker，attempt 在审查发起前写。
   health.writeAttempt(health.resolveHealthDir(process.env), sessionId, {
     model: eff.model, effectiveModel: eff.model
-  });
+  }, stateDir);
   const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir), { state: current });
 
   // 指针推进策略：只要完成了一次审查尝试就前进——失败同样前进（drop 即放弃，
@@ -836,7 +836,7 @@ async function onStopSync(ctx) {
     });
     health.writeResult(health.resolveHealthDir(process.env), sessionId, {
       ok: false, reason: result.error, model: eff.model, effectiveModel: eff.model, reviews
-    });
+    }, stateDir);
     return;
   }
 
@@ -850,7 +850,7 @@ async function onStopSync(ctx) {
     ok: true, degraded: Boolean(result.usedFallback), model: eff.model,
     effectiveModel: result.usedFallback ? (result.fallbackModel || eff.model) : eff.model,
     reviews
-  });
+  }, stateDir);
   mutateStateExclusive(file, (s) => {
     // 恢复信号：告警发过的会话（healthNotifiedAt 非空）恢复后，下一次 UPS 喊一声"已恢复"
     if (s.healthNotifiedAt) s.healthRecoveryPending = true;
@@ -1084,7 +1084,7 @@ async function handleReviewWorker(args) {
       health.writeResult(health.resolveHealthDir(process.env), p.sid, {
         ok: p.ok, degraded: p.degraded, reason: p.reason, model: p.model,
         effectiveModel: p.effectiveModel, reviews: p.reviews
-      });
+      }, stateDir);
     }
   } catch (err) {
     // worker 内任何异常：留下计数痕迹（此前版本此处静默消失），尽力落盘。

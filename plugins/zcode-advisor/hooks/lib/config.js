@@ -82,6 +82,68 @@ function zcodeConfigPath(env) {
   return path.join(os.homedir(), '.zcode', 'v2', 'config.json');
 }
 
+// ZCode 还有第二个（且对新建服务商更权威的）配置源：~/.zcode/v2/provider_config.json。
+//   config.providerConfigRules.providerRules[] = {
+//     providerId, providerName,
+//     config: { group, access:{ type:'api-key', apiKey }, api:{ type, baseUrl },
+//               personalModelIds:[...], modelOrder:[...] } }
+// 用户实测（2026-10-05）：在 ZCode 界面新建的服务商（如内网 workbuddy）**只**落在这个文件里，
+// config.json 的 provider.* 里没有；此前只读 config.json → 这些服务商在插件里完全不可见
+//（用户报障「抓不到我 zcode 里所有第三方 api」的真因）。
+// api.type 是 ZCode 的内部枚举：'openai-chat-completions' 即 OpenAI 兼容（= 界面的
+// openai-compatible，同一协议两种叫法）；'anthropic-messages' 不可用于本插件（见 reviewer.js）。
+function zcodeProviderConfigPath(env) {
+  const e = env || process.env;
+  if (e.ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG) return e.ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG;
+  return path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
+}
+
+// 从 provider_config.json 读服务商规则（结构见上）。读取失败返回 []。
+// 与 config.json 的形状归一化成同一份字段集，便于上层合并/去重。
+function readProviderConfigRules(env) {
+  let raw = null;
+  try {
+    raw = JSON.parse(fs.readFileSync(zcodeProviderConfigPath(env), 'utf8'));
+  } catch (_) {
+    return [];
+  }
+  const rules = (((raw || {}).config || {}).providerConfigRules || {}).providerRules;
+  if (!Array.isArray(rules)) return [];
+  const out = [];
+  for (const e of rules) {
+    if (!e || typeof e !== 'object') continue;
+    const c = e.config && typeof e.config === 'object' ? e.config : {};
+    const api = c.api && typeof c.api === 'object' ? c.api : {};
+    const acc = c.access && typeof c.access === 'object' ? c.access : {};
+    const id = String(e.providerId || '').trim();
+    if (!id) continue;
+    const models = Array.isArray(c.personalModelIds) ? c.personalModelIds.map(String)
+      : (Array.isArray(c.modelOrder) ? c.modelOrder.map(String) : []);
+    out.push({
+      id,
+      name: String(e.providerName || ''),
+      kind: String(api.type || ''),
+      baseURL: String(api.baseUrl || '').trim(),
+      apiKey: String(acc.apiKey || '').trim(),
+      models,
+      // 官方内置通道不会出现在该文件；统一置 false 保持形状一致。
+      official: false,
+      source: 'provider_config'
+    });
+  }
+  return out;
+}
+
+// 审查通道可用的协议判定。三个等价写法都要认——它们指同一个 OpenAI chat/completions 协议：
+//   config.json 侧的 kind:        'openai' | 'openai-compatible'
+//   provider_config.json 侧的 api.type: 'openai-chat-completions'（ZCode 界面选 openai-compatible 后的落盘值）
+// 反之 'anthropic' / 'anthropic-messages' 走 /v1/messages，本插件（reviewer.js 只发
+// chat/completions）不支持，明确排除。
+function isOpenAiCompatibleKind(kind) {
+  const k = String(kind || '').trim().toLowerCase();
+  return k === 'openai' || k === 'openai-compatible' || k === 'openai-chat-completions';
+}
+
 // 读取全部 provider（含 apiKey，仅供 hook 解析/本机面板 Ping 等本地路径使用）。
 // 读取失败返回 []（ZCode 未装/未配置过 provider 时是正常状态，不挂 problems）。
 function readZcodeProviders(env) {
@@ -108,10 +170,35 @@ function readZcodeProviders(env) {
       baseURL: String(opts.baseURL || '').trim(),
       apiKey: rawKey && !isPlaceholderKey(rawKey) ? rawKey : '',
       models,
-      eligible: p.kind === 'openai' || p.kind === 'openai-compatible',
+      eligible: isOpenAiCompatibleKind(p.kind),
       // 官方内置通道（bigmodel/z.ai 的 builtin:*）——审查通道不使用。
-      official: id.startsWith('builtin:')
+      official: id.startsWith('builtin:'),
+      source: 'config'
     });
+  }
+  // 合并第二个源（provider_config.json）：用户在 ZCode 界面新建的服务商只写在那里。
+  // ⚠️ 两源**存在 ID 重叠**（实测 4 个：Ark API / Fengwind / lucy / AIPM），故不能简单去重：
+  //   重叠项的 baseUrl 与 apiKey 实测**完全相同**，但 provider_config 侧的
+  //   personalModelIds **更全**（如 Ark 4 vs 2、lucy 5 vs 3）——它是更新的一侧。
+  //   合并策略：以 config.json 的条目为基底（保留它的 source/official 标记与既有顺序），
+  //   但用 provider_config 的模型清单**补全**（取并集，保持前者顺序在前，避免下拉跳动）。
+  const byId = new Map(out.map((p) => [p.id, p]));
+  for (const p of readProviderConfigRules(env)) {
+    const rawKey = String(p.apiKey || '').trim();
+    const key = rawKey && !isPlaceholderKey(rawKey) ? rawKey : '';
+    const exist = byId.get(p.id);
+    if (exist) {
+      const merged = exist.models.slice();
+      for (const m of p.models) if (!merged.includes(m)) merged.push(m);
+      exist.models = merged;
+      // 端点/key 两源一致（实测）；仅当 config.json 侧缺失时才补，避免意外覆盖。
+      if (!exist.baseURL && p.baseURL) exist.baseURL = p.baseURL;
+      if (!exist.apiKey && key) exist.apiKey = key;
+      continue;
+    }
+    const item = Object.assign({}, p, { apiKey: key, eligible: isOpenAiCompatibleKind(p.kind) });
+    byId.set(p.id, item);
+    out.push(item);
   }
   return out;
 }

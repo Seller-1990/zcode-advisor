@@ -42,7 +42,9 @@ function makeEnv(stateDir, extra) {
     ZCODE_ADVISOR_NO_SPAWN: '1',
     // 隔离用户级配置，避免读本机真实 ~/.zcode/advisor.config.json
     ZCODE_ADVISOR_USER_CONFIG: path.join(stateDir, 'no-such-user-config.json'),
-    ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg
+    ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg,
+    // 隔离 provider_config.json（用户新建的服务商只写在那里）——否则读开发机真实配置。
+    ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(stateDir, 'no-such-provider-config.json')
   }, extra || {});
 }
 

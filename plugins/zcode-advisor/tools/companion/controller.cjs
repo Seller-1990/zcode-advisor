@@ -764,10 +764,56 @@ function zcodeConfigFile() {
     || path.join(HOME, '.zcode', 'v2', 'config.json');
 }
 
+// 第二个数据源（与 hooks/lib/config.js 的 zcodeProviderConfigPath 同源）：
+// 用户在 ZCode 界面新建的服务商只写在这里（实测：内网 workbuddy 的 providerId
+// 是 'new-provider'，在 config.json 里完全不存在）——只读 config.json 会漏掉它们。
+function zcodeProviderConfigFile() {
+  return process.env.ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG
+    || path.join(HOME, '.zcode', 'v2', 'provider_config.json');
+}
+
+// 审查通道可用的协议判定：config.json 侧是 'openai'/'openai-compatible'，
+// provider_config.json 侧是 'openai-chat-completions'（同一协议的另一枚举名，界面显示为
+// openai-compatible）。三者都认；'anthropic'/'anthropic-messages' 走 /v1/messages，不支持。
+function isOpenAiCompatibleKind(kind) {
+  const k = String(kind || '').trim().toLowerCase();
+  return k === 'openai' || k === 'openai-compatible' || k === 'openai-chat-completions';
+}
+
+function readProviderConfigRules() {
+  let raw = null;
+  try { raw = JSON.parse(fs.readFileSync(zcodeProviderConfigFile(), 'utf8')); } catch (_) { return []; }
+  const rules = (((raw || {}).config || {}).providerConfigRules || {}).providerRules;
+  if (!Array.isArray(rules)) return [];
+  const out = [];
+  for (const e of rules) {
+    if (!e || typeof e !== 'object') continue;
+    const c = e.config && typeof e.config === 'object' ? e.config : {};
+    const api = c.api && typeof c.api === 'object' ? c.api : {};
+    const acc = c.access && typeof c.access === 'object' ? c.access : {};
+    const id = String(e.providerId || '').trim();
+    if (!id) continue;
+    const models = Array.isArray(c.personalModelIds) ? c.personalModelIds.map(String)
+      : (Array.isArray(c.modelOrder) ? c.modelOrder.map(String) : []);
+    out.push({
+      id,
+      name: String(e.providerName || ''),
+      kind: String(api.type || ''),
+      baseURL: String(api.baseUrl || '').trim(),
+      apiKey: String(acc.apiKey || '').trim(),
+      models,
+      eligible: isOpenAiCompatibleKind(api.type),
+      official: false,
+      source: 'provider_config'
+    });
+  }
+  return out;
+}
+
 function readZcodeProviders() {
   let raw = null;
-  try { raw = JSON.parse(fs.readFileSync(zcodeConfigFile(), 'utf8')); } catch (_) { return []; }
-  const map = raw && raw.provider && typeof raw.provider === 'object' ? raw.provider : {};
+  try { raw = JSON.parse(fs.readFileSync(zcodeConfigFile(), 'utf8')); } catch (_) { raw = null; }
+  const map = (raw && raw.provider && typeof raw.provider === 'object') ? raw.provider : {};
   const out = [];
   for (const [id, p] of Object.entries(map)) {
     if (!p || typeof p !== 'object') continue;
@@ -779,9 +825,27 @@ function readZcodeProviders() {
       baseURL: String(opts.baseURL || '').trim(),
       apiKey: String(opts.apiKey || '').trim(),
       models: p.models && typeof p.models === 'object' ? Object.keys(p.models) : [],
-      eligible: p.kind === 'openai' || p.kind === 'openai-compatible',
-      official: id.startsWith('builtin:')
+      eligible: isOpenAiCompatibleKind(p.kind),
+      official: id.startsWith('builtin:'),
+      source: 'config'
     });
+  }
+  // 合并第二个源。⚠️ 两源有 ID 重叠（实测 4 个）：端点/key 实测相同，
+  // 但 provider_config 的模型清单更全 → 重叠项**补全模型**（并集），不整体替换，
+  // 以免丢掉 config.json 侧的 official/source 标记与既有顺序。
+  const byId = new Map(out.map((p) => [p.id, p]));
+  for (const p of readProviderConfigRules()) {
+    const exist = byId.get(p.id);
+    if (exist) {
+      const merged = exist.models.slice();
+      for (const m of p.models) if (!merged.includes(m)) merged.push(m);
+      exist.models = merged;
+      if (!exist.baseURL && p.baseURL) exist.baseURL = p.baseURL;
+      if (!exist.apiKey && p.apiKey) exist.apiKey = p.apiKey;
+      continue;
+    }
+    byId.set(p.id, p);
+    out.push(p);
   }
   return out;
 }
