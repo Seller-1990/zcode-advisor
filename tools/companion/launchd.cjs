@@ -340,11 +340,19 @@ function main(argv) {
   }
   if (cmd === 'uninstall') {
     const r = uninstall();
-    console.log(`[launchd] uninstall: ${r.removed ? '已移除' : '文件不存在'} ${r.path}`);
+    // skipped=true 时说明**没去碰** launchd 域（沙箱/非 darwin/无 uid），此时
+    // 「已移除/文件不存在」只描述 plist 文件，不代表真实作业被卸载——打印出来，
+    // 免得看日志的人把「文件删了」当成「作业也停了」。
+    const skip = r.skipped ? '（未操作 launchd 域）' : '';
+    console.log(`[launchd] uninstall: ${r.removed ? '已移除' : '文件不存在'}${skip} ${r.path}`);
     return 0;
   }
   const s = status();
-  console.log(`[launchd] status: plist=${s.exists ? '存在' : '不存在'} loaded=${s.loaded ? '是' : '否'}${s.state ? ` state=${s.state}` : ''} path=${s.path}`);
+  // queried=false 表示**没查** launchd 域（沙箱/非 darwin/无 uid），与「查过、没加载」
+  // 是两回事。只打 loaded=否 会让调用方（packagers/install-templates 里的
+  // `grep -q 'loaded=是'`）把「没查过」误读成「作业没在跑」。
+  const q = s.queried === false ? ' queried=否' : '';
+  console.log(`[launchd] status: plist=${s.exists ? '存在' : '不存在'} loaded=${s.loaded ? '是' : '否'}${q}${s.state ? ` state=${s.state}` : ''} path=${s.path}`);
   return 0;
 }
 
