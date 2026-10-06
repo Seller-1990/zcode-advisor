@@ -166,23 +166,31 @@ cleanup() {
     # 首行就是 [ -s "$OUT_JSON" ]，故「CHOSEN 非空」已蕴含「有完整评审可拷」。
     if [ -d "$OCR_REVIEW_RAW_OUT" ]; then
       # 传目录进来时 cp/mv 会把文件塞进目录、还顺带覆盖同名文件，与「保存到该路径」的
-      # 契约不符；明确拒绝好过默默塞进去。
-      echo "警告：OCR_REVIEW_RAW_OUT 是目录（期望文件路径），跳过保存原始 JSON" >&2
+      # 契约不符；明确拒绝好过默默塞进去。（[ -d ] 跟随符号链接，指向目录的链接同样被拒。）
+      echo "警告：OCR_REVIEW_RAW_OUT=$OCR_REVIEW_RAW_OUT 是目录（期望文件路径），跳过保存原始 JSON" >&2
     else
       # 先写同目录临时文件再 mv，而不是直接 cp：
       #   ① cp 是「打开目标→截断→写入」，并发读者会看到 0 字节或半截文件；本脚本用
       #      OCR_REVIEW_FORCE=1 明确支持并行运行，两个评审会争同一目标，必须原子发布。
       #   ② cp 会**跟随**目标符号链接（把内容写穿到链接指向的文件）；mv 替换链接本身。
       #   ③ 只有同目录的 mv 才是原子的（跨文件系统会退化成 copy+unlink）。
-      local _raw_tmp="${OCR_REVIEW_RAW_OUT}.tmp.$$"
-      if cp -f "$OUT_JSON" "$_raw_tmp" 2>/dev/null && mv -f "$_raw_tmp" "$OCR_REVIEW_RAW_OUT" 2>/dev/null; then
-        :
-      else
+      #   ④ 临时名必须**不可预测**：用 "${TARGET}.tmp.$$" 这种可枚举（PID）的名字，
+      #      攻击者能预置同名符号链接，cp 会跟随它把内容写穿到任意文件（已实测复现）。
+      #      mktemp 在目标同目录创建、名随机，且 O_EXCL 保证不会被既有文件/链接抢占。
+      local _raw_dir _raw_tmp
+      _raw_dir="$(dirname "$OCR_REVIEW_RAW_OUT")"
+      _raw_tmp="$(mktemp "${_raw_dir%/}/.ocr-raw-XXXXXX" 2>/dev/null)" || _raw_tmp=""
+      if [ -z "$_raw_tmp" ]; then
+        echo "警告：无法在 $_raw_dir 创建临时文件，保存原始 JSON 到 $OCR_REVIEW_RAW_OUT 失败（事后复核将不可用）" >&2
+      elif ! cp -f "$OUT_JSON" "$_raw_tmp" 2>/dev/null || ! mv -f "$_raw_tmp" "$OCR_REVIEW_RAW_OUT" 2>/dev/null; then
         # 静默失败最坑：这个功能存在的意义就是「事后能复核」，写不成功必须说一声。
         # 但不改退出码——cleanup 不该篡改脚本本身的成败。
         rm -f "$_raw_tmp" 2>/dev/null || true
         echo "警告：保存原始 JSON 到 $OCR_REVIEW_RAW_OUT 失败（事后复核将不可用）" >&2
       fi
+      # 已知残余窗口：上面 [ -d ] 与 mv 之间，目标仍可能被并发替换成目录，此时 mv 会把
+      # 文件移进该目录。能这么做的人对目标目录已有写权限、本可径直覆盖报告文件，
+      # 故此处只做「更早发现」，不宣称已消除该竞态。
     fi
   fi
   rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}

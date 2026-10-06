@@ -292,13 +292,52 @@ test('ocr-review.sh：发布走「同目录临时文件 + mv」而非直接 cp�
   );
 });
 
-test('ocr-review.sh：成功发布后不留 .tmp 中间文件', skipUnlessHardened, () => {
+test('ocr-review.sh：成功发布后不留中间文件', skipUnlessHardened, () => {
   const sb = mkSandbox();
   const raw = path.join(sb.root, 'raw.json');
   runReviewer(sb, { OCR_REVIEW_RAW_OUT: raw });
   assert.ok(fs.existsSync(raw));
-  const leftovers = fs.readdirSync(sb.root).filter((f) => f.includes('.tmp.'));
+  const leftovers = fs.readdirSync(sb.root).filter((f) => f.includes('.tmp.') || f.startsWith('.ocr-raw-'));
   assert.deepStrictEqual(leftovers, [], `不得残留临时文件：${leftovers.join(', ')}`);
+});
+
+// 第三轮评审意见 #3：临时名若是 "${TARGET}.tmp.$$"，PID 可枚举，攻击者能预置同名符号
+// 链接，而 cp 会跟随它把内容写穿到任意文件（已实测复现）。必须用 mktemp。
+test('ocr-review.sh：临时文件名不可预测（不得用 .tmp.$$ 这类可枚举名）', skipUnlessHardened, () => {
+  assert.doesNotMatch(
+    REVIEWER_SRC_TEXT,
+    /_raw_tmp="\$\{OCR_REVIEW_RAW_OUT\}\.tmp\.\$\$"/,
+    '可预测的临时名 + cp 跟随符号链接 = 任意文件写穿，必须改用 mktemp'
+  );
+  assert.match(
+    REVIEWER_SRC_TEXT,
+    /_raw_tmp="\$\(mktemp /,
+    '临时文件必须由 mktemp 创建（O_EXCL，不会被既有链接抢占）'
+  );
+});
+
+// 第三轮评审意见 #6：指向目录的符号链接也要被拒绝（[ -d ] 会跟随链接）。
+test('ocr-review.sh：OCR_REVIEW_RAW_OUT 是指向目录的符号链接时同样拒绝', skipUnlessHardened, () => {
+  const sb = mkSandbox();
+  const realDir = path.join(sb.root, 'realdir');
+  const link = path.join(sb.root, 'linkdir');
+  fs.mkdirSync(realDir);
+  fs.symlinkSync(realDir, link);
+
+  const r = runReviewerSync(sb, { OCR_REVIEW_RAW_OUT: link });
+  assert.strictEqual(r.code, 0, '拒绝保存不应改变脚本本身的退出码');
+  assert.match(r.stderr, /警告/, '必须出声');
+  assert.deepStrictEqual(fs.readdirSync(realDir), [], '不得往链接指向的目录里塞文件');
+  assert.ok(fs.lstatSync(link).isSymbolicLink(), '链接本身不应被替换');
+});
+
+// 第三轮评审意见 #2：两条警告都应回显实际路径值，而不是只说变量名。
+test('ocr-review.sh：警告必须回显实际路径值（便于定位）', skipUnlessHardened, () => {
+  const sb = mkSandbox();
+  const rawDir = path.join(sb.root, 'rawdir');
+  fs.mkdirSync(rawDir);
+  const r = runReviewerSync(sb, { OCR_REVIEW_RAW_OUT: rawDir });
+  assert.match(r.stderr, new RegExp(rawDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), '警告里应含被拒绝的实际路径');
 });
 
 // 意见 #2：写失败曾用 `2>/dev/null || true` 完全静默，与「事后可复核」的初衷矛盾。
