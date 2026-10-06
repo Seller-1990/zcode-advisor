@@ -152,7 +152,20 @@ OUT_JSON="$(mktemp "${TMPDIR_OCR%/}/ocr-review-XXXXXX" 2>/dev/null)" || {
 }
 [ -n "$OUT_JSON" ] || { echo "错误：mktemp 未返回路径" >&2; exit 1; }
 ATTEMPT_LOG=""
-cleanup() { rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}; }
+# OCR_REVIEW_RAW_OUT（可选，由调用方提供，例如 pre-push hook）：把 ocr 的**原始 JSON**
+# 另存一份。它是权威产物（下面的渲染表由它生成），而 OUT_JSON 只是 mktemp 临时文件、
+# 退出时被本函数删掉 —— 此前评审成功后原始 JSON 一并消失，事后无法复核或重渲染。
+#
+# 两道守卫，缺一不可：
+#   - `$CHOSEN` 非空 = 确有一跳产出完整评审。**不能**只看 OUT_JSON 非空：链全失败时
+#     OUT_JSON 里留着最后一跳的 partial/无效输出，照拷会把上一份好结论覆盖成半成品。
+#   - 命中锁而提前退出的进程根本走不到这里（锁检查在 OUT_JSON 创建之前）。
+cleanup() {
+  if [ -n "${OCR_REVIEW_RAW_OUT:-}" ] && [ -n "${CHOSEN:-}" ] && [ -s "$OUT_JSON" ]; then
+    cp -f "$OUT_JSON" "$OCR_REVIEW_RAW_OUT" 2>/dev/null || true
+  fi
+  rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}
+}
 trap cleanup EXIT INT TERM
 
 # 判定一次尝试是否真正成功：退出码为 0 **且** 评审确实完整完成。
