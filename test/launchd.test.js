@@ -205,6 +205,75 @@ function probeUninstall(opts, extraEnv) {
   return JSON.parse(out.trim());
 }
 
+// install --now 走的是 ensureLoaded 的「跳过」分支，这是 install 侧的主修复点。
+// 必须在子进程里打桩：真机上不拦的话，`install --now` 会把沙箱 plist bootstrap 进
+// 用户真实的 gui 域，等于凭空多出一个自启作业。
+function probeInstallNow(opts, extraEnv) {
+  const runner = `
+    const cp = require('child_process');
+    const calls = [];
+    cp.execFileSync = (f, a) => { calls.push([f, a]); return ''; };
+    const L = require(${JSON.stringify(path.join(__dirname, '../tools/companion/launchd.cjs'))});
+    const r = L.install(${JSON.stringify(opts)});
+    process.stdout.write(JSON.stringify({ r, calls }));
+  `;
+  const out = require('child_process').execFileSync(process.execPath, ['-e', runner], {
+    encoding: 'utf8',
+    env: Object.assign({}, process.env, extraEnv || {})
+  });
+  return JSON.parse(out.trim());
+}
+
+test('install --now：沙箱 dir 只落盘，绝不 bootstrap 进真实 gui 域', () => {
+  const dir = tmpDir();
+  const probe = probeInstallNow({ dir, now: true, nodeBin: '/x/node', controllerPath: '/x/controller.cjs' });
+  assert.deepStrictEqual(probe.calls, [],
+    '沙箱 install --now 不得调用任何 launchctl（bootstrap 会往用户真实 gui 域塞作业）');
+  assert.strictEqual(probe.r.loaded, false);
+  assert.strictEqual(probe.r.skipped, true, '必须把「跳过加载」明确报给调用方');
+  assert.match(probe.r.warn, /跳过 launchd 加载/);
+  assert.ok(fs.existsSync(L.plistPath(dir)), 'plist 仍应正常落盘');
+});
+
+// 符号链接规范化：只做 path.resolve 时，「指向真实 LaunchAgents 目录的链接」会被判成
+// 另一个位置 → 真实卸载被静默跳过（卸载功能失效）。macOS 上 /var → /private/var 就是
+// 这类链接。这里用自建链接锁死语义，不依赖平台上的 /var 是否存在。
+test('路径判定：指向真实目录的符号链接仍算真实作业（否则卸载被静默跳过）', { skip: process.platform !== 'darwin' && '仅在 macOS 有 launchd 域' }, () => {
+  const linkParent = tmpDir();
+  const link = path.join(linkParent, 'LaunchAgents-link');
+  const realDir = path.join(os.homedir(), 'Library', 'LaunchAgents');
+  if (!fs.existsSync(realDir)) return;
+  fs.symlinkSync(realDir, link, 'dir');
+  // 打桩后 status 不会真的查 launchd；queried 表示「判定为真实作业、允许操作域」。
+  const probe = probeStatus({ dir: link });
+  assert.strictEqual(probe.r.queried, true,
+    '链接指向真实目录时必须认定为真实作业（path.resolve 版本会误判为沙箱）');
+});
+
+test('路径判定：沙箱目录即使经 /var 符号链接也不得认定为真实作业', () => {
+  const dir = tmpDir();
+  const probe = probeStatus({ dir });
+  assert.strictEqual(probe.r.queried, false);
+});
+
+// status 的域查询同样要打桩：真机上不拦的话，`status` 会去 print 用户真实作业，
+// 把真实运行态当成沙箱 plist 的态返回（装了 agent 的开发机上断言必红）。
+function probeStatus(opts, extraEnv) {
+  const runner = `
+    const cp = require('child_process');
+    const calls = [];
+    cp.execFileSync = (f, a) => { calls.push([f, a]); return ''; };
+    const L = require(${JSON.stringify(path.join(__dirname, '../tools/companion/launchd.cjs'))});
+    const r = L.status(${JSON.stringify(opts)});
+    process.stdout.write(JSON.stringify({ r, calls }));
+  `;
+  const out = require('child_process').execFileSync(process.execPath, ['-e', runner], {
+    encoding: 'utf8',
+    env: Object.assign({}, process.env, extraEnv || {})
+  });
+  return JSON.parse(out.trim());
+}
+
 test('uninstall：移除 plist 文件（可逆）', () => {
   const dir = tmpDir();
   L.install({ dir, nodeBin: '/x/node', controllerPath: '/x/controller.cjs' });
