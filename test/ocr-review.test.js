@@ -351,3 +351,48 @@ test('ocr-review.sh：保存失败时必须警告，但不改变脚本退出码'
   assert.match(r.stderr, /警告.*保存原始 JSON/, '写失败必须出声');
   assert.ok(!fs.existsSync(raw));
 });
+
+// 第四轮评审意见 #1 判为误报：dirname 对 "/foo.json" 返回 "/"、对 "foo.json" 返回 "."，
+// **永不为空**，故 `${_raw_dir%/}` 不会退化成空串、也就不需要 `_raw_dir="${_raw_dir:-.}"`。
+// 该建议非但是空操作，若真把 _raw_dir 兜底成 "."，临时文件会落到 CWD、与目标可能跨文件
+// 系统，mv 退化成 copy+unlink —— 恰好破坏上面 ③ 条「只有同目录 mv 才原子」的前提。
+// 用静态守卫钉住这个判断，免得下次评审又提同一建议。
+test('ocr-review.sh：不得为 _raw_dir 加 "." 兜底（会破坏同目录原子发布）', skipUnlessHardened, () => {
+  assert.doesNotMatch(
+    REVIEWER_SRC_TEXT,
+    /_raw_dir="\$\{_raw_dir:-\.\}"/,
+    'dirname 永不为空；兜底成 "." 会让临时文件离开目标目录，跨文件系统时 mv 不再原子'
+  );
+  // 真实行为核对：dirname 的两种极端输入都不是空串
+  const { execFileSync } = require('node:child_process');
+  const dirname = (p) => execFileSync('dirname', [p], { encoding: 'utf8' }).trim();
+  assert.strictEqual(dirname('/foo.json'), '/');
+  assert.strictEqual(dirname('foo.json'), '.');
+});
+
+// 第四轮评审意见 #4：建议「预清理目标目录里历史的 .ocr-raw-*」。本脚本用
+// OCR_REVIEW_FORCE=1 明确支持并行评审，另一个并发进程的临时文件正等着 mv，清掉它等于
+// 毁掉那次评审的发布。故只清自己的 _raw_tmp，绝不扫描删除别人的。
+test('ocr-review.sh：不得预清理目录里他人的 .ocr-raw-*（会毁掉并发评审的发布）', skipUnlessHardened, () => {
+  const sb = mkSandbox();
+  const otherTmp = path.join(sb.root, '.ocr-raw-otherpid');
+  fs.writeFileSync(otherTmp, '另一个并发评审正在用的临时文件');
+  const raw = path.join(sb.root, 'raw.json');
+
+  runReviewer(sb, { OCR_REVIEW_RAW_OUT: raw });
+
+  assert.ok(fs.existsSync(otherTmp), '不得删除并发进程的临时文件');
+  assert.strictEqual(fs.readFileSync(otherTmp, 'utf8'), '另一个并发评审正在用的临时文件');
+  assert.ok(fs.existsSync(raw), '自己的发布仍应成功');
+});
+
+// mktemp 建的是 0600，mv 保留该权限 → 发布出去的原始 JSON（可能含代码）不对同机其他用户可读。
+// 旧的 `cp -f` 直写会带上 umask（通常 0644），这条守卫防止实现被改回去。
+test('ocr-review.sh：发布出的原始 JSON 权限不得宽于 0600（评审原文可能含代码）', skipUnlessHardened, () => {
+  const sb = mkSandbox();
+  const raw = path.join(sb.root, 'raw.json');
+  runReviewer(sb, { OCR_REVIEW_RAW_OUT: raw });
+  assert.ok(fs.existsSync(raw));
+  const mode = fs.statSync(raw).mode & 0o777;
+  assert.strictEqual(mode & 0o077, 0, `不得对组/其他用户开放，实际权限 ${mode.toString(8)}`);
+});
