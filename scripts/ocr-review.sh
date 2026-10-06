@@ -398,11 +398,14 @@ $(tail -5 "$ATTEMPT_LOG" 2>/dev/null)
 done
 
 if [ -z "$CHOSEN" ]; then
-  record_use "-" "-" fail
   if [ "$SKIPPED_ALL" = "1" ]; then
+    # 与「链坏了」区分开：这不是 provider 失败，是编码代理占用了链上每一个模型。
+    # 记 skip 而不是 fail，否则台账会把「今天没评审」统计成「provider 全挂」。
+    record_use "-" "-" skip
     echo "错误：所有 provider 都因与编码代理同模型被跳过（agent-model=${AGENT_MODEL}）。" >&2
     echo "      可临时指定：ocr review --provider <p> --model <m>" >&2
   else
+    record_use "-" "-" fail
     echo "错误：${TOTAL_BUDGET}s 预算内没有一跳产出有效评审结果。" >&2
   fi
   if [ -n "$FAILURE_DIAG" ]; then

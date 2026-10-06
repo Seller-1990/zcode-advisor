@@ -36,6 +36,32 @@ const skipUnlessHardened = SUPPORTS_RAW_OUT_HARDENED
   ? {}
   : { skip: 'scripts/ocr-review.sh 的 RAW_OUT 尚未加固（原子发布/目录拒绝）' };
 
+// 链外置 / 时间预算 / 用量台账 / 锁清理 是另一处改动引入的能力，与 RAW_OUT 同文件但独立。
+// 逐项探测、缺哪项跳哪项，免得「同文件里一个特性已合入、另一个还没合」时整套测试被染红。
+const SUPPORTS_CHAIN_FILE = REVIEWER_SRC_TEXT.includes('OCR_REVIEW_CHAIN_FILE');
+const SUPPORTS_DEADLINE = REVIEWER_SRC_TEXT.includes('run_with_deadline');
+const SUPPORTS_BUDGET = REVIEWER_SRC_TEXT.includes('OCR_REVIEW_TOTAL_BUDGET');
+const SUPPORTS_USAGE_LOG = REVIEWER_SRC_TEXT.includes('OCR_REVIEW_USAGE_LOG');
+// 锁清理：cleanup() 的 trap 会覆盖前面那个锁 trap，故必须在 cleanup 里再删一次。
+// 钉住的是「cleanup 里必须出现 rm -rf "$LOCK_DIR"」这一实现事实。
+const SUPPORTS_LOCK_CLEANUP = /rm -rf \$\{LOCK_DIR:\+"\$LOCK_DIR"\}/.test(REVIEWER_SRC_TEXT);
+
+const skipUnlessChainFile = SUPPORTS_CHAIN_FILE
+  ? {}
+  : { skip: 'scripts/ocr-review.sh 尚不支持 OCR_REVIEW_CHAIN_FILE' };
+const skipUnlessDeadline = SUPPORTS_DEADLINE
+  ? {}
+  : { skip: 'scripts/ocr-review.sh 尚无 run_with_deadline（时间预算）' };
+const skipUnlessBudget = SUPPORTS_BUDGET
+  ? {}
+  : { skip: 'scripts/ocr-review.sh 尚不支持 OCR_REVIEW_TOTAL_BUDGET' };
+const skipUnlessUsageLog = SUPPORTS_USAGE_LOG
+  ? {}
+  : { skip: 'scripts/ocr-review.sh 尚不支持 OCR_REVIEW_USAGE_LOG' };
+const skipUnlessLockCleanup = SUPPORTS_LOCK_CLEANUP
+  ? {}
+  : { skip: 'scripts/ocr-review.sh 的 cleanup 尚未回收 LOCK_DIR' };
+
 const COMPLETE_JSON = {
   status: 'complete',
   comments: [{ path: 'x.js', severity: 'high', content: '示例意见' }],
@@ -395,4 +421,213 @@ test('ocr-review.sh：发布出的原始 JSON 权限不得宽于 0600（评审�
   assert.ok(fs.existsSync(raw));
   const mode = fs.statSync(raw).mode & 0o777;
   assert.strictEqual(mode & 0o077, 0, `不得对组/其他用户开放，实际权限 ${mode.toString(8)}`);
+});
+
+// ── 降级链外置 / 时间预算 / 用量台账 / 锁回收 ─────────────────────────────────
+// 这四项是「评审链外置」那处改动引入的。教训背景：
+//   ① 改链要改脚本正文 → 每次调链都是一次代码改动 + 一轮评审；真源应外置。
+//   ② 本机无 GNU timeout，一次建连挂起就能把整条链卡死，且锁被长期占用，
+//      之后每次推送都被误判「已有评审在进行」。
+//   ③ 没人知道当前到底在用哪个 provider（配额打满后一路降级到谁，全靠猜）。
+
+// 链文件的解析规则：一行一条 scope|provider|model，行内注释/空行/段数不对的行都要跳过，
+// 且必须**按文件顺序**取第一条可用的（顺序即优先级）。
+test('ocr-review.sh：链文件按顺序解析，跳过注释/空行/段数不对的行', skipUnlessChainFile, () => {
+  const sb = mkSandbox();
+  // 故意把干扰项放在最前面：若解析器不过滤，第一跳就会是 bad|extra 或空模型。
+  fs.writeFileSync(
+    sb.chain,
+    [
+      '# scope|provider|model',
+      '',
+      '   ',
+      'public|fake|bad|extra', // 3 个竖线：段数不对
+      'public||empty-model', // 模型为空
+      'public|fake|m1   # 行内注释必须被剥掉，否则 model 会带尾巴',
+      'public|fake|m2'
+    ].join('\n') + '\n'
+  );
+
+  const out = runReviewer(sb, {});
+  // model 必须恰好是 m1（行内注释被剥掉），而不是 "m1#行内注释必须被剥掉..."
+  assert.match(out, /成功：fake \/ m1\b/, `应取第一条合法条目，实际输出：\n${out}`);
+  assert.doesNotMatch(out, /成功：fake \/ m2/, '第一条合法条目之后的不应被用到');
+});
+
+// 链文件读不到（或解析出 0 条）时必须退回内嵌快照，脚本被单独拷走也要能跑。
+test('ocr-review.sh：链文件不可用时退回内嵌快照并吭声', skipUnlessChainFile, () => {
+  const sb = mkSandbox();
+  const missing = path.join(sb.root, 'no-such-chain');
+  const r = runReviewerSync(sb, { OCR_REVIEW_CHAIN_FILE: missing });
+
+  assert.strictEqual(r.code, 0, '退回快照后评审仍应成功');
+  assert.match(r.stderr, /链文件.*不可用/, '静默退回会让「改了链却没生效」无从察觉');
+  assert.match(r.stderr, /内嵌快照 \d+ 条/, '应说明快照里有多少条，便于判断是否退化');
+  assert.match(r.stdout, COMPLETED_RE, '快照里的第一跳应能完成评审');
+});
+
+test('ocr-review.sh：链文件存在但零条合法条目时同样退回快照', skipUnlessChainFile, () => {
+  const sb = mkSandbox();
+  fs.writeFileSync(sb.chain, '# 全是注释\nbadline\npublic||\n');
+  const r = runReviewerSync(sb, {});
+  assert.strictEqual(r.code, 0);
+  assert.match(r.stderr, /链文件.*不可用/, '解析出 0 条等同于不可用，必须退回快照');
+  assert.match(r.stdout, COMPLETED_RE);
+});
+
+// 单跳超时：本机 macOS + bash 3.2 没有 GNU timeout，run_with_deadline 用「自成进程组 +
+// 整组 TERM」实现。这里锁住两个行为：① 挂起的一跳会被掐掉并降级；② **孙进程**也必须死
+// （用 perl alarm 或裸 kill 只杀直接子进程，ocr 派生的子进程会漏成孤儿）。
+test('ocr-review.sh：单跳挂起会被强杀并降级（退出码 137/143 透传）', skipUnlessDeadline, () => {
+  const sb = mkSandbox();
+  const childPidFile = path.join(sb.root, 'grandchild.pid');
+  const state = path.join(sb.root, 'state');
+  fs.mkdirSync(state, { recursive: true });
+  // 第 1 跳：派生一个「孙进程」并记下 pid，然后自己也挂住 —— 整组被杀后孙进程必须一起死。
+  // 第 2 跳：正常返回完整 JSON，用来验证「超时后确实降级了」。
+  // 用计数文件区分两跳，而不是让假 ocr 一律挂起（那样第二跳也会挂，就测不到降级）。
+  writeFakeOcr(
+    sb,
+    `#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --output) out="$2"; shift 2;; *) shift;; esac; done
+n=0
+if [ -f "${state}/count" ]; then n=$(cat "${state}/count"); fi
+n=$((n + 1))
+printf '%s' "$n" > "${state}/count"
+if [ "$n" -eq 1 ]; then
+  sleep 300 &
+  echo $! > "${childPidFile}"
+  sleep 300
+fi
+printf '%s\\n' '${JSON.stringify(COMPLETE_JSON)}' > "$out"
+`
+  );
+  fs.writeFileSync(sb.chain, 'public|fake|hang\npublic|fake|m1\n');
+
+  const r = runReviewerSync(sb, { OCR_REVIEW_HOP_TIMEOUT: '2' });
+  assert.strictEqual(r.code, 0, '第一跳超时后应降级到第二跳并成功');
+  // 超时提示走 stdout（与「尝试 provider=…」同一路），且必须带上真实退出码，
+  // 否则看起来和「普通失败」一模一样，排查时会误判成 provider 坏了。
+  assert.match(r.stdout, /上限被强制终止（退出码 (137|143)）/, '超时必须明说并带上退出码');
+  assert.match(r.stdout, /成功：fake \/ m1/, '应降级到下一跳');
+
+  // 孙进程必须已被回收（组信号生效）。给它一点时间完成 TERM→KILL。
+  const gcPid = fs.readFileSync(childPidFile, 'utf8').trim();
+  const alive = () => {
+    try {
+      process.kill(Number(gcPid), 0);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+  const deadline = Date.now() + 5000;
+  while (alive() && Date.now() < deadline) {
+    // 忙等：孙进程若漏成孤儿会一直活着，这里最多等 5s 再断言失败
+    execFileSync('sleep', ['0.1']);
+  }
+  assert.ok(!alive(), `孙进程 ${gcPid} 仍存活 —— 说明只杀了直接子进程，ocr 派生的进程漏成孤儿`);
+});
+
+// 整条链的总预算：用完就不再试后面的 provider，宁可本次无评审，也不无限期占着锁。
+test('ocr-review.sh：总预算用尽后不再尝试剩余 provider', skipUnlessBudget, () => {
+  const sb = mkSandbox();
+  // 每一跳都挂到超时；链给 5 条，但预算只够 2 跳左右。
+  writeFakeOcr(sb, `#!/usr/bin/env bash\nsleep 300\n`);
+  fs.writeFileSync(
+    sb.chain,
+    ['public|fake|m1', 'public|fake|m2', 'public|fake|m3', 'public|fake|m4', 'public|fake|m5'].join('\n') + '\n'
+  );
+
+  const r = runReviewerSync(sb, { OCR_REVIEW_HOP_TIMEOUT: '1', OCR_REVIEW_TOTAL_BUDGET: '3' });
+  assert.strictEqual(r.code, 1, '全失败应非零退出');
+  // 进度行与「尝试 provider=…」同走 stdout；汇总错误走 stderr。两边合起来看才完整。
+  const all = r.stdout + r.stderr;
+  assert.match(all, /总预算 3s 已用尽，剩余 provider 不再尝试/, '必须明确说明是预算用尽，而非 provider 都坏了');
+  assert.match(r.stderr, /3s 预算内没有一跳产出有效评审结果/, '汇总错误里应带上预算，便于区分「链全灭」和「时间不够」');
+  // 关键：不能把 5 条全试完（否则预算形同虚设）
+  const tried = (all.match(/尝试 provider=/g) || []).length;
+  assert.ok(tried < 5, `预算用尽后不应继续尝试剩余 provider，实际尝试了 ${tried} 跳`);
+});
+
+// 用量台账：只记「哪个 provider/model、成没成」，供 ocr-pool-status.sh 展示。
+// 绝不写 diff 内容或 key。
+test('ocr-review.sh：成功时把实际使用的 provider/model 记入用量台账', skipUnlessUsageLog, () => {
+  const sb = mkSandbox();
+  const usage = path.join(sb.root, 'usage.log');
+  runReviewer(sb, { OCR_REVIEW_USAGE_LOG: usage });
+
+  const lines = fs.readFileSync(usage, 'utf8').trim().split('\n');
+  assert.strictEqual(lines.length, 1, `成功一次只应记一条，实际 ${lines.length} 条`);
+  const cols = lines[0].split('\t');
+  assert.strictEqual(cols.length, 5, '格式应为 时间\\t仓库\\tprovider\\tmodel\\tok');
+  assert.strictEqual(cols[2], 'fake');
+  assert.strictEqual(cols[3], 'm1');
+  assert.strictEqual(cols[4], 'ok');
+  // 台账是公共文件，不得泄漏评审内容
+  assert.doesNotMatch(lines[0], /示例意见|comments|diff/, '台账只记 provider/model/结果，不得写入评审正文');
+});
+
+test('ocr-review.sh：全链失败时也记一条 fail（否则「谁在失败」无从统计）', skipUnlessUsageLog, () => {
+  const sb = mkSandbox();
+  const usage = path.join(sb.root, 'usage.log');
+  writeFakeOcr(sb, `#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --output) out="$2"; shift 2;; *) shift;; esac; done
+printf '%s\\n' '{"status":"partial","comments":[]}' > "$out"
+`);
+  assert.throws(() => runReviewer(sb, { OCR_REVIEW_USAGE_LOG: usage }), /Command failed/);
+  const line = fs.readFileSync(usage, 'utf8').trim();
+  assert.match(line, /\t-\t-\tfail$/, `全链失败应记 provider=- model=- ok=fail，实际：${line}`);
+});
+
+// 「链上每个模型都被编码代理占用」不是 provider 故障。record_use 的契约里第三列是
+// ok|skip|fail 三值，这条钉住 skip 真的会被写出来——否则台账把「今天没评审」统计成
+// 「provider 全挂」，用 ocr-pool-status.sh 排查时会一路查错方向。
+test('ocr-review.sh：全被编码代理跳过时记 skip，而不是 fail', skipUnlessUsageLog, () => {
+  const sb = mkSandbox();
+  const usage = path.join(sb.root, 'usage.log');
+  // 单跳链 + agent-model 命中该跳的 model → SKIPPED_ALL
+  fs.writeFileSync(sb.chain, 'public|fake|m1\n');
+  fs.writeFileSync(path.join(sb.root, '.opencodereview', 'agent-model'), 'm1\n');
+
+  assert.throws(
+    () => runReviewer(sb, { OCR_REVIEW_USAGE_LOG: usage }),
+    /Command failed/,
+    '全部被跳过应非零退出（本次没有评审结论）'
+  );
+  const line = fs.readFileSync(usage, 'utf8').trim();
+  assert.match(line, /\t-\t-\tskip$/, `被跳过不等于失败，应记 skip，实际：${line}`);
+});
+
+// 锁回收：cleanup() 的 trap 覆盖了前面那个锁 trap，必须在 cleanup 里再删一次。
+// 否则锁目录永不消失 → 之后每次运行都走「陈旧锁」分支（能接管，但看着像坏了）。
+test('ocr-review.sh：正常运行结束后锁目录必须消失（cleanup 要回收 LOCK_DIR）', skipUnlessLockCleanup, () => {
+  const sb = mkSandbox();
+  const lockDir = path.join(sb.repo, '.git', 'ocr-review.lock');
+  // OCR_REVIEW_FORCE='' → 走真实加锁分支（默认的 '1' 会绕过锁，就测不到了）
+  runReviewer(sb, { OCR_REVIEW_FORCE: '' });
+  assert.ok(!fs.existsSync(lockDir), '成功路径结束后锁目录仍存在 —— cleanup 没有回收 LOCK_DIR');
+});
+
+test('ocr-review.sh：评审失败退出时同样回收锁目录', skipUnlessLockCleanup, () => {
+  const sb = mkSandbox();
+  const lockDir = path.join(sb.repo, '.git', 'ocr-review.lock');
+  writeFakeOcr(sb, `#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --output) out="$2"; shift 2;; *) shift;; esac; done
+printf '%s\\n' '{"status":"partial","comments":[]}' > "$out"
+`);
+  assert.throws(() => runReviewer(sb, { OCR_REVIEW_FORCE: '' }), /Command failed/);
+  assert.ok(!fs.existsSync(lockDir), '失败路径也必须回收锁，否则一次失败会污染后续每次运行');
+});
+
+// 静态守卫：把「cleanup 里必须有 LOCK_DIR 回收」钉在实现上，防止后人删掉这一行。
+test('ocr-review.sh：cleanup 必须显式回收 LOCK_DIR（trap 覆盖是这里的历史缺陷）', skipUnlessLockCleanup, () => {
+  assert.match(
+    REVIEWER_SRC_TEXT,
+    /rm -rf \$\{LOCK_DIR:\+"\$LOCK_DIR"\}/,
+    'cleanup 的 trap 覆盖了锁 trap，必须在这里再删一次 LOCK_DIR'
+  );
 });
