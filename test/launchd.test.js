@@ -256,6 +256,16 @@ test('路径判定：沙箱目录即使经 /var 符号链接也不得认定为�
   assert.strictEqual(probe.r.queried, false);
 });
 
+// realpathSync 的 TOCTOU 兜底方向必须是安全的：沙箱目录在判定途中消失时，
+// canonicalPath 退化成 path.resolve，仍不得被认成真实作业（宁可跳过，也不能误打真实作业）。
+test('路径判定：沙箱目录不存在时兜底为「非真实作业」（realpath 失败方向必须安全）', () => {
+  const gone = path.join(os.tmpdir(), `zca-vanished-${process.pid}-${Date.now()}`);
+  assert.ok(!fs.existsSync(gone), '前置条件：该目录确实不存在');
+  const s = L.status({ dir: gone });
+  assert.strictEqual(s.queried, false, '路径不可 realpath 时不得认定为真实作业（否则会误 bootout 用户真实作业）');
+  assert.strictEqual(s.loaded, false);
+});
+
 // status 的域查询同样要打桩：真机上不拦的话，`status` 会去 print 用户真实作业，
 // 把真实运行态当成沙箱 plist 的态返回（装了 agent 的开发机上断言必红）。
 function probeStatus(opts, extraEnv) {
@@ -300,6 +310,8 @@ test('uninstall：dir 覆盖时绝不 bootout 真实 LABEL（本机 npm test 会
   assert.deepStrictEqual(probe.calls, [],
     '沙箱 uninstall 不得调用任何 launchctl（bootout 会终止并卸载用户真实自启作业）');
   assert.strictEqual(probe.r.bootedOut, false);
+  assert.strictEqual(probe.r.skipped, true,
+    'skipped=true 表示「没去碰」launchd 域，与「碰了但作业未加载」可区分');
   assert.deepStrictEqual(probe.unlinked, [L.plistPath(dir)],
     '只应删除沙箱自己的 plist');
 });

@@ -128,6 +128,11 @@ function realPlistPath() {
 // /var → /private/var、/tmp → /private/tmp 都是这种链接。后果是真实卸载被误判成
 // 「不是真实作业」而静默跳过——卸载功能本身失效。realpath 之后两个方向都不会误判：
 // 指向真实目录的链接被认成真实（该 bootout），沙箱仍被认成沙箱（不碰 launchd 域）。
+//
+// realpathSync 可能因目录在两次调用之间被删而抛（TOCTOU）。这里不回退重试而是直接
+// 落到 path.resolve：**兜底方向是安全的**——沙箱目录消失时判定结果仍是「不是真实作业」，
+// 于是不碰 launchd 域（宁可不操作，也不能误打用户真实作业）。反之若真实目录消失，
+// 两条路径都退化成 path.resolve，仍然相等，卸载照常生效。
 function canonicalPath(p) {
   const dir = path.dirname(p);
   const base = path.basename(p);
@@ -206,6 +211,9 @@ function isLoaded(label) {
 //   { loaded:true,  reloaded:boolean }            —— 已加载（reloaded 表示是否重载过）
 //   { loaded:false, skipped:true, warn }          —— 故意跳过域操作（沙箱/非 darwin/无 uid）
 //   { loaded:false, warn }                        —— 真失败（bootstrap 抛错）
+//
+// 注意 skipped 只表示「**没去碰** launchd 域」，与「碰了但作业没加载」是两回事；
+// install/uninstall 的返回值沿用同一含义，调用方据此决定是否自行拉起进程。
 function ensureLoaded(plistFile, changed, label) {
   const l = label || LABEL;
   if (uid() === null) return { loaded: false, warn: '无法获取 uid，跳过加载' };
@@ -269,6 +277,9 @@ function uninstall(opts) {
   const p = plistPath(o.dir);
   // 只在「目标就是用户真实那份 + macOS」时才 bootout：否则会打掉用户真实的自启作业
   // （见 canTouchLaunchd）。重定向调用方（测试）只清理自己沙箱里的 plist 文件。
+  // 返回 { ok, path, removed, bootedOut, skipped }：skipped=true 表示**没去碰** launchd
+  // 域（沙箱/非 darwin/无 uid），此时 bootedOut 恒为 false，且与「bootout 试过但作业
+  // 本就没加载」区分开。
   let bootedOut = false;
   let skipped = false;
   if (canTouchLaunchd(p)) {
