@@ -115,6 +115,40 @@ function launchctl(args) {
   return execFileSync('/bin/launchctl', args, { stdio: 'pipe', timeout: 20000, encoding: 'utf8' });
 }
 
+// 用户真实自启作业的 plist 路径——**绕过一切覆盖**（dir 参数 / ZCODE_ADVISOR_LAUNCHD_DIR）。
+//
+// 关键不变量：LABEL 是固定常量，重定向只能改 plist 的**路径**，改不掉 launchd
+// 域里的作业名。所以一旦目标 plist 不是这一份，任何
+// `launchctl print/bootout gui/<uid>/<LABEL>` 都打在用户**真实**的自启作业上：
+//   - bootout 会终止真实作业的进程并把它从 launchd 卸载。KeepAlive 监督随作业
+//     一起消失 → 进程被杀且**永远不会自动重启**，直到用户重开一次 App
+//     （真机故障：在本机跑一次 `npm test`，外挂就被打死，表现为「动不动就连不上
+//     controller」，而 CI 跑在 Linux 上、launchctl 不存在，ENOENT 被 catch 吞掉，
+//     所以结构性看不见）。
+//   - print 会把真实作业的运行态误报成沙箱的态（装了 agent 的开发机上，
+//     「已写入但未加载」这条断言必然变红）。
+// 用路径判定而不是「有没有传 dir」：这样显式把 dir 指向真实目录、或经环境变量
+// 重定向的情形都能被正确识别。
+function realPlistPath() {
+  return path.join(os.homedir(), 'Library', 'LaunchAgents', `${LABEL}.plist`);
+}
+
+// 目标 plist 是否就是用户真实那份（只有这份才允许操作 launchd 域）。
+function managesRealAgent(p) {
+  try {
+    return path.resolve(p) === path.resolve(realPlistPath());
+  } catch (_) {
+    return false;
+  }
+}
+
+// launchd 域操作仅在 macOS 且拿得到 uid 时才有意义。
+// 显式判断而不是靠 execFileSync 抛 ENOENT 再吞掉——「静默吞掉」正是本 bug
+// 在 CI 上无法暴露的原因。
+function canTouchLaunchd(p) {
+  return process.platform === 'darwin' && uid() !== null && managesRealAgent(p);
+}
+
 // 写 plist（幂等：内容相同则不重写，保持 mtime 稳定，避免触发无谓的重载）。
 function writePlist(content, dir) {
   const p = plistPath(dir);
@@ -141,9 +175,16 @@ function isLoaded(label) {
 // 幂等加载：已加载且 plist 未变 → 什么都不做（**不能无条件 bootout+bootstrap**，
 // 那会把正在跑的实例杀掉再拉起，用户每次点图标都会闪断一次）。
 // plist 变了 → 必须重载，否则 launchd 仍按旧配置跑（升级后不生效）。
+//
+// 注意 plistFile 指向沙箱时**绝不能**走 launchd 域（见 managesRealAgent）：
+// 那里的 bootout 打的是真实 LABEL，会把用户真实的 agent 打死并卸载。
 function ensureLoaded(plistFile, changed, label) {
   const l = label || LABEL;
   if (uid() === null) return { loaded: false, warn: '无法获取 uid，跳过加载' };
+  if (!canTouchLaunchd(plistFile)) {
+    // 只落盘，由调用方决定是否需要别的加载方式；不谎报「已加载」。
+    return { loaded: false, skipped: true, warn: '目标不是用户真实 LaunchAgent，跳过 launchd 加载（避免影响真实自启作业）' };
+  }
   const loaded = isLoaded(l);
   if (loaded && !changed) return { loaded: true, reloaded: false };
   try {
@@ -196,8 +237,10 @@ function install(opts) {
 function uninstall(opts) {
   const o = opts || {};
   const p = plistPath(o.dir);
+  // 只在「目标就是用户真实那份 + macOS」时才 bootout：否则会打掉用户真实的自启作业
+  // （见 managesRealAgent）。重定向调用方（测试）只清理自己沙箱里的 plist 文件。
   let bootedOut = false;
-  if (uid() !== null) {
+  if (canTouchLaunchd(p)) {
     try { launchctl(['bootout', `gui/${uid()}/${LABEL}`]); bootedOut = true; } catch (_) { /* 未加载：忽略 */ }
   }
   let removed = false;
@@ -209,16 +252,22 @@ function status(opts) {
   const o = opts || {};
   const p = plistPath(o.dir);
   const exists = fs.existsSync(p);
+  // 目标不是真实那份时不去查 launchd 域：作业名仍是真实 LABEL，查出来的是用户真实
+  // agent 的态，当成沙箱 plist 的态返回会让调用方拿到自相矛盾的结果（沙箱里文件不存在，
+  // 却报 loaded=true）——装了 agent 的开发机上这条断言必红。
+  // 返回 loaded=false + queried=false，让「没查过」与「查过、没加载」可区分。
   let loaded = false;
+  let queried = false;
   let detail = '';
-  if (uid() !== null) {
+  if (canTouchLaunchd(p)) {
+    queried = true;
     try {
       detail = launchctl(['print', `gui/${uid()}/${LABEL}`]);
       loaded = true;
     } catch (_) { /* 未加载 */ }
   }
   const state = /state = (\w+)/.exec(detail);
-  return { path: p, exists, loaded, state: state ? state[1] : '' };
+  return { path: p, exists, loaded, queried, state: state ? state[1] : '' };
 }
 
 function main(argv) {

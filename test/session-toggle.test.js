@@ -13,6 +13,10 @@ const path = require('path');
 const healthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-health-'));
 const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-state-'));
 process.env.ZCODE_ADVISOR_HEALTH_DIR = healthDir;
+// 同理隔离生产日志（controller.cjs:135 在 require 期固化 LOG_FILE）：
+// 本文件目前不写日志，但 require controller 就一并隔离，避免后续新增用例污染用户真实日志。
+process.env.ZCODE_ADVISOR_COMPANION_LOG = path.join(
+  fs.mkdtempSync(path.join(os.tmpdir(), 'zca-sess-log-')), 'companion.log');
 const controller = require('../tools/companion/controller.cjs');
 
 const SESSION_ID = 'sess_test0001';

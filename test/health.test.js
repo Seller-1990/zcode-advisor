@@ -14,6 +14,15 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
+// 隔离生产日志：controller.cjs:135 在模块加载期解析
+// LOG_FILE = process.env.ZCODE_ADVISOR_COMPANION_LOG || ~/.zcode/advisor-companion.log，
+// 而 startApi() 在 listen 时写「本机 API 就绪」（controller.cjs:1391）。
+// 下面两个用例会起真实 HTTP server（C.startApi(1, 0, tok)），不隔离就会把测试噪音
+// 写进用户真实日志，把真实故障淹没掉。runInChild 不传 env，子进程继承本进程 env，
+// 所以这里设一次即可覆盖全部子进程。
+process.env.ZCODE_ADVISOR_COMPANION_LOG = path.join(
+  fs.mkdtempSync(path.join(os.tmpdir(), 'zca-health-log-')), 'companion.log');
+
 const HEALTH = require('../hooks/lib/health');
 
 function tmpDir(prefix) {
