@@ -14,6 +14,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 
 const LOG = process.env.ZCODE_ADVISOR_COMPANION_LOG
@@ -232,15 +233,105 @@ function cmpSemver(a, b) {
   return 0;
 }
 
+// ── 同版本内容漂移检测 ──
+// 为什么需要（真机故障）：宿主 cache 是「市场源目录」的逐字节拷贝，而市场源在
+// .app 内 = **打包时**的插件快照。若某次发版把版本号提上去了、内容却是旧的
+//（2cd7e42 只改了 plugins/ 镜像的两份 version，根目录仍 0.2.19、reviewer.js 还是
+// pre-anthropic），用户装到的就是「版本号 0.2.20、代码却是旧的」。
+// 此后无论重跑多少次 auto-enable，纯版本比较都判「已装 0.2.20 == 包内 0.2.20 → 就绪」，
+// 幂等快路径直接返回 → 新代码永远进不了宿主 cache。用户看到的就是「修了没生效」。
+//
+// 判据：已装版本与包内版本**相同**时，再比一次内容指纹；不同即视为未就绪、强制重装。
+// 已装版本更高时**不比对**（保住「不降级」语义：旧 .app 的快照不得覆盖用户手装的新版本）。
+//
+// 指纹只覆盖 ITEMS（与构建期 stagePluginPayload 的清单一致），且**跳过所有
+// marketplace.json**：构建期会按设计把它们的 source 改写成 './'，两侧本就不该逐字节相同。
+const FP_ITEMS = [
+  '.zcode-plugin', '.claude-plugin', 'hooks', 'commands', 'tools',
+  'package.json', 'README.md', 'advisor.config.example.json'
+];
+
+function hashFile(p) {
+  return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+}
+
+// 递归收集 {相对路径: sha256}。跳过 __pycache__（跑过一次 tools/*.py 就生成，
+// 不属于 payload）与 .orphan-*（sync-plugin-dir 的隔离回收站）。
+function collectHashes(dir, rel, out) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch (_) { return out; }
+  for (const name of names.sort()) {
+    if (name === '__pycache__' || name.startsWith('.orphan-')) continue;
+    const abs = path.join(dir, name);
+    const r = rel ? `${rel}/${name}` : name;
+    let st;
+    try { st = fs.statSync(abs); } catch (_) { continue; }
+    if (st.isDirectory()) { collectHashes(abs, r, out); continue; }
+    // 构建期会改写 source，两侧本就不一致——不纳入指纹
+    if (name === 'marketplace.json') continue;
+    try { out[r] = hashFile(abs); } catch (_) { /* 不可读：不纳入指纹 */ }
+  }
+  return out;
+}
+
+// 目录内容指纹：对「相对路径 + 文件 sha256」排序后整体再哈希。
+// 任一 ITEM 缺失只会让两侧指纹不同（正是我们想要的：缺文件 = 内容漂移）。
+function computeFingerprint(dir) {
+  const map = {};
+  for (const item of FP_ITEMS) {
+    const abs = path.join(dir, item);
+    let st;
+    try { st = fs.statSync(abs); } catch (_) { continue; }
+    if (st.isDirectory()) collectHashes(abs, item, map);
+    else if (path.basename(item) !== 'marketplace.json') {
+      try { map[item] = hashFile(abs); } catch (_) {}
+    }
+  }
+  const keys = Object.keys(map).sort();
+  if (keys.length === 0) return '';
+  const h = crypto.createHash('sha256');
+  for (const k of keys) h.update(`${k}\u0000${map[k]}\n`);
+  return h.digest('hex');
+}
+
+// 从 `plugins list` 输出里取已装插件的 cache 目录（即 installPath）。
+// 真实形态（多插件时必须在 zcode-advisor 那一块里找，否则会拿到别的插件的路径）：
+//   - zcode-advisor@zcode-advisor-local [enabled]
+//     cache/zcode-advisor-local: /Users/…/zcode-advisor/0.2.20
+function parseInstallPath(out) {
+  const lines = String(out || '').split('\n');
+  const start = lines.findIndex((l) => /zcode-advisor@\S+/.test(l));
+  if (start < 0) return '';
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i];
+    // 走到下一个插件条目（以 `- ` 开头的行）就停，避免越界到别的插件
+    if (/^\s*-\s/.test(l)) break;
+    const m = /cache\/[^:\n]*:\s*([^\n]+)/.exec(l);
+    if (m) return m[1].trim();
+  }
+  return '';
+}
+
 // 纯决策：给定 `plugins list` 输出与包内版本，判断是否已就绪（可跳过安装）。
 // 抽成纯函数是为了能直接单测——「不降级」这条判据一旦写错，用户新装的版本会被
 // 旧 .app 反复覆盖回快照版本（真机故障），必须有测试锁住。
-function isReadyFromList(out, pkgVersion) {
+//
+// fps 可选：{ payload, installed } 两个内容指纹。给了就启用「同版本漂移检测」；
+// 不给则行为与旧版完全一致（现有单测不受影响）。
+function isReadyFromList(out, pkgVersion, fps) {
   if (!/zcode-advisor@\S+\s+\[enabled\]/.test(out)) return false;
   if (!pkgVersion) return true;
   // 已装版本从 cache 路径解析：`…/zcode-advisor/<ver>`
   const installed = ((/zcode-advisor\/(\d+\.\d+\.\d+)/.exec(out) || [])[1]) || '';
-  if (installed) return cmpSemver(installed, pkgVersion) >= 0;  // 已装 >= 包内 → 就绪（不降级）
+  if (installed) {
+    const c = cmpSemver(installed, pkgVersion);
+    if (c > 0) return true;        // 已装更高 → 就绪（绝不降级）
+    if (c < 0) return false;       // 包内更高 → 必须重装
+    // 版本相同：再比内容指纹。任一侧指纹缺失（目录不可读等）时保守判为就绪，
+    // 退回旧行为——宁可漏检一次，也不要让指纹计算失败变成「每次启动都重装」。
+    if (fps && fps.payload && fps.installed) return fps.payload === fps.installed;
+    return true;
+  }
   return out.includes(`zcode-advisor/${pkgVersion}`);           // 解析不出 → 退回精确匹配
 }
 
@@ -256,8 +347,22 @@ function alreadyEnabled(cli, nodeBin, payload) {
     try {
       pkgVersion = JSON.parse(fs.readFileSync(path.join(payload, 'package.json'), 'utf8')).version || '';
     } catch (_) {}
-    const ready = isReadyFromList(out, pkgVersion);
-    if (ready && pkgVersion && !out.includes(`zcode-advisor/${pkgVersion}`)) {
+
+    // 同版本内容漂移检测所需的两个指纹（见 isReadyFromList 上方说明）。
+    // 只在「已装版本 == 包内版本」时才会被用到；此时若内容不同，必须强制重装。
+    const installedDir = parseInstallPath(out);
+    const fps = {
+      payload: computeFingerprint(payload),
+      installed: installedDir ? computeFingerprint(installedDir) : ''
+    };
+
+    const ready = isReadyFromList(out, pkgVersion, fps);
+    if (!ready && pkgVersion && installedDir && fps.payload && fps.installed
+        && fps.payload !== fps.installed && out.includes(`zcode-advisor/${pkgVersion}`)) {
+      // 版本号相同、内容却不同：宿主 cache 里的插件是旧快照（真机故障根因）。
+      // 必须报出来——否则用户只会看到「修了没生效」，无从判断卡在哪一步。
+      log(`已装 ${pkgVersion} 与包内版本号相同但内容不一致（宿主 cache 是旧快照）——强制重装`);
+    } else if (ready && pkgVersion && !out.includes(`zcode-advisor/${pkgVersion}`)) {
       log(`已装版本不低于包内 ${pkgVersion}——跳过（不降级）`);
     }
     return ready;
@@ -340,4 +445,7 @@ function runEnable() {
 if (require.main === module) process.exitCode = main();
 
 // 供单测验证「不降级」判据（避免真跑 CLI）
-module.exports = { cmpSemver, parseSemver, alreadyEnabled, isReadyFromList, findPluginPayload };
+module.exports = {
+  cmpSemver, parseSemver, alreadyEnabled, isReadyFromList, findPluginPayload,
+  computeFingerprint, parseInstallPath
+};

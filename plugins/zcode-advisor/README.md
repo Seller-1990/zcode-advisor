@@ -122,6 +122,9 @@ NSIS 是业界标准安装器（非 IExpress 自解压），快捷方式直接�
   安装包自动挂到 Release；
 - **手动触发**：Actions 页面 `Run workflow`，只上传 artifact 供验证，不发 Release。
 
+发版前先升版本号：`node tools/companion/bump-version.cjs 0.2.21`
+（版本号在四处，必须同值——只改一处会装出「版本号新、内容旧」的插件，见 ARCHITECTURE.md）。
+
 流程包含一道确定性门禁：Linux 上先跑全量测试（`npm test`），通过后才进入打包；
 macOS 侧在打包后额外做 **DMG 挂载冒烟**（确认 `.app` 与启动器存在），Windows 侧确认 `makensis` 可用。
 

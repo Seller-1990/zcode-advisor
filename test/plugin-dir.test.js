@@ -71,6 +71,37 @@ test('同步脚本能发现「源已删除、副本残留」的幽灵文件（0.
   }
 });
 
+test('四处版本号必须一致（2cd7e42 只提镜像版本号 → 装出「版本号新、内容旧」）', () => {
+  // 真机故障根因：某次提交只把 plugins/zcode-advisor/ 的两份 version 提到 0.2.20，
+  // 根目录的 package.json / .zcode-plugin/plugin.json 仍是 0.2.19，而 reviewer.js 还是
+  // pre-anthropic 的旧内容。宿主于是装出「版本 0.2.20、代码却旧」的插件，此后
+  // auto-enable 的纯版本比较永远判「已装 == 包内 → 就绪」，新代码再也进不了 cache。
+  //
+  // 版本号是安装侧判断「要不要重装」的唯一依据，四处必须同源同值。
+  // 注意：这里**不是**要求版本号与内容自动一致（那靠发版纪律），而是保证不会出现
+  // 「同一个仓库里两个不同版本号」这种必然导致错配的状态。
+  const root = path.join(__dirname, '..');
+  const files = [
+    'package.json',
+    '.zcode-plugin/plugin.json',
+    'plugins/zcode-advisor/package.json',
+    'plugins/zcode-advisor/.zcode-plugin/plugin.json'
+  ];
+  const versions = files.map((f) => {
+    const p = path.join(root, f);
+    assert.ok(fs.existsSync(p), `${f} 应存在`);
+    const v = JSON.parse(fs.readFileSync(p, 'utf8')).version;
+    assert.ok(v, `${f} 应有 version 字段`);
+    return { f, v };
+  });
+  const first = versions[0].v;
+  const mismatch = versions.filter((x) => x.v !== first);
+  assert.deepStrictEqual(mismatch, [],
+    `版本号不一致（会装出「版本号新、内容旧」的插件）：\n` +
+    versions.map((x) => `  ${x.v}  ${x.f}`).join('\n') +
+    `\n四处必须同为 ${first}——改版本时用 tools/companion/bump-version.cjs 或手工四处同步。`);
+});
+
 test('同步脚本幂等：连续两次 --check 均无漂移', () => {
   const run = () => {
     try {

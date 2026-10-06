@@ -170,5 +170,12 @@ plugins/zcode-advisor/                  ← 市场 source 指向它
 - **改 hook 逻辑** → 跑 `npm test`（e2e 覆盖三事件契约）
 - **改 UI（inject.js）** → 跑测试 + **真机验证**（DOM 桩有覆盖盲区）
 - **改插件构成**（增删目录/文件）→ **同步 `sync-plugin-dir.cjs` 的 ITEMS**，否则副本漏文件
-- **改版本号** → 只改 `.zcode-plugin/plugin.json`（单一来源，构建脚本读它）
+- **改版本号** → `node tools/companion/bump-version.cjs 0.2.21`（**不要手改**）。
+  版本号散落四处（根 `package.json`、根 `.zcode-plugin/plugin.json`、以及
+  `plugins/zcode-advisor/` 下的同名两份），必须同值：宿主只认版本号来决定「要不要重装」，
+  只提其中两份会装出**「版本号新、内容旧」**的插件，此后 auto-enable 的版本比较
+  永远判「已装 == 包内 → 就绪」，新代码再也进不了宿主 cache（用户现象：「修了没生效」）。
+  `test/plugin-dir.test.js` 有守卫，四处不一致时 `npm test` 直接失败。
+  （构建期读版本的单一来源仍是根 `.zcode-plugin/plugin.json`——那只是构建脚本的入口，
+  不等于「只需改它」。）
 - **改配置键** → 同步 `advisor.config.example.json` 与 README 配置表
