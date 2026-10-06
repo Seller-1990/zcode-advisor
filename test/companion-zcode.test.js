@@ -17,6 +17,10 @@ process.env.ZCODE_ADVISOR_USER_CONFIG = USER_CFG;
 process.env.ZCODE_ADVISOR_ZCODE_CONFIG = V2_CFG;
 // 隔离第二个数据源（provider_config.json）：否则会读到开发机真实配置，断言随环境漂移。
 process.env.ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG = path.join(dir, 'no-such-provider-config.json');
+// 隔离生产日志：controller.cjs:135 在 require 期固化 LOG_FILE。本文件的 saveUserConfig
+// 用例会触发 0.2.17 迁移日志（controller.cjs:733），不隔离就会写进用户真实日志
+// （配置隔离与日志隔离是两条独立的轴）。
+process.env.ZCODE_ADVISOR_COMPANION_LOG = path.join(dir, 'companion.log');
 fs.writeFileSync(V2_CFG, JSON.stringify({
   provider: {
     p1: {

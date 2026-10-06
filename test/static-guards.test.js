@@ -242,3 +242,24 @@ test('测试文件：无遗留的调试输出', () => {
     assert.ok(!/\[dbg\]/.test(src), `test/${f} 残留调试输出`);
   }
 });
+
+// 生产日志隔离守卫。
+//
+// 真机故障：controller.cjs:135 在模块加载期固化
+//   LOG_FILE = process.env.ZCODE_ADVISOR_COMPANION_LOG || ~/.zcode/advisor-companion.log
+// 只要测试 require 了 controller 却忘了设该 env，测试产生的日志（startApi 的
+// 「本机 API 就绪」、saveUserConfig 的 0.2.17 迁移行）就会写进用户**真实**日志，
+// 把真实故障淹没在测试噪音里，且「外挂从未启动」会被误读成「外挂反复启动」。
+// 这条守卫让「新增一个 require controller 的测试却忘记隔离」在 npm test 阶段就暴露。
+test('测试文件：require controller.cjs 必须同时隔离 ZCODE_ADVISOR_COMPANION_LOG', () => {
+  const offenders = [];
+  for (const f of fs.readdirSync(path.join(ROOT, 'test'))) {
+    if (!/\.test\.(js|cjs)$/.test(f)) continue;
+    const src = read(path.join('test', f));
+    // 只看真正 require() 控制器模块的文件；纯读文本的静态断言不算。
+    if (!/require\(['"][^'"]*companion\/controller/.test(src)) continue;
+    if (!/ZCODE_ADVISOR_COMPANION_LOG/.test(src)) offenders.push(`test/${f}`);
+  }
+  assert.deepStrictEqual(offenders, [],
+    `以下测试 require 了 controller.cjs 但未隔离 ZCODE_ADVISOR_COMPANION_LOG，会污染用户真实日志：${offenders.join(', ')}`);
+});

@@ -20,6 +20,9 @@ const path = require('path');
 // 读到开发者本机真实的 ~/.zcode/v2/config.json（断言漂移 + 明文 key 进测试输出）。
 process.env.ZCODE_ADVISOR_ZCODE_CONFIG = path.join(os.tmpdir(), `zcadv-inject-no-zcode-${Date.now()}.json`);
 process.env.ZCODE_ADVISOR_USER_CONFIG = path.join(os.tmpdir(), `zcadv-inject-no-user-${Date.now()}.json`);
+// 本文件在端点归一化用例里 require controller.cjs，而 controller.cjs:135 在 require 期
+// 固化 LOG_FILE → 一并隔离，避免任何写日志路径落到用户真实的 advisor-companion.log。
+process.env.ZCODE_ADVISOR_COMPANION_LOG = path.join(os.tmpdir(), `zcadv-inject-log-${Date.now()}.log`);
 
 const INJECT_SRC = fs.readFileSync(
   path.join(__dirname, '..', 'tools', 'companion', 'inject.js'),

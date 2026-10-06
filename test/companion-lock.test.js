@@ -19,6 +19,12 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// 隔离生产日志：controller.cjs:135 在 require 期固化 LOG_FILE。本文件目前不写日志，
+// 但「require controller 就必须隔离日志路径」是这里的统一约束——否则将来新增用例
+// 一旦走到 startApi/saveUserConfig，噪音会直接落进用户真实日志。
+process.env.ZCODE_ADVISOR_COMPANION_LOG = path.join(
+  fs.mkdtempSync(path.join(os.tmpdir(), 'zca-lock-log-')), 'companion.log');
+
 const { _internal: I } = require('../tools/companion/controller.cjs');
 const LOCK = I.LOCK_FILE;
 
