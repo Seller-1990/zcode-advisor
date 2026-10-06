@@ -7,19 +7,17 @@
 #   - 也**不定时跑**：只在每个 PR 合并前调用一次。
 #
 # 模型降级链（provider|model，与 ~/.opencodereview/config.json 的 custom_providers 对应）：
+#   ⚠️ 链的**唯一真源**是 ~/.dsh/templates/ocr-review/chain-public（运行时直接读它）。
+#      本文件里那段 CHAIN 数组只是读不到链文件时的**兜底快照**，别在这里找当前顺序——
+#      它必然滞后（改链不必改脚本，也就没人会记得同步它）。
+#      改链：编辑 chain-public 再跑 bash ~/.dsh/bin/ocr-sync-reviewer.sh 刷快照。
+#   这里不再逐条列举模型名与顺序：链外置的全部意义就是「枚举会过期」，再抄一份
+#   只会制造第二处会撒谎的注释（2026-10-06 实测：注释写着主棒 deepseek，运行时首跳
+#   其实是 chain-public 的 minimax-m3）。各模型的可用性/耗时/成本结论写在链文件里，
+#   那才是它们生效的地方。
 #   【2026-10-04】隐私铁律暂缓（用户拍板）：私有仓也可用本链（私有副本用 ocr-review.sh.private
 #      变体，链走 chain-private，同样允许 cloud 条目）。
-#   主    nas-hy4     -> deepseek-v4.1-flash （8787 免费，工具调用已实测）
-#   备用① runanytime  -> z-ai/glm-5.2       （随时跑路中转，本机中继 127.0.0.1:18789，工具调用已实测）
-#   备用② nas-octopus -> glm-5.3-flash      （8088 PM-API 免费分组）
-#   备用③ nas-hy4     -> hy3                （8787 免费）
-#   备用④ nas-hy4     -> hy4-preview-f      （8787 免费）
-#   备用⑤ x666        -> ministral-14b-latest （云端 0 倍率，工具调用已实测；该站唯一可用，2026-10-04 全站复测）
-#   备用⑥ lucky       -> stealth/space-bunny-alpha （云端，工具调用已实测）
-#   备用⑦ lucky       -> step-5-preview     （云端，工具调用已实测）
-#   备用⑧ daigua      -> gpt-6-sol          （云端，顾问生产验证过工具调用）
-#   （lucky-gem/gemini-3.6-flash 已出链：2026-10-04 实测 503 无通道）
-#   ⚠️ 同站 kimi-k3 不支持工具调用（2026-10-04 三次探针无 tool_calls）→ 不能当 ocr 模型，勿加回。
+#   ⚠️ kimi-k3 不支持工具调用（三次探针无 tool_calls）→ 不能当 ocr 模型，勿加回。
 # 用法：
 #   ./scripts/ocr-review.sh              # 默认基准 origin/dev（不存在则回退 main）
 #   ./scripts/ocr-review.sh v1.8.8       # 对比 tag / 分支
@@ -42,9 +40,14 @@ cd "$REPO_ROOT" || exit 1
 #   - 持锁进程已死（崩溃/被 kill）→ 视为陈旧锁，接管
 LOCK_DIR="$REPO_ROOT/.git/ocr-review.lock"
 LOCK_INFO="$LOCK_DIR/info"
+# 只有**自己拿到锁**才允许在退出时删锁。OCR_REVIEW_FORCE=1 整段跳过、根本不取锁，
+# 若无条件删就会把另一个正在跑的评审的锁连根拔掉——而并行评审正是 FORCE 的用途，
+# 于是「强制并行」变成「两个进程互相拆锁」。清理由 cleanup() 按这个标记判断。
+LOCK_ACQUIRED=""
 # OCR_REVIEW_FORCE=1 可绕过（需要并行评审时显式指定）
 if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
   if mkdir "$LOCK_DIR" 2>/dev/null; then
+    LOCK_ACQUIRED=1
     printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
     trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
   else
@@ -58,6 +61,7 @@ if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
     fi
     # 陈旧锁：持锁进程已不存在，接管
     echo "[ocr-review] 发现陈旧锁（pid ${HOLD_PID:-未知} 已退出），接管"
+    LOCK_ACQUIRED=1
     printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
     trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
   fi
@@ -262,7 +266,9 @@ cleanup() {
       # （dirname 对 "/foo.json" 返回 "/"、对 "foo.json" 返回 "."，**永不为空**，故无需兜底。）
     fi
   fi
-  rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}; rm -rf ${LOCK_DIR:+"$LOCK_DIR"}
+  rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}
+  # 只在**自己持锁**时回收（见 LOCK_ACQUIRED 定义处）：无条件删会把并行评审的锁拆掉。
+  [ -n "$LOCK_ACQUIRED" ] && rm -rf "$LOCK_DIR"
 }
 trap cleanup EXIT INT TERM
 

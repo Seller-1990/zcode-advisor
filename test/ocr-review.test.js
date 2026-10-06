@@ -43,8 +43,9 @@ const SUPPORTS_DEADLINE = REVIEWER_SRC_TEXT.includes('run_with_deadline');
 const SUPPORTS_BUDGET = REVIEWER_SRC_TEXT.includes('OCR_REVIEW_TOTAL_BUDGET');
 const SUPPORTS_USAGE_LOG = REVIEWER_SRC_TEXT.includes('OCR_REVIEW_USAGE_LOG');
 // 锁清理：cleanup() 的 trap 会覆盖前面那个锁 trap，故必须在 cleanup 里再删一次。
-// 钉住的是「cleanup 里必须出现 rm -rf "$LOCK_DIR"」这一实现事实。
-const SUPPORTS_LOCK_CLEANUP = /rm -rf \$\{LOCK_DIR:\+"\$LOCK_DIR"\}/.test(REVIEWER_SRC_TEXT);
+// 但**必须只删自己拿到的锁**：OCR_REVIEW_FORCE=1 整段跳过、根本不取锁，无条件删会把
+// 另一个正在跑的评审的锁连根拔掉——而并行正是 FORCE 的用途。
+const SUPPORTS_LOCK_CLEANUP = /LOCK_ACQUIRED/.test(REVIEWER_SRC_TEXT);
 
 const skipUnlessChainFile = SUPPORTS_CHAIN_FILE
   ? {}
@@ -623,11 +624,35 @@ printf '%s\\n' '{"status":"partial","comments":[]}' > "$out"
   assert.ok(!fs.existsSync(lockDir), '失败路径也必须回收锁，否则一次失败会污染后续每次运行');
 });
 
-// 静态守卫：把「cleanup 里必须有 LOCK_DIR 回收」钉在实现上，防止后人删掉这一行。
-test('ocr-review.sh：cleanup 必须显式回收 LOCK_DIR（trap 覆盖是这里的历史缺陷）', skipUnlessLockCleanup, () => {
+// 并行评审的核心用例：OCR_REVIEW_FORCE=1 表示「我知道有锁，我偏要并行跑」，
+// 它整段跳过取锁。此时若 cleanup 仍无条件 rm -rf "$LOCK_DIR"，就会把**另一个
+// 正在跑的评审**的锁连根拔掉——FORCE 的用途恰恰是并行，于是变成互相拆锁，
+// 两个进程都以为自己独占。这条先证伪再锁定：pre-fix 脚本跑完锁会消失。
+test('ocr-review.sh：FORCE=1 并行运行时不得删掉别人的锁', skipUnlessLockCleanup, () => {
+  const sb = mkSandbox();
+  const lockDir = path.join(sb.repo, '.git', 'ocr-review.lock');
+  // 模拟「另一个评审正持锁」：目录存在 + info 里写一个活着的 pid（用本进程，
+  // 保证 kill -0 为真，走不到「陈旧锁接管」分支——否则就测成接管而非并行了）。
+  fs.mkdirSync(lockDir, { recursive: true });
+  fs.writeFileSync(path.join(lockDir, 'info'), `pid=${process.pid}\nstarted=0\n`);
+
+  runReviewer(sb, { OCR_REVIEW_FORCE: '1' });
+  assert.ok(
+    fs.existsSync(lockDir),
+    'FORCE=1 没有取锁，退出时却把锁删了 —— 并行评审会互相拆锁'
+  );
+});
+// 同时钉住**有条件的**回收——无条件 rm -rf 会让 FORCE=1 的并行评审互相拆锁。
+test('ocr-review.sh：cleanup 回收 LOCK_DIR 必须限定在自己持锁时', skipUnlessLockCleanup, () => {
   assert.match(
     REVIEWER_SRC_TEXT,
+    /\[ -n "\$LOCK_ACQUIRED" \] && rm -rf "\$LOCK_DIR"/,
+    'cleanup 的 trap 覆盖了锁 trap，必须在这里回收 LOCK_DIR；且必须限定 LOCK_ACQUIRED，否则拆掉并行评审的锁'
+  );
+  // 反面：不得再出现无条件的 rm -rf "$LOCK_DIR"（FORCE=1 路径从未取锁）
+  assert.doesNotMatch(
+    REVIEWER_SRC_TEXT,
     /rm -rf \$\{LOCK_DIR:\+"\$LOCK_DIR"\}/,
-    'cleanup 的 trap 覆盖了锁 trap，必须在这里再删一次 LOCK_DIR'
+    'FORCE=1 不取锁却删锁 = 拆掉并发评审的锁，这个写法已废弃'
   );
 });
