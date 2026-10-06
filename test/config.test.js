@@ -148,6 +148,13 @@ function zcodeFixtureFile(dir) {
         options: { baseURL: 'https://relay.example.com', apiKey: 'sk-ant' },
         models: { 'claude-opus-5': {} }
       },
+      // 协议不受支持（既非 OpenAI 兼容、也非 Anthropic）：必须判 ineligible、不产出凭据。
+      'prov-unknown': {
+        name: '未知协议网关',
+        kind: 'bedrock',
+        options: { baseURL: 'https://bedrock.example.com', apiKey: 'sk-unknown' },
+        models: { 'some-model': {} }
+      },
       'builtin:bigmodel': {
         name: 'BigModel 官方',
         kind: 'openai',
@@ -207,17 +214,29 @@ test('服务商解析：环境变量仍优先于服务商解析（env 是显式�
   assert.strictEqual(cfg.baseUrl, 'http://192.168.50.139:8088/v1');
 });
 
-test('服务商解析：协议不兼容/官方内置/找不到时都不产出凭据（防密钥交叉）', () => {
+test('服务商解析：协议不受支持/官方内置/找不到时都不产出凭据（防密钥交叉）', () => {
   const file = zcodeFixtureFile(tmpRoot());
   const root = tmpRoot();
+  // 不受支持的协议（kind=bedrock）→ 不产出 baseUrl/apiKey（旧版会回退手动值 = 密钥交叉面）
   fs.writeFileSync(path.join(root, 'advisor.config.json'), JSON.stringify({
-    zcodeProvider: 'prov-anthropic', model: 'manual-model'
+    zcodeProvider: 'prov-unknown', model: 'manual-model'
   }));
   const cfg = loadConfig(root, hermeticEnv({ ZCODE_ADVISOR_ZCODE_CONFIG: file }));
-  // 不兼容 → 不产出 baseUrl/apiKey（旧版会回退手动值 = 密钥交叉面）
   assert.strictEqual(cfg.baseUrl, undefined);
   assert.strictEqual(cfg.apiKey, undefined);
   assert.ok(cfg.problems.some((p) => p.startsWith('zcode_provider_ineligible')));
+
+  // anthropic 协议：自 0.2.20 起受支持（reviewer.js 走 /v1/messages）——必须产出凭据与协议标记
+  const rootAnt = tmpRoot();
+  fs.writeFileSync(path.join(rootAnt, 'advisor.config.json'), JSON.stringify({
+    zcodeProvider: 'prov-anthropic', model: 'claude-opus-5'
+  }));
+  const cfgAnt = loadConfig(rootAnt, hermeticEnv({ ZCODE_ADVISOR_ZCODE_CONFIG: file }));
+  assert.strictEqual(cfgAnt.baseUrl, 'https://relay.example.com');
+  assert.strictEqual(cfgAnt.apiKey, 'sk-ant');
+  assert.strictEqual(cfgAnt.model, 'claude-opus-5');
+  assert.strictEqual(cfgAnt.protocol, 'anthropic');
+  assert.strictEqual(cfgAnt.problems.some((p) => p.startsWith('zcode_provider_ineligible')), false);
 
   // 官方内置通道：明确拒绝
   const root2 = tmpRoot();
@@ -257,18 +276,23 @@ test('旧版手动残留（apiSource/baseUrl/apiKey/zcodeModel）不再参与解
   assert.strictEqual(cfg.model, 'glm-5.3-flash');
 });
 
-test('listZcodeProviders：剔除 apiKey 明文并给出 eligible/official/hasApiKey 标记', () => {
+test('listZcodeProviders：剔除 apiKey 明文并给出 eligible/official/protocol/hasApiKey 标记', () => {
   const file = zcodeFixtureFile(tmpRoot());
   const list = listZcodeProviders({ ZCODE_ADVISOR_ZCODE_CONFIG: file, ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(os.tmpdir(), 'zcadv-no-zpc-lp.json') });
-  assert.strictEqual(list.length, 3);
+  assert.strictEqual(list.length, 4);
   const p3p = list.find((p) => p.id === 'prov-3p');
   assert.strictEqual(p3p.eligible, true);
+  assert.strictEqual(p3p.protocol, 'openai');
   assert.strictEqual(p3p.official, false);
   assert.strictEqual(p3p.hasApiKey, true);
   assert.strictEqual('apiKey' in p3p, false, '列表不得携带 apiKey 明文');
   assert.deepStrictEqual(p3p.models, ['glm-5.3-flash', 'kimi-k3']);
   const pant = list.find((p) => p.id === 'prov-anthropic');
-  assert.strictEqual(pant.eligible, false);
+  assert.strictEqual(pant.eligible, true, 'anthropic 自 0.2.20 起可用（走 /v1/messages）');
+  assert.strictEqual(pant.protocol, 'anthropic');
+  const punknown = list.find((p) => p.id === 'prov-unknown');
+  assert.strictEqual(punknown.eligible, false, '既非 OpenAI 兼容也非 Anthropic → 不可用');
+  assert.strictEqual(punknown.protocol, '');
   const pbuiltin = list.find((p) => p.id === 'builtin:bigmodel');
   assert.strictEqual(pbuiltin.official, true, 'builtin: 前缀 = ZCode 官方内置通道');
 });
@@ -323,6 +347,39 @@ test('env 逃生舱：端点与 key 必须成对（与 hook 侧 resolveTarget �
   assert.ok(ph.problems.some((p) => p.startsWith('env_override_incomplete')));
 });
 
+test('env 逃生舱：协议随端点一起切（不得沿用服务商侧旧协议）', () => {
+  // 复审实测的缺陷：服务商 kind=anthropic + env 端点指向 OpenAI 端点时，
+  // cfg.baseUrl 已切换而 cfg.protocol 仍停在 anthropic → key 会以 x-api-key
+  // 发到 OpenAI 端点（与"端点/key 交叉"同类）。协议必须一起切。
+  const file = zcodeFixtureFile(tmpRoot());
+  const root = tmpRoot();
+  fs.writeFileSync(path.join(root, 'advisor.config.json'), JSON.stringify({ zcodeProvider: 'prov-anthropic' }));
+  const cfg = loadConfig(root, hermeticEnv({
+    ZCODE_ADVISOR_ZCODE_CONFIG: file,
+    ZCODE_ADVISOR_BASE_URL: 'https://openai.example/v1',
+    ZCODE_ADVISOR_API_KEY: 'sk-openai-env-key'
+  }));
+  assert.strictEqual(cfg.baseUrl, 'https://openai.example/v1');
+  assert.strictEqual(cfg.protocol, 'openai', 'env 端点非 /messages 结尾 → 协议必须切回 openai');
+
+  // env 端点以 /messages 结尾 → 推断为 anthropic
+  const ant = loadConfig(root, hermeticEnv({
+    ZCODE_ADVISOR_ZCODE_CONFIG: file,
+    ZCODE_ADVISOR_BASE_URL: 'https://anthropic.example/v1/messages',
+    ZCODE_ADVISOR_API_KEY: 'sk-ant-env-key'
+  }));
+  assert.strictEqual(ant.protocol, 'anthropic');
+
+  // 显式 ZCODE_ADVISOR_PROTOCOL 优先
+  const explicit = loadConfig(root, hermeticEnv({
+    ZCODE_ADVISOR_ZCODE_CONFIG: file,
+    ZCODE_ADVISOR_BASE_URL: 'https://weird.example/v1',
+    ZCODE_ADVISOR_API_KEY: 'sk-weird-env-key',
+    ZCODE_ADVISOR_PROTOCOL: 'anthropic'
+  }));
+  assert.strictEqual(explicit.protocol, 'anthropic', '显式 protocol 应生效');
+});
+
 // —— 回归：provider_config.json 是第二个数据源，漏读会看不到「界面新建的服务商」 ——
 // 用户实测报障「抓不到我 zcode 里所有第三方 api」：内网 workbuddy 只存在于
 // provider_config.json（providerId='new-provider'），config.json 里没有它。
@@ -352,7 +409,7 @@ test('readZcodeProviders：合并 provider_config.json（界面新建的服务�
         config: { access: { type: 'api-key', apiKey: 'sk-old-key-1234' },
           api: { type: 'openai-chat-completions', baseUrl: 'http://old/v1' },
           personalModelIds: ['m-old', 'm-new-extra'] } },
-      // anthropic：不该被当成可用
+      // anthropic-messages：0.2.20 起受支持（protocol 归一化为 anthropic）
       { providerId: 'new-provider-2', providerName: 'AIPM',
         config: { access: { type: 'api-key', apiKey: 'sk-ant-999' },
           api: { type: 'anthropic-messages', baseUrl: 'https://aipm.example' },
@@ -376,7 +433,8 @@ test('readZcodeProviders：合并 provider_config.json（界面新建的服务�
     '重叠项的模型清单应取并集（provider_config 侧更全）');
 
   const aipm = list.find((p) => p.name === 'AIPM');
-  assert.strictEqual(aipm.eligible, false, 'anthropic-messages 不得判为可用');
+  assert.strictEqual(aipm.eligible, true, 'anthropic-messages 自 0.2.20 起可用（走 /v1/messages）');
+  assert.strictEqual(aipm.protocol, 'anthropic');
 
   assert.strictEqual(list.length, 3, '不应重复列出重叠项');
   assert.strictEqual(JSON.stringify(list).includes('sk-wb-key'), false, '列表不得携带 key 明文');

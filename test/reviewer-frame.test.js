@@ -268,3 +268,290 @@ test('callReviewer：content 正常时不使用 reasoning_content（优先级正
     globalThis.fetch = origFetch;
   }
 });
+
+// ---------------- Anthropic /v1/messages 适配 ----------------
+// 背景：ZCode 里 kind=anthropic 的服务商（内网 192.168.50.139:8088 的 Anthropic 通道、AIPM）
+// 走的是 /v1/messages，与 OpenAI 的 chat/completions 在端点路径、鉴权头、请求体与响应结构上
+// 全都不同。适配前这些服务商被直接过滤掉，用户那台内网机上的 4 个 claude-opus 模型用不了。
+
+test('normalizeMessagesEndpoint：裸主机补 /v1/messages，已含 /v1 只补 /messages', () => {
+  const { normalizeMessagesEndpoint } = require('../hooks/lib/reviewer.js');
+  // 真机实测：ZCode 里 6 个 anthropic 服务商的 baseURL 都不含 /v1，
+  // 真实路径是 + /v1/messages（探测：/v1/messages → 401 鉴权层；/messages → 404）。
+  // 曾只补 /messages，导致这些服务商全部 404（真机复现）。
+  assert.strictEqual(normalizeMessagesEndpoint('http://192.168.50.139:8088'), 'http://192.168.50.139:8088/v1/messages');
+  assert.strictEqual(normalizeMessagesEndpoint('https://api.z.ai/api/anthropic'), 'https://api.z.ai/api/anthropic/v1/messages');
+  assert.strictEqual(normalizeMessagesEndpoint('https://open.bigmodel.cn/api/anthropic'), 'https://open.bigmodel.cn/api/anthropic/v1/messages');
+  assert.strictEqual(normalizeMessagesEndpoint('https://aipm9527.ccwu.cc'), 'https://aipm9527.ccwu.cc/v1/messages');
+  // 已含 /v1：只补 /messages（避免 /v1/v1/messages）
+  assert.strictEqual(normalizeMessagesEndpoint('https://x.com/v1'), 'https://x.com/v1/messages');
+  assert.strictEqual(normalizeMessagesEndpoint('https://x.com/v1/'), 'https://x.com/v1/messages');
+  assert.strictEqual(normalizeMessagesEndpoint('https://x.com/v1/messages'), 'https://x.com/v1/messages');
+  // 填了 OpenAI 完整端点也应换成 messages，而不是拼出 /chat/completions/messages
+  assert.strictEqual(normalizeMessagesEndpoint('https://x.com/v1/chat/completions'), 'https://x.com/v1/messages');
+  assert.strictEqual(normalizeMessagesEndpoint(''), '');
+  assert.strictEqual(normalizeMessagesEndpoint(null), '');
+});
+
+test('normalizeChatEndpoint：填了 Anthropic 端点时不拼出 /messages/chat/completions', () => {
+  const { normalizeChatEndpoint } = require('../hooks/lib/reviewer.js');
+  assert.strictEqual(normalizeChatEndpoint('https://x.com/v1/messages'), 'https://x.com/v1/chat/completions');
+  assert.strictEqual(normalizeChatEndpoint('https://x.com/v1'), 'https://x.com/v1/chat/completions');
+});
+
+test('isAnthropicProtocol：只认显式协议标识，未知/空走 OpenAI', () => {
+  const { isAnthropicProtocol } = require('../hooks/lib/reviewer.js');
+  assert.strictEqual(isAnthropicProtocol('anthropic'), true);
+  assert.strictEqual(isAnthropicProtocol('anthropic-messages'), true);
+  assert.strictEqual(isAnthropicProtocol('Anthropic'), true);
+  assert.strictEqual(isAnthropicProtocol('openai'), false);
+  assert.strictEqual(isAnthropicProtocol(''), false);
+  assert.strictEqual(isAnthropicProtocol(undefined), false);
+});
+
+test('callReviewer(anthropic)：请求头用 x-api-key + anthropic-version，system 走顶层字段', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, opt) => {
+    seen = { url, opt };
+    return {
+      ok: true, status: 200,
+      json: async () => ({
+        id: 'msg_1', type: 'message', role: 'assistant',
+        content: [{ type: 'text', text: '{"severity":"concern","note":"来自 content[0].text"}' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 11, output_tokens: 22 }
+      })
+    };
+  };
+  try {
+    const r = await callReviewer({
+      baseUrl: 'https://relay.example.com/v1',
+      protocol: 'anthropic',
+      model: 'claude-opus-5', apiKey: 'sk-ant',
+      systemPrompt: 'SYS-PROMPT', userContent: 'USER-DELTA',
+      maxTokens: 1024, temperature: 0.2, timeoutMs: 5000
+    });
+    assert.ok(!r.error, `不应报错，实际 ${r.error}`);
+    assert.ok(r.text.includes('来自 content[0].text'), '必须从 content[] 的 text 块取正文');
+    assert.deepStrictEqual(r.usage, { promptTokens: 11, completionTokens: 22 },
+      'usage 字段名是 input_tokens/output_tokens');
+    // 端点：基地址补 /messages（不是 /chat/completions）
+    assert.strictEqual(seen.url, 'https://relay.example.com/v1/messages');
+    // 鉴权头：x-api-key 而非 Authorization: Bearer
+    assert.strictEqual(seen.opt.headers['x-api-key'], 'sk-ant');
+    assert.strictEqual(seen.opt.headers['anthropic-version'], '2023-06-01');
+    assert.strictEqual(seen.opt.headers.Authorization, undefined, 'anthropic 不得带 Bearer 头');
+    // 请求体：system 是顶层字段，messages 里只有 user
+    const body = JSON.parse(seen.opt.body);
+    assert.strictEqual(body.system, 'SYS-PROMPT');
+    assert.deepStrictEqual(body.messages, [{ role: 'user', content: 'USER-DELTA' }]);
+    assert.strictEqual(body.max_tokens, 1024);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('callReviewer：baseUrl 以 /messages 结尾时自动按 anthropic 处理（端点自证协议）', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, opt) => {
+    seen = { url, opt };
+    return {
+      ok: true, status: 200,
+      json: async () => ({
+        content: [{ type: 'text', text: '{"severity":"nit","note":"ok"}' }],
+        stop_reason: 'end_turn', usage: {}
+      })
+    };
+  };
+  try {
+    const r = await callReviewer({
+      baseUrl: 'https://relay.example.com/v1/messages',
+      model: 'claude-opus-5', apiKey: 'sk-ant',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 100, temperature: 0, timeoutMs: 5000
+    });
+    assert.ok(!r.error, `不应报错，实际 ${r.error}`);
+    assert.strictEqual(seen.url, 'https://relay.example.com/v1/messages');
+    assert.strictEqual(seen.opt.headers['x-api-key'], 'sk-ant');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('callReviewer(anthropic)：content 为空但 stop_reason=max_tokens → 给出可操作提示', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    json: async () => ({
+      content: [], stop_reason: 'max_tokens',
+      usage: { input_tokens: 10, output_tokens: 4096 }
+    })
+  });
+  try {
+    const r = await callReviewer({
+      baseUrl: 'https://relay.example.com/v1', protocol: 'anthropic',
+      model: 'claude-opus-5', apiKey: 'sk-ant',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 4096, temperature: 0, timeoutMs: 5000
+    });
+    assert.strictEqual(r.error, 'llm_empty_response');
+    assert.ok(/max_tokens/.test(r.hint || ''), '应提示预算烧在推理上');
+    assert.ok(/4096/.test(r.hint || ''), '应带上 output_tokens 便于诊断');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('callReviewer(anthropic)：extended thinking 里能捞出 JSON 帧时采用', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  const frame = '{"severity":"blocker","note":"来自 thinking 块"}';
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    json: async () => ({
+      content: [{ type: 'thinking', thinking: `分析…\n${frame}\n完毕` }],
+      stop_reason: 'end_turn', usage: {}
+    })
+  });
+  try {
+    const r = await callReviewer({
+      baseUrl: 'https://relay.example.com/v1', protocol: 'anthropic',
+      model: 'claude-opus-5', apiKey: 'sk-ant',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 4096, temperature: 0, timeoutMs: 5000
+    });
+    assert.ok(!r.error, `不应报错，实际 ${r.error}`);
+    assert.ok(r.text.includes('severity'), '应从 thinking 块捞出合法 JSON 帧');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('callReviewer(openai)：显式 protocol=openai 时仍走 chat/completions（不误伤）', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, opt) => {
+    seen = { url, opt };
+    return {
+      ok: true, status: 200,
+      json: async () => ({ choices: [{ message: { content: '{"severity":"nit","note":"ok"}' }, finish_reason: 'stop' }], usage: {} })
+    };
+  };
+  try {
+    const r = await callReviewer({
+      baseUrl: 'https://relay.example.com/v1', protocol: 'openai',
+      model: 'm', apiKey: 'k',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 100, temperature: 0, timeoutMs: 5000
+    });
+    assert.ok(!r.error);
+    assert.strictEqual(seen.url, 'https://relay.example.com/v1/chat/completions');
+    assert.strictEqual(seen.opt.headers.Authorization, 'Bearer k');
+    assert.strictEqual(seen.opt.headers['x-api-key'], undefined);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+// ---------------- 复审整改（protocol 优先级 / 尾斜杠 / 信封容错） ----------------
+// 复审实测：隐式 `/messages$` 判定若**覆盖**显式 protocol，会让「baseUrl 恰好以 /messages
+// 结尾的 OpenAI 兼容服务商」被误判成 anthropic —— key 以 x-api-key 发到 OpenAI 端点，
+// 而 controller 只认显式 protocol → 同一服务商 ping 成功、审查必失败。
+
+test('callReviewer：显式 protocol=openai 不被 baseUrl 的 /messages 结尾覆盖', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, opt) => {
+    seen = { url, opt };
+    return {
+      ok: true, status: 200,
+      json: async () => ({ choices: [{ message: { content: '{"severity":"nit","note":"ok"}' }, finish_reason: 'stop' }], usage: {} })
+    };
+  };
+  try {
+    const r = await callReviewer({
+      baseUrl: 'https://gw.example/openai/messages',
+      protocol: 'openai',
+      model: 'm', apiKey: 'K',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 100, temperature: 0, timeoutMs: 5000
+    });
+    assert.ok(!r.error, `不应报错，实际 ${r.error}`);
+    assert.strictEqual(seen.url, 'https://gw.example/openai/chat/completions',
+      '显式 openai 必须走 chat/completions（与 controller 判定一致）');
+    assert.strictEqual(seen.opt.headers.Authorization, 'Bearer K');
+    assert.strictEqual(seen.opt.headers['x-api-key'], undefined, '不得以 x-api-key 发凭据');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('callReviewer：protocol 缺省时才按 /messages 结尾推断 anthropic', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, opt) => {
+    seen = { url, opt };
+    return { ok: true, status: 200, json: async () => ({ content: [{ type: 'text', text: '{"severity":"nit","note":"ok"}' }], stop_reason: 'end_turn', usage: {} }) };
+  };
+  try {
+    const r = await callReviewer({
+      baseUrl: 'https://gw.example/v1/messages',
+      model: 'm', apiKey: 'K',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 100, temperature: 0, timeoutMs: 5000
+    });
+    assert.ok(!r.error, `不应报错，实际 ${r.error}`);
+    assert.strictEqual(seen.url, 'https://gw.example/v1/messages');
+    assert.strictEqual(seen.opt.headers['x-api-key'], 'K');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('callReviewer：尾斜杠的 /messages/ 也能推断出 anthropic（与归一化同纪律）', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, opt) => {
+    seen = { url, opt };
+    return { ok: true, status: 200, json: async () => ({ content: [{ type: 'text', text: '{"severity":"nit","note":"ok"}' }], stop_reason: 'end_turn', usage: {} }) };
+  };
+  try {
+    const r = await callReviewer({
+      baseUrl: 'https://gw.example/v1/messages/',
+      model: 'm', apiKey: 'K',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 100, temperature: 0, timeoutMs: 5000
+    });
+    assert.ok(!r.error, `不应报错，实际 ${r.error}`);
+    assert.strictEqual(seen.url, 'https://gw.example/v1/messages');
+    assert.strictEqual(seen.opt.headers['x-api-key'], 'K', '尾斜杠不得让 anthropic 静默退回 Bearer');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('callReviewer(anthropic)：网关回成 OpenAI 信封时也能取到正文', async () => {
+  const { callReviewer } = require('../hooks/lib/reviewer.js');
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    json: async () => ({
+      choices: [{ message: { content: '{"severity":"concern","note":"被网关包成 OpenAI 信封"}' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 3, completion_tokens: 4 }
+    })
+  });
+  try {
+    const r = await callReviewer({
+      baseUrl: 'https://relay.example.com/v1', protocol: 'anthropic',
+      model: 'm', apiKey: 'k',
+      systemPrompt: 'sp', userContent: 'uc', maxTokens: 100, temperature: 0, timeoutMs: 5000
+    });
+    assert.ok(!r.error, `不应判成空响应，实际 ${r.error}`);
+    assert.ok(r.text.includes('被网关包成 OpenAI 信封'));
+    assert.deepStrictEqual(r.usage, { promptTokens: 3, completionTokens: 4 });
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

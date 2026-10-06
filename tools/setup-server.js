@@ -74,7 +74,7 @@ function page() {
     const known = allProviders.find((p) => p.id === wantRaw);
     const why = !known ? '在 ZCode 配置里已不存在'
       : (known.official ? '是官方内置通道（审查通道不使用）'
-        : (!known.eligible ? `协议 ${known.kind || '未知'} 非 OpenAI 兼容`
+        : (!known.eligible ? `协议 ${known.kind || '未知'} 不受支持`
           : (!known.baseURL ? '缺端点' : (!known.apiKey ? '缺 key' : '不满足使用条件'))));
     missingHint = `<div class="card" style="border-left:3px solid #f59e0b">`
       + `<b>⚠ 已保存的服务商「${esc(wantRaw)}」当前不可用</b>（${esc(why)}）。`
@@ -128,7 +128,7 @@ ${missingHint}
 <select id="zcodeProvider">${providerOpts}</select>
 <label>审查模型</label>
 <select id="zcodeModel">${modelOpts || '<option value="">（该服务商未配置模型）</option>'}</select>
-<div class="hintline" id="zcodeEndpoint">${selProvider ? esc(`端点：${selProvider.baseURL || '（该服务商未配置 baseURL）'}`) : '先在 ZCode 设置里添加 OpenAI 兼容服务商（官方内置通道不用于审查）'}</div>
+<div class="hintline" id="zcodeEndpoint">${selProvider ? esc(`端点：${selProvider.baseURL || '（该服务商未配置 baseURL）'}`) : '先在 ZCode 设置里添加 OpenAI 兼容或 Anthropic 服务商（官方内置通道不用于审查）'}</div>
 <label>审查模式</label>
 <select id="reviewMode">
  <option value="async"${(cfg.reviewMode || 'async') === 'async' ? ' selected' : ''}>async（默认：零体感延迟，意见随下一条消息送达）</option>
@@ -222,7 +222,7 @@ function hint(err) {
 }
 
 async function ping(body) {
-  // 与审查侧同一解析规则：端点/key 只来自 ZCode 第三方服务商（非官方、OpenAI 兼容、齐备），
+  // 与审查侧同一解析规则：端点/key 只来自 ZCode 第三方服务商（非官方、协议受支持、齐备），
   // 表单里改了服务商/模型还没保存时优先用表单值，未给则回退已存配置。
   const envLike = Object.assign({}, process.env);
   const cfg = loadConfig(PLUGIN_ROOT, envLike);
@@ -231,10 +231,10 @@ async function ping(body) {
   const t = resolveProviderTarget(readZcodeProviders(envLike), wantProvider, wantModel);
   if (!t.ok) {
     const hints = {
-      zcode_provider_missing: 'ZCode 里没有可用的第三方服务商（需 OpenAI 兼容且已填端点与 key）',
+      zcode_provider_missing: 'ZCode 里没有可用的第三方服务商（需 OpenAI 兼容或 Anthropic 协议且已填端点与 key）',
       zcode_provider_not_found: 'ZCode 配置里找不到所选服务商，请刷新页面后重新选择',
       zcode_provider_official: 'ZCode 官方内置通道不用于审查，请选择第三方服务商',
-      zcode_provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+      zcode_provider_ineligible: '该服务商协议既非 OpenAI 兼容、也非 Anthropic，审查通道不可用',
       zcode_provider_incomplete: '服务商的端点/key 缺一，Ping 已中止',
       zcode_no_model: '该服务商未登记模型，请在 ZCode 设置里添加'
     };
@@ -243,6 +243,7 @@ async function ping(body) {
   const t0 = Date.now();
   const res = await callReviewer({
     baseUrl: t.baseUrl, model: t.model, apiKey: t.apiKey,
+    protocol: t.protocol || 'openai',
     systemPrompt: 'You are a health check.',
     userContent: 'ping',
     maxTokens: 1,

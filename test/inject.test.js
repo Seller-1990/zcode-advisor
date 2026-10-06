@@ -600,6 +600,35 @@ test('controller / reviewer 的端点归一化规则一致（修复 Ping 404）'
     'http://192.168.50.139:8788/v1/chat/completions', '基地址应补全路径');
 });
 
+// Anthropic 端点归一化同样是「controller 与 hook 各一份拷贝」，规则必须一致——
+// 真机实测这些服务商 baseURL 不含 /v1，真实路径是 + /v1/messages（+ /messages → 404）。
+test('controller / reviewer 的 Anthropic 端点归一化规则一致', () => {
+  const ctrl = require('../tools/companion/controller.cjs');
+  const { normalizeMessagesEndpoint: hookNorm } = require('../hooks/lib/reviewer.js');
+  const ctrlNorm = ctrl.normalizeMessagesEndpoint;
+
+  const cases = [
+    'http://192.168.50.139:8088',
+    'https://api.z.ai/api/anthropic',
+    'https://open.bigmodel.cn/api/anthropic',
+    'https://zcode.z.ai/api/v1/zcode-plan/anthropic',
+    'https://aipm9527.ccwu.cc',
+    'https://x.com/v1',
+    'https://x.com/v1/',
+    'https://x.com/v1/messages',
+    'https://x.com/v1/chat/completions',
+    ''
+  ];
+  for (const c of cases) {
+    assert.strictEqual(ctrlNorm(c), hookNorm(c), `两端对 ${JSON.stringify(c)} 的归一化应一致`);
+  }
+  // 关键行为：裸主机补 /v1/messages（曾只补 /messages → 所有 anthropic 服务商 404）
+  assert.strictEqual(ctrlNorm('http://192.168.50.139:8088'),
+    'http://192.168.50.139:8088/v1/messages');
+  assert.strictEqual(ctrlNorm('https://x.com/v1'), 'https://x.com/v1/messages',
+    '已含 /v1 时只补 /messages（避免 /v1/v1/messages）');
+});
+
 // ---------------- 顾问总开关（startEnabled 往返） ----------------
 
 

@@ -21,7 +21,7 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const {
   loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey, isPlaceholderKey,
-  readZcodeProviders, resolveProviderTarget
+  readZcodeProviders, resolveProviderTarget, envProtocolFor
 } = require('./lib/config');
 const {
   ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, bumpPrimaryFailStreak, loadState, mutateStateExclusive,
@@ -142,6 +142,9 @@ function resolveTarget(cfg, state, env) {
     baseUrl: t.ok ? t.baseUrl : '',
     apiKey: t.ok ? t.apiKey : '',
     model: t.ok ? t.model : '',
+    // 协议随服务商一起解析（'openai' | 'anthropic'）——callReviewer 据此选请求构造/响应解析分支。
+    // 解析失败时留空：不产出凭据本来就走不到调用。
+    protocol: t.ok ? (t.protocol || 'openai') : '',
     keySource: t.ok ? 'config' : '',
     providerId: t.ok ? t.provider.id : '',
     providerName: t.ok ? (t.provider.name || t.provider.id) : '',
@@ -154,8 +157,10 @@ function resolveTarget(cfg, state, env) {
   };
 
   // 2) env 逃生舱最后覆盖（显式、且只影响本次进程）。
-  // **端点与 key 必须成对覆盖**：只覆盖其一会把服务商 A 的 key 发往 env 指定的端点
+  // **端点/key/协议必须成套覆盖**：只覆盖其一会把服务商 A 的 key 发往 env 指定的端点
   // （或反之），这正是 0.2.17 要消灭的密钥交叉面——旧实现有这条纪律，重写时不能丢。
+  // 协议也在这组里：它决定凭据以哪种鉴权方案发出（Bearer vs x-api-key），
+  // 端点换了而协议沿用旧值 = key 以错误方案发到新端点（与端点/key 交叉同类）。
   // 只给了一半时整体不生效，并挂 problem 让用户看见（不静默）。
   const envBase = e.ZCODE_ADVISOR_BASE_URL ? String(e.ZCODE_ADVISOR_BASE_URL) : '';
   const envKeyRaw = e.ZCODE_ADVISOR_API_KEY ? String(e.ZCODE_ADVISOR_API_KEY) : '';
@@ -166,6 +171,7 @@ function resolveTarget(cfg, state, env) {
     if (envBase && envKey) {
       out.baseUrl = envBase;
       out.apiKey = envKey;
+      out.protocol = envProtocolFor(e.ZCODE_ADVISOR_PROTOCOL, envBase);
       out.keySource = 'env:ZCODE_ADVISOR_API_KEY';
     } else {
       out.problems.push(`env_override_incomplete: 环境变量只提供了 ${envBase ? 'ZCODE_ADVISOR_BASE_URL' : 'ZCODE_ADVISOR_API_KEY'}（或 key 形似占位符）——端点与 key 必须成对且真实，为避免密钥交叉本次不生效`);
@@ -224,7 +230,7 @@ function controlLines(cfg, stateDir, file, state) {
   for (const n of cfg.notices || []) lines.push(`[advisor] 配置提示：${n}`);
   const gateReasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey, source: eff.keySource });
   if (gateReasons.length > 0) {
-    lines.push(`[advisor] 门禁未满足（${gateReasons.join(',')}）：审查暂不运行。请先在 ZCode 设置里维护一个 OpenAI 兼容的第三方服务商（含端点与 key），再用 /advisor-status 或角标面板选择它。`);
+    lines.push(`[advisor] 门禁未满足（${gateReasons.join(',')}）：审查暂不运行。请先在 ZCode 设置里维护一个 OpenAI 兼容或 Anthropic 协议的第三方服务商（含端点与 key），再用 /advisor-status 或角标面板选择它。`);
   }
   for (const w of configWarnings({ baseUrl: eff.baseUrl }, { key: eff.apiKey, source: eff.keySource })) lines.push(`[advisor] 配置警告：${w}`);
   return lines;
@@ -345,6 +351,9 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
   const baseParams = {
     baseUrl: target.baseUrl,
     apiKey: target.apiKey,
+    // 协议：'anthropic' 时 callReviewer 走 /v1/messages（x-api-key + anthropic-version 头，
+    // 顶层 system 字段，响应取 content[] 文本块）。
+    protocol: target.protocol || 'openai',
     systemPrompt,
     userContent,
     maxTokens: cfg.maxTokens,
@@ -1157,6 +1166,7 @@ async function handleCtl(args) {
       lines.push(`  会话覆盖: ${eff.overrides.join(' + ')}（/advisor-model reset 恢复全局）`);
     }
     lines.push(`  端点: ${eff.baseUrl || '（未解析出）'}`);
+    lines.push(`  协议: ${eff.protocol || '（未解析出）'}`);
     lines.push(`  生效 key: ${eff.apiKey ? maskKey(eff.apiKey) : '（无）'}（来源 ${eff.keySource || '无'}）`);
     lines.push(`  审查次数: ${state.reviews || 0} | steer 记录: ${state.steers || 0}（sync=实际送达；async=入队数） | 冷却剩余: ${state.immuneTurns || 0} 轮`);
     lines.push(`  顺延队列: ${(state.pendingNotes || []).length} 条 | 历史顺延: ${state.deferred || 0}`);
@@ -1315,12 +1325,12 @@ async function handleCtl(args) {
     const list = readZcodeProviders(process.env);
     const lines = ['advisor 服务商（来自 ZCode 配置）'];
     if (list.length === 0) {
-      lines.push('  （ZCode 里暂无服务商——请在 ZCode 设置中添加 OpenAI 兼容服务商）');
+      lines.push('  （ZCode 里暂无服务商——请在 ZCode 设置中添加 OpenAI 兼容或 Anthropic 服务商）');
     }
     for (const p of list) {
       const reasons = [];
       if (p.official) reasons.push('ZCode 官方内置通道，审查通道不使用');
-      if (!p.eligible) reasons.push(`协议 ${p.kind || '未知'} 非 OpenAI 兼容`);
+      if (!p.eligible) reasons.push(`协议 ${p.kind || '未知'} 不受支持`);
       if (!p.baseURL) reasons.push('缺端点');
       if (!p.apiKey) reasons.push('缺 key');
       const usable = reasons.length === 0;
@@ -1351,6 +1361,7 @@ async function ctlDoctor(cfg, args, state) {
   lines.push(`  服务商: ${eff.providerName || '（未解析出）'}${eff.providerSource === 'auto' ? '（自动选择）' : (eff.providerSource === 'session-override' ? '（本会话覆盖）' : '')}`);
   lines.push(`  模型: ${eff.model || '（未定）'}${eff.modelSource === 'session-override' ? '（本会话覆盖）' : ''}`);
   lines.push(`  端点: ${eff.baseUrl || '（未解析出）'}`);
+  lines.push(`  协议: ${eff.protocol || '（未解析出）'}`);
   lines.push(`  模式: ${cfg.reviewMode} | 预算: maxTokens=${cfg.maxTokens}, 审查超时=${cfg.reviewTimeoutMs}ms`);
   const gateReasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey, source: eff.keySource });
   lines.push(`  门禁: ${gateReasons.length > 0 ? '未满足 → ' + gateReasons.join(',') : '满足'} | key 来源: ${eff.keySource || '(无)'}${eff.apiKey ? `（${maskKey(eff.apiKey)}）` : ''}`);
@@ -1387,7 +1398,7 @@ async function ctlDoctor(cfg, args, state) {
     if (model !== eff.model) process.stdout.write(`  探针: 目标模型 ${model}（非配置模型）\n`);
     process.stdout.write(`  探针: 正在用生产参数测试 ${model} ×${n} …\n`);
     const stat = await probeModel(
-      { baseUrl: eff.baseUrl, model, apiKey: eff.apiKey },
+      { baseUrl: eff.baseUrl, model, apiKey: eff.apiKey, protocol: eff.protocol || 'openai' },
       {
         n,
         timeoutMs,
@@ -1408,6 +1419,7 @@ async function ctlDoctor(cfg, args, state) {
     baseUrl: eff.baseUrl,
     model,
     apiKey: eff.apiKey,
+    protocol: eff.protocol || 'openai',
     systemPrompt: 'You are a health check.',
     userContent: 'ping',
     maxTokens: 1,

@@ -72,7 +72,7 @@ Stop 侧：同步 copyFileSync → state/snapshots/<sessionId>.jsonl（0o600，�
 review-worker（detached）
   ├─ readDelta(snapshot, offset, {backfillLimitBytes})
   ├─ renderDelta(entries) → 文本增量
-  ├─ callReviewer（OpenAI 兼容 /chat/completions）
+  ├─ callReviewer（OpenAI 兼容 /chat/completions 或 Anthropic /v1/messages）
   └─ parseFrame（JSON 帧优先 → 散文救回三条守门）
        ▼
      route：decideAction / decideActionAsync → nit 队列 | concern/blocker block

@@ -774,10 +774,28 @@ function zcodeProviderConfigFile() {
 
 // 审查通道可用的协议判定：config.json 侧是 'openai'/'openai-compatible'，
 // provider_config.json 侧是 'openai-chat-completions'（同一协议的另一枚举名，界面显示为
-// openai-compatible）。三者都认；'anthropic'/'anthropic-messages' 走 /v1/messages，不支持。
+// openai-compatible）。三者都认；'anthropic'/'anthropic-messages' 走 /v1/messages，
+// 由 normalizeMessagesEndpoint + ping/fetch 的协议分支处理。
 function isOpenAiCompatibleKind(kind) {
   const k = String(kind || '').trim().toLowerCase();
   return k === 'openai' || k === 'openai-compatible' || k === 'openai-chat-completions';
+}
+
+function isAnthropicKind(kind) {
+  const k = String(kind || '').trim().toLowerCase();
+  return k === 'anthropic' || k === 'anthropic-messages';
+}
+
+// 归一化协议标识（与 hooks/lib/config.js 的 protocolOf 同源）：
+// 'openai' | 'anthropic'；未知协议返回空串 → 判为 ineligible，不产出凭据。
+function protocolOf(kind) {
+  if (isOpenAiCompatibleKind(kind)) return 'openai';
+  if (isAnthropicKind(kind)) return 'anthropic';
+  return '';
+}
+
+function isUsableKind(kind) {
+  return Boolean(protocolOf(kind));
 }
 
 function readProviderConfigRules() {
@@ -802,7 +820,8 @@ function readProviderConfigRules() {
       baseURL: String(api.baseUrl || '').trim(),
       apiKey: String(acc.apiKey || '').trim(),
       models,
-      eligible: isOpenAiCompatibleKind(api.type),
+      eligible: isUsableKind(api.type),
+      protocol: protocolOf(api.type),
       official: false,
       source: 'provider_config'
     });
@@ -825,7 +844,8 @@ function readZcodeProviders() {
       baseURL: String(opts.baseURL || '').trim(),
       apiKey: String(opts.apiKey || '').trim(),
       models: p.models && typeof p.models === 'object' ? Object.keys(p.models) : [],
-      eligible: isOpenAiCompatibleKind(p.kind),
+      eligible: isUsableKind(p.kind),
+      protocol: protocolOf(p.kind),
       official: id.startsWith('builtin:'),
       source: 'config'
     });
@@ -859,7 +879,7 @@ function pickZcodeProvider(want) {
 
 // 把面板载荷/已存配置解析为一次真实调用的 {baseUrl, apiKey, model}。
 // 与 hook 侧 resolveProviderTarget 同一规则（两侧独立实现、字段名被测试锁住）：
-// 服务商必须是非官方 + OpenAI 兼容 + 端点/key 齐备，否则不产出任何凭据
+// 服务商必须是非官方 + 协议受支持（OpenAI 兼容或 Anthropic）+ 端点/key 齐备，否则不产出任何凭据
 // （调用方按 error 字段失败返回，绝不回退到硬编码端点——防密钥交叉）。
 // key 不出进程：页面只需要模型/端点展示，永远拿不到 apiKey 明文。
 function effectiveTarget(body) {
@@ -891,6 +911,8 @@ function effectiveTarget(body) {
     baseUrl: usable ? prov.baseURL : '',
     apiKey: usable ? prov.apiKey : '',
     model,
+    // 协议随凭据一起给出：ping/fetchModels 据此选请求构造（OpenAI 头 vs x-api-key+anthropic-version）。
+    protocol: usable ? (prov.protocol || 'openai') : '',
     providerId: prov ? prov.id : '',
     providerName: prov ? (prov.name || prov.id) : '',
     providerFound: Boolean(prov),
@@ -1112,9 +1134,26 @@ function normalizeChatEndpoint(baseUrl) {
   const u = String(baseUrl || '').trim().replace(/\/+$/, '');
   if (!u) return '';
   if (/\/chat\/completions$/i.test(u)) return u;
-  if (/\/messages$/i.test(u)) return u;   // Anthropic 协议端点不改写
+  // 填的是 Anthropic 端点形态：换成 OpenAI 路径，不拼出不存在的 /messages/chat/completions
+  if (/\/messages$/i.test(u)) return `${u.replace(/\/messages$/i, '')}/chat/completions`;
   return `${u}/chat/completions`;
 }
+
+// Anthropic 端点归一化（与 hooks/lib/reviewer.js 的 normalizeMessagesEndpoint 同规则）。
+// 真机实测：ZCode 里 6 个 anthropic 服务商的 baseURL 都不含 /v1（api.z.ai/api/anthropic、
+// open.bigmodel.cn/api/anthropic、内网 192.168.50.139:8088 …），真实路径是 + /v1/messages
+//（探测：+ /v1/messages → 401 鉴权层；+ /messages → 404）。只有 baseURL 已含 /v1 时才只补 /messages。
+function normalizeMessagesEndpoint(baseUrl) {
+  const u = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (!u) return '';
+  if (/\/messages$/i.test(u)) return u;
+  if (/\/chat\/completions$/i.test(u)) return `${u.replace(/\/chat\/completions$/i, '')}/messages`;
+  if (/\/v\d+$/i.test(u)) return `${u}/messages`;
+  return `${u}/v1/messages`;
+}
+
+// /v1/messages 必填头（缺失端点返回 400）
+const ANTHROPIC_VERSION = '2023-06-01';
 
 async function ping(body) {
   const t = effectiveTarget(body);
@@ -1122,16 +1161,20 @@ async function ping(body) {
   // （那会把服务商 key 发到别的端点——密钥交叉）。
   if (!t.providerUsable || !t.model) {
     const hints = {
-      provider_missing: 'ZCode 里没有可用的第三方服务商（需 OpenAI 兼容且已填端点与 key）',
+      provider_missing: 'ZCode 里没有可用的第三方服务商（需 OpenAI 兼容或 Anthropic 协议且已填端点与 key）',
       provider_not_found: 'ZCode 配置里找不到所选服务商，请刷新列表或重新选择',
       provider_official: 'ZCode 官方内置通道不用于审查，请选择第三方服务商',
-      provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+      provider_ineligible: '该服务商协议既非 OpenAI 兼容、也非 Anthropic，审查通道不可用',
       provider_incomplete: '服务商的端点/key 缺一，Ping 已中止',
       no_model: '该服务商未登记模型，请在 ZCode 设置里添加'
     };
     return { ok: false, error: t.providerError || 'provider_unusable', hint: hints[t.providerError] || '' };
   }
-  const baseUrl = normalizeChatEndpoint(t.baseUrl);
+  // 协议分支（与 hook 侧 callReviewer 同一语义）：anthropic 服务商走 /v1/messages，
+  // 头部用 x-api-key + anthropic-version（缺失 anthropic-version 端点直接 400），
+  // system 走顶层字段。若这里仍按 OpenAI 发，用户会看到误导性的「模型 id 或端点路径不对」。
+  const anthropic = t.protocol === 'anthropic';
+  const baseUrl = anthropic ? normalizeMessagesEndpoint(t.baseUrl) : normalizeChatEndpoint(t.baseUrl);
   const model = t.model;
   const apiKey = t.apiKey;
   const t0 = Date.now();
@@ -1142,7 +1185,11 @@ async function ping(body) {
     try {
       r = await fetch(baseUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: anthropic
+          ? { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': ANTHROPIC_VERSION }
+          : { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        // 请求体两种协议在此处同形（model + 单条 user + max_tokens/temperature/stream）；
+        // 差异全在头部与端点路径。
         body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, temperature: 0, stream: false }),
         signal: ctl.signal
       });
@@ -1154,7 +1201,7 @@ async function ping(body) {
       return { ok: false, error: `llm_http_${r.status}`, hint, endpoint: baseUrl };
     }
     const note = '；响应体为空是 max_tokens=1 下的正常现象';
-    return { ok: true, ms: Date.now() - t0, note, provider: t.providerName, model };
+    return { ok: true, ms: Date.now() - t0, note, provider: t.providerName, model, protocol: t.protocol || 'openai' };
   } catch (err) {
     const aborted = err && (err.name === 'AbortError' || String(err).includes('abort'));
     return { ok: false, error: aborted ? 'llm_timeout' : 'llm_error', hint: aborted ? '端点无响应（超时）' : '网络失败' };
@@ -1169,22 +1216,31 @@ async function fetchModels(body) {
   const t = effectiveTarget(body);
   if (!t.providerUsable) {
     const hints = {
-      provider_missing: 'ZCode 里没有可用的第三方服务商（需 OpenAI 兼容且已填端点与 key）',
+      provider_missing: 'ZCode 里没有可用的第三方服务商（需 OpenAI 兼容或 Anthropic 协议且已填端点与 key）',
       provider_not_found: 'ZCode 配置里找不到所选服务商，请刷新列表或重新选择',
       provider_official: 'ZCode 官方内置通道不用于审查，请选择第三方服务商',
-      provider_ineligible: '该服务商协议非 OpenAI 兼容，审查通道不可用',
+      provider_ineligible: '该服务商协议既非 OpenAI 兼容、也非 Anthropic，审查通道不可用',
       provider_incomplete: '服务商的端点/key 缺一，无法拉取模型'
     };
     return { ok: false, error: t.providerError || 'provider_unusable', hint: hints[t.providerError] || '' };
   }
   if (body && body.zcodeFetch) {
-    const url = modelsUrl(t.baseUrl);
+    // anthropic 服务商的 baseURL 不含 /v1（见 normalizeMessagesEndpoint 的实测说明），
+    // 其模型清单在 /v1/models（真机探测：/models → 404，/v1/models → 200）。
+    // modelsUrl 只补 /models，这里按协议先归一到「含 /v1 的基地址」再交给它。
+    const url = t.protocol === 'anthropic'
+      ? modelsUrl(normalizeMessagesEndpoint(t.baseUrl).replace(/\/messages$/i, ''))
+      : modelsUrl(t.baseUrl);
     if (!url) return { ok: false, error: 'baseUrl 为空' };
     let r;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 12000);
     try {
-      r = await fetch(url, { headers: { Authorization: `Bearer ${t.apiKey}` }, signal: ctl.signal });
+      // /models 在两种协议下都存在，但鉴权头不同：anthropic 用 x-api-key（Bearer 会被拒）。
+      const hdrs = t.protocol === 'anthropic'
+        ? { 'x-api-key': t.apiKey, 'anthropic-version': ANTHROPIC_VERSION }
+        : { Authorization: `Bearer ${t.apiKey}` };
+      r = await fetch(url, { headers: hdrs, signal: ctl.signal });
     } finally {
       clearTimeout(timer);
     }
@@ -1258,7 +1314,7 @@ function startApi(cdpPort, apiPort, token) {
       if (req.method === 'GET' && req.url === '/api/zcode-providers') {
         const providers = readZcodeProviders().map((p) => ({
           id: p.id, name: p.name, kind: p.kind, baseURL: p.baseURL,
-          models: p.models, eligible: p.eligible, official: p.official, hasApiKey: Boolean(p.apiKey)
+          models: p.models, eligible: p.eligible, official: p.official, protocol: p.protocol, hasApiKey: Boolean(p.apiKey)
         }));
         return done(200, { ok: true, providers, file: zcodeConfigFile() });
       }
@@ -1422,7 +1478,7 @@ if (require.main === module) {
   });
 }
 
-module.exports = { findZcodePath, normalizeChatEndpoint, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, pickZcodeProvider, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi,
+module.exports = { findZcodePath, normalizeChatEndpoint, normalizeMessagesEndpoint, ping, fetchModels, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, pickZcodeProvider, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi,
   readSessionSnapshot, toggleSessionEnabled, setSessionTarget,
   // 供单测直接验证单实例锁与主实例探测（不启动进程）
   _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, exitCodeFor, classifySpawnError, RETRY_EXIT_CODE, SUPERVISED, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS } };

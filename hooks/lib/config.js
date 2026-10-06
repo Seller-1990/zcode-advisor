@@ -11,12 +11,19 @@ const SYNC_TIMEOUT_CAP_MS = 300000;
 const DEFAULTS = {
   // —— 审查通道来源（0.2.17 起唯一来源：ZCode 已维护的**第三方**服务商）——
   // 端点/key/模型一律从 ~/.zcode/v2/config.json 的 provider.* 解析（一处维护两处生效），
-  // 只认非官方（非 builtin:）且 OpenAI 兼容的服务商；本插件不再维护端点/key。
+  // 只认非官方（非 builtin:）且协议受支持（OpenAI 兼容或 Anthropic）的服务商；本插件不再维护端点/key。
   // zcodeProvider：全局服务商（id 或名称）；留空 = 自动选择（优先含 cfg.model 的服务商）。
   zcodeProvider: '',
   // 全局审查模型（id）。留空 = 取所选服务商登记清单首项。
   // 会话级覆盖：state.sessionProvider / state.sessionModel（角标面板或 /advisor-model）。
   model: '',
+  // —— 注：`protocol` **不是**这里的配置键，刻意不登记 ——
+  // 它是运行期由所选服务商的 kind/api.type 推导出来的（见 applyZcodeTarget），
+  // 因为 DEFAULTS 的键 = applyLayer 允许落盘的键，而协议与端点/凭据是一个三元组：
+  // 放开成自由配置键，用户就能让 protocol=anthropic 配着 OpenAI 端点，
+  // 于是 key 以 x-api-key 发到 OpenAI 端点（与 0.2.17 要消灭的密钥交叉同类）。
+  // 唯一的显式覆盖入口是环境变量 ZCODE_ADVISOR_PROTOCOL（它同时要求给端点与 key）。
+  // 真正发起调用时协议随凭据走 resolveTarget→t.protocol；cfg.protocol 仅供 status 展示。
   // 环境变量逃生舱（CI/测试/特殊部署）：ZCODE_ADVISOR_BASE_URL/API_KEY/MODEL 显式覆盖解析结果。
   // 注意：baseUrl/apiKey **不是**可落盘配置键（applyLayer 只拷贝 DEFAULTS 里登记的键）——
   // 旧配置文件里的手动端点/key 一律失效，防止「手动 key 发往服务商端点」的密钥交叉。
@@ -73,7 +80,7 @@ function userConfigPath(env) {
 // ZCode 桌面版把用户维护的模型服务商（含第三方 API）存在 ~/.zcode/v2/config.json：
 // provider.<id> = { name, kind: 'anthropic'|'openai'|'openai-compatible',
 //                   options: { baseURL, apiKey }, models: { <modelId>: … } }。
-// 本插件审查通道只走 OpenAI 兼容 chat/completions（见 reviewer.js），kind=anthropic 不可用。
+// 审查通道支持 OpenAI 兼容 chat/completions 与 Anthropic /v1/messages 两种协议（见 reviewer.js）。
 // id 以 builtin: 开头的是 ZCode 官方内置通道（bigmodel/z.ai），审查通道不使用（只借道第三方）。
 function zcodeConfigPath(env) {
   const e = env || process.env;
@@ -91,7 +98,7 @@ function zcodeConfigPath(env) {
 // config.json 的 provider.* 里没有；此前只读 config.json → 这些服务商在插件里完全不可见
 //（用户报障「抓不到我 zcode 里所有第三方 api」的真因）。
 // api.type 是 ZCode 的内部枚举：'openai-chat-completions' 即 OpenAI 兼容（= 界面的
-// openai-compatible，同一协议两种叫法）；'anthropic-messages' 不可用于本插件（见 reviewer.js）。
+// openai-compatible，同一协议两种叫法）；'anthropic-messages' 走 /v1/messages（见 reviewer.js）。
 function zcodeProviderConfigPath(env) {
   const e = env || process.env;
   if (e.ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG) return e.ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG;
@@ -134,14 +141,42 @@ function readProviderConfigRules(env) {
   return out;
 }
 
-// 审查通道可用的协议判定。三个等价写法都要认——它们指同一个 OpenAI chat/completions 协议：
+// 审查通道可用的协议判定。四种等价写法都要认——前三个指同一个 OpenAI chat/completions 协议：
 //   config.json 侧的 kind:        'openai' | 'openai-compatible'
 //   provider_config.json 侧的 api.type: 'openai-chat-completions'（ZCode 界面选 openai-compatible 后的落盘值）
-// 反之 'anthropic' / 'anthropic-messages' 走 /v1/messages，本插件（reviewer.js 只发
-// chat/completions）不支持，明确排除。
+// 后两个指 Anthropic /v1/messages 协议（reviewer.js 有专门的请求构造与响应解析分支）：
+//   'anthropic' | 'anthropic-messages'
 function isOpenAiCompatibleKind(kind) {
   const k = String(kind || '').trim().toLowerCase();
   return k === 'openai' || k === 'openai-compatible' || k === 'openai-chat-completions';
+}
+
+function isAnthropicKind(kind) {
+  const k = String(kind || '').trim().toLowerCase();
+  return k === 'anthropic' || k === 'anthropic-messages';
+}
+
+// 归一化协议标识，供 reviewer.js 选择请求构造/响应解析分支。
+// 未知协议返回空串（调用方据此判 ineligible，不产出凭据）。
+function protocolOf(kind) {
+  if (isOpenAiCompatibleKind(kind)) return 'openai';
+  if (isAnthropicKind(kind)) return 'anthropic';
+  return '';
+}
+
+function isUsableKind(kind) {
+  return Boolean(protocolOf(kind));
+}
+
+// env 逃生舱的协议判定（config.js 与 advisor-hook.js 共用同一份语义）：
+//   显式 ZCODE_ADVISOR_PROTOCOL 优先（'anthropic'/'anthropic-messages' → anthropic，其余 → openai）；
+//   未显式给时按端点形态推断（以 /messages 结尾 = Anthropic），默认 openai。
+// 关键点：**绝不沿用服务商侧解析出的旧协议** —— 端点已被 env 换掉，沿用会让 key
+// 以错误的鉴权方案（x-api-key vs Bearer）发到新端点（复审实测的密钥交叉同类错误）。
+function envProtocolFor(explicit, baseUrl) {
+  const p = String(explicit || '').trim();
+  if (p) return isAnthropicKind(p) ? 'anthropic' : 'openai';
+  return /\/messages$/i.test(String(baseUrl || '').trim().replace(/\/+$/, '')) ? 'anthropic' : 'openai';
 }
 
 // 读取全部 provider（含 apiKey，仅供 hook 解析/本机面板 Ping 等本地路径使用）。
@@ -170,7 +205,9 @@ function readZcodeProviders(env) {
       baseURL: String(opts.baseURL || '').trim(),
       apiKey: rawKey && !isPlaceholderKey(rawKey) ? rawKey : '',
       models,
-      eligible: isOpenAiCompatibleKind(p.kind),
+      eligible: isUsableKind(p.kind),
+      // 协议标识（'openai' | 'anthropic' | ''）——reviewer.js 据此选请求构造/响应解析分支。
+      protocol: protocolOf(p.kind),
       // 官方内置通道（bigmodel/z.ai 的 builtin:*）——审查通道不使用。
       official: id.startsWith('builtin:'),
       source: 'config'
@@ -196,7 +233,7 @@ function readZcodeProviders(env) {
       if (!exist.apiKey && key) exist.apiKey = key;
       continue;
     }
-    const item = Object.assign({}, p, { apiKey: key, eligible: isOpenAiCompatibleKind(p.kind) });
+    const item = Object.assign({}, p, { apiKey: key, eligible: isUsableKind(p.kind), protocol: protocolOf(p.kind) });
     byId.set(p.id, item);
     out.push(item);
   }
@@ -208,11 +245,11 @@ function listZcodeProviders(env) {
   return readZcodeProviders(env).map((p) => ({
     id: p.id, name: p.name, kind: p.kind, baseURL: p.baseURL,
     models: p.models, eligible: p.eligible, official: p.official,
-    hasApiKey: Boolean(p.apiKey)
+    protocol: p.protocol, hasApiKey: Boolean(p.apiKey)
   }));
 }
 
-// 可用作审查通道的服务商：非官方 + OpenAI 兼容 + 端点/key 齐备。
+// 可用作审查通道的服务商：非官方 + 协议受支持（OpenAI 兼容或 Anthropic）+ 端点/key 齐备。
 // 注意：这段判定在 resolveProviderTarget 内联使用（需要区分「显式指定」与「自动选择」
 // 两条路径的不同错误文案）；此前曾导出一份 usableZcodeProviders 副本，无人调用，已删除。
 function findZcodeProvider(providers, want) {
@@ -226,7 +263,7 @@ function findZcodeProvider(providers, want) {
 // 规则：
 // - 未指定服务商 → 自动选择：优先登记清单里含 modelWant 的服务商，其次第一个可用的；
 // - 显式指定的服务商即使清单里没有该模型也尊重（ZCode 清单可能滞后，真实可用性以端点为准）；
-// - 官方内置（builtin:）/非 OpenAI 兼容/缺端点或 key → 明确拒绝，不产出任何凭据（防密钥交叉）。
+// - 官方内置（builtin:）/协议不受支持/缺端点或 key → 明确拒绝，不产出任何凭据（防密钥交叉）。
 function resolveProviderTarget(providers, providerWant, modelWant) {
   const want = String(providerWant || '').trim();
   const wantModel = String(modelWant || '').trim();
@@ -240,7 +277,7 @@ function resolveProviderTarget(providers, providerWant, modelWant) {
   } else {
     const usable = providers.filter((p) => !p.official && p.eligible && p.baseURL && p.apiKey);
     if (usable.length === 0) {
-      return { ok: false, problem: 'zcode_provider_missing: ZCode 里没有可用的第三方服务商（需 OpenAI 兼容且已填端点与 key）——请先在 ZCode 设置里添加' };
+      return { ok: false, problem: 'zcode_provider_missing: ZCode 里没有可用的第三方服务商（需 OpenAI 兼容或 Anthropic 协议且已填端点与 key）——请先在 ZCode 设置里添加' };
     }
     found = (wantModel && usable.find((p) => p.models.includes(wantModel))) || usable[0];
     auto = true;
@@ -249,7 +286,7 @@ function resolveProviderTarget(providers, providerWant, modelWant) {
     return { ok: false, problem: `zcode_provider_official: 服务商「${found.name || found.id}」是 ZCode 官方内置通道——审查通道只使用第三方服务商` };
   }
   if (!found.eligible) {
-    return { ok: false, problem: `zcode_provider_ineligible: 服务商「${found.name || found.id}」协议为 ${found.kind || '未知'}，审查通道仅支持 OpenAI 兼容端点` };
+    return { ok: false, problem: `zcode_provider_ineligible: 服务商「${found.name || found.id}」协议为 ${found.kind || '未知'}，审查通道仅支持 OpenAI 兼容与 Anthropic 端点` };
   }
   if (!found.baseURL || !found.apiKey) {
     const missing = [!found.baseURL && 'baseURL', !found.apiKey && 'apiKey'].filter(Boolean).join('/');
@@ -266,7 +303,7 @@ function resolveProviderTarget(providers, providerWant, modelWant) {
     // 显式模型不在登记清单里：可能是清单滞后，也可能是旧配置残留。不阻断（尊重用户选择），但必须可见。
     notices.push(`zcode_model_unlisted: 模型「${wantModel}」不在服务商「${found.name || found.id}」的登记清单里（若不是有意为之，请在面板重新选择）`);
   }
-  return { ok: true, provider: found, baseUrl: found.baseURL, apiKey: found.apiKey, model, auto, notices };
+  return { ok: true, provider: found, baseUrl: found.baseURL, apiKey: found.apiKey, model, protocol: found.protocol || 'openai', auto, notices };
 }
 
 // 解析全局审查目标并写入 cfg（loadConfig 的 provider 解析阶段）。
@@ -282,6 +319,7 @@ function applyZcodeTarget(cfg, problems, sources, notices, env) {
   cfg.providerId = '';
   cfg.providerName = '';
   cfg.providerAuto = false;
+  cfg.protocol = '';
   const t = resolveProviderTarget(readZcodeProviders(env), cfg.zcodeProvider, cfg.model);
   if (!t.ok) {
     problems.push(t.problem);
@@ -290,6 +328,7 @@ function applyZcodeTarget(cfg, problems, sources, notices, env) {
   cfg.baseUrl = t.baseUrl;
   cfg.apiKey = t.apiKey;
   cfg.model = t.model;
+  cfg.protocol = t.protocol || 'openai';
   cfg.providerId = t.provider.id;
   cfg.providerName = t.provider.name || t.provider.id;
   cfg.providerAuto = Boolean(t.auto);
@@ -377,9 +416,13 @@ function loadConfig(pluginRoot, env) {
   // 服务商解析：端点/key/模型一次定稿（全局层）。env 逃生舱在下一段覆盖。
   applyZcodeTarget(cfg, problems, sources, notices, env);
 
-  // env 逃生舱覆盖全局层。**端点与 key 必须成对**（与 advisor-hook 的 resolveTarget 同一纪律）：
+  // env 逃生舱覆盖全局层。**端点/key/协议必须成套**（与 advisor-hook 的 resolveTarget 同一纪律）：
   // 只覆盖其一会把服务商 A 的 key 发往 env 端点（或反之）——这正是 0.2.17 要消灭的密钥交叉。
   // 只给了一半时整体不覆盖，并挂 problem 让用户看见（不静默）。
+  //
+  // 协议为什么也算这一组：它决定凭据**以哪种鉴权方案**发出（Bearer vs x-api-key）。
+  // 端点切到 OpenAI 端点而协议仍停在 anthropic 时，同一份 key 会以 x-api-key 发到 OpenAI 端点
+  //（复审实测）——与"端点/key 交叉"是同一类错误，故必须一起切。
   const envBase = env.ZCODE_ADVISOR_BASE_URL ? String(env.ZCODE_ADVISOR_BASE_URL) : '';
   const envKeyRaw = env.ZCODE_ADVISOR_API_KEY ? String(env.ZCODE_ADVISOR_API_KEY) : '';
   // 占位符样式的 env key 视为未配置（防 `test-*`/`your-api-key` 这类误配被当真 key 发出去）
@@ -387,6 +430,9 @@ function loadConfig(pluginRoot, env) {
   if (envBase && envKey) {
     cfg.baseUrl = envBase;
     cfg.apiKey = envKey;
+    // 协议随端点一起切：未显式给 ZCODE_ADVISOR_PROTOCOL 时按 env 端点形态推断
+    //（以 /messages 结尾 = Anthropic），否则默认 OpenAI——绝不能沿用服务商侧的旧协议。
+    cfg.protocol = envProtocolFor(env.ZCODE_ADVISOR_PROTOCOL, envBase);
   } else if (envBase || envKeyRaw) {
     problems.push(`env_override_incomplete: 环境变量只提供了 ${envBase ? 'ZCODE_ADVISOR_BASE_URL' : 'ZCODE_ADVISOR_API_KEY'}（或 key 形似占位符）——端点与 key 必须成对且真实，为避免密钥交叉本次不生效`);
   }
@@ -520,5 +566,6 @@ module.exports = {
   DEFAULTS, SYNC_TIMEOUT_CAP_MS, loadConfig, resolveApiKey, gate, configWarnings,
   isPlaceholderKey, userConfigPath, maskKey,
   zcodeConfigPath, readZcodeProviders, listZcodeProviders,
-  findZcodeProvider, resolveProviderTarget
+  findZcodeProvider, resolveProviderTarget,
+  protocolOf, isUsableKind, isAnthropicKind, envProtocolFor
 };

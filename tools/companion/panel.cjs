@@ -56,7 +56,7 @@ details summary:hover{color:#e6e8ec}
 <h3><span>ZCode Advisor · 完整配置</span></h3>
 <div class="status" id="st">读取中…</div>
 
-<label class="label" title="审查用哪个 ZCode 服务商：只列非官方、OpenAI 兼容且已配端点与 key 的">服务商</label>
+<label class="label" title="审查用哪个 ZCode 服务商：只列非官方、协议受支持（OpenAI 兼容或 Anthropic）且已配端点与 key 的">服务商</label>
 <div class="row tight">
   <select id="zprovider" style="flex:1"><option value="">（载入中…）</option></select>
   <button type="button" class="btn alt" id="zrefresh" style="flex:0 0 auto;padding:7px 12px" title="重新读取 ZCode 配置（~/.zcode/v2/config.json）——在 ZCode 里改过服务商后点这里">刷新</button>
@@ -110,7 +110,7 @@ details summary:hover{color:#e6e8ec}
 
   // 服务商列表：每次都从 controller 现读（不像角标面板做缓存）——用户在 ZCode 里
   // 改过服务商后，打开/刷新本页面即是新列表；另有「刷新」按钮强制重拉。
-  // 只列可用项（非官方 + OpenAI 兼容 + 端点/key 齐备）：看得见的都能用。
+  // 只列可用项（非官方 + 协议受支持 + 端点/key 齐备）：看得见的都能用。
   async function loadProviders(force) {
     try {
       const r = await api('/api/zcode-providers');
@@ -155,7 +155,7 @@ details summary:hover{color:#e6e8ec}
     // 不清空会盖住用户接下来在下拉里的选择（currentModelId 手填优先）。
     const manual = $('modelManual');
     if (manual && manual.value && !list.includes(String(manual.value).trim())) manual.value = '';
-    $('zendpoint').textContent = p ? ('端点：' + (p.baseURL || '（该服务商未配置 baseURL）')) : '先在 ZCode 设置里添加 OpenAI 兼容服务商';
+    $('zendpoint').textContent = p ? ('端点：' + (p.baseURL || '（该服务商未配置 baseURL）')) : '先在 ZCode 设置里添加 OpenAI 兼容或 Anthropic 服务商';
   }
 
   async function fetchZcodeModels() {

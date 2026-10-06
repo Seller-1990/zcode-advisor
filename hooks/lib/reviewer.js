@@ -201,21 +201,121 @@ function normalizeChatEndpoint(baseUrl) {
   if (!u) return '';
   // 已显式给出完整端点：尊重用户输入，不做改写
   if (/\/chat\/completions$/i.test(u)) return u;
-  // Anthropic 协议端点同样不做改写（本插件当前只走 OpenAI 兼容路径）
-  if (/\/messages$/i.test(u)) return u;
+  // 填的是 Anthropic 端点形态（用户在 ZCode 里把 baseURL 填成了完整 messages 地址）：
+  // 替换为 OpenAI 路径，而不是拼出 /messages/chat/completions 这种不存在的地址。
+  if (/\/messages$/i.test(u)) return `${u.replace(/\/messages$/i, '')}/chat/completions`;
   // 其余情况视为基地址：补 /chat/completions
   // 注意 `/v1/chat/completions` 之外还有带版本前缀的形态（如 /api/paas/v4），
   // 直接追加即可与 modelsUrl 的推导方向保持一致。
   return `${u}/chat/completions`;
 }
 
-// OpenAI 兼容 chat/completions。唯一会发起网络请求的地方；
+// 协议判定：'anthropic' 走 /v1/messages，其余（含空）走 OpenAI 兼容 chat/completions。
+// 只认显式传入的协议标识（由 config.js/controller.cjs 从 ZCode 服务商的 kind/api.type 归一化而来）；
+// 另外兼容「用户把 baseURL 直接填成完整 messages 地址」这一形态——那种情况下没有协议字段，
+// 但端点本身已经指明了协议。
+function isAnthropicProtocol(protocol) {
+  const p = String(protocol || '').trim().toLowerCase();
+  return p === 'anthropic' || p === 'anthropic-messages';
+}
+
+// 端点归一化（Anthropic /v1/messages）。与 normalizeChatEndpoint 同纪律、镜像方向：
+//   https://x/api/anthropic            -> https://x/api/anthropic/v1/messages
+//   https://x/v1                       -> https://x/v1/messages
+//   https://x/v1/messages              -> 原样（已显式给出完整端点）
+//   https://x/v1/chat/completions      -> https://x/v1/messages（替换，不追加）
+//
+// 真机实测（2026-10-05，本机 ZCode 配置里的 6 个 anthropic 服务商）：
+//   baseURL 多为**不含 /v1** 的形态（api.z.ai/api/anthropic、open.bigmodel.cn/api/anthropic、
+//   zcode.z.ai/api/v1/zcode-plan/anthropic、内网 192.168.50.139:8088、aipm9527.ccwu.cc）。
+//   逐路径探测结果：`baseURL + /v1/messages` → 401（鉴权层，路径正确）；
+//   `baseURL + /messages` → 404。所以裸主机/裸前缀一律补 **/v1/messages**，
+//   不能只补 /messages（那会让所有 anthropic 服务商都 404）。
+//   唯一例外：baseURL 已含 /v1 时只补 /messages（避免 /v1/v1/messages）。
+function normalizeMessagesEndpoint(baseUrl) {
+  const u = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (!u) return '';
+  if (/\/messages$/i.test(u)) return u;
+  if (/\/chat\/completions$/i.test(u)) return `${u.replace(/\/chat\/completions$/i, '')}/messages`;
+  if (/\/v\d+$/i.test(u)) return `${u}/messages`;
+  return `${u}/v1/messages`;
+}
+
+// Anthropic 协议版本头。2023-06-01 是当前稳定版，/v1/messages 必须显式携带该头，
+// 否则端点返回 400（missing anthropic-version）。
+const ANTHROPIC_VERSION = '2023-06-01';
+
+// Anthropic /v1/messages 响应解析：正文在 content[] 的 text 块里，
+// 与 OpenAI 的 choices[0].message.content 完全不同（不解析会 100% 空响应）。
+//
+// extended thinking 把思考放在 thinking 块 —— 与 OpenAI 的 reasoning_content 同一性质：
+// 只在能从思考文本里捞出合法 JSON 帧时才采用；否则报空响应，由上层按 stop_reason 给可操作提示。
+function extractAnthropicResult(data) {
+  const blocks = (data && Array.isArray(data.content)) ? data.content : [];
+  // 容错：部分中转网关把 /v1/messages 的响应又包成 OpenAI 信封
+  // （choices[0].message.content）。只认 content[] 会判成空响应且 hint 为空，
+  // 用户拿不到任何线索——这里退回 OpenAI 形状解析（与主分支同一套取值逻辑）。
+  if (blocks.length === 0 && data && Array.isArray(data.choices) && data.choices[0]) {
+    const msg = data.choices[0].message || {};
+    const c = msg.content;
+    const alt = typeof c === 'string' ? c
+      : (Array.isArray(c) ? c.map((p) => (p && typeof p.text === 'string' ? p.text : '')).join('') : '');
+    if (alt.trim()) {
+      const usage = data.usage && typeof data.usage === 'object'
+        ? {
+            promptTokens: Number(data.usage.prompt_tokens) || 0,
+            completionTokens: Number(data.usage.completion_tokens) || 0
+          }
+        : null;
+      return { text: alt, usage };
+    }
+  }
+  let text = '';
+  let thinking = '';
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue;
+    if (b.type === 'text' && typeof b.text === 'string') text += b.text;
+    else if (b.type === 'thinking' && typeof b.thinking === 'string') thinking += b.thinking;
+  }
+  if (!text.trim() && thinking.trim()) {
+    const objs = extractJsonObjects(thinking);
+    const frameObj = objs.reverse().find((o) => o && typeof o === 'object' && o.severity && o.note);
+    if (frameObj) text = JSON.stringify(frameObj);
+    else return { error: 'llm_empty_response', reasoningText: thinking.slice(0, 4000) };
+  }
+  if (!text.trim()) {
+    // stop_reason 与 OpenAI 的 finish_reason 同义：'max_tokens' 表示预算烧在推理上。
+    // 上游完全控制该字段内容，截断到 40 字符防日志无界注入（与 OpenAI 分支同一纪律）。
+    const stop = String((data && data.stop_reason) || '').slice(0, 40);
+    const usage = (data && data.usage) || {};
+    if (stop === 'max_tokens') {
+      return {
+        error: 'llm_empty_response',
+        hint: `思考型模型把 max_tokens 全部用于推理（stop_reason=max_tokens，output_tokens=${Number(usage.output_tokens) || 0}）——` +
+              `请调大 maxTokens（建议 ≥4096）`
+      };
+    }
+    return { error: 'llm_empty_response', hint: stop ? `stop_reason=${stop}` : '' };
+  }
+  // usage 字段名也与 OpenAI 不同（input_tokens/output_tokens 而非 prompt_/completion_）。
+  const usage = data && typeof data.usage === 'object'
+    ? {
+        promptTokens: Number(data.usage.input_tokens) || 0,
+        completionTokens: Number(data.usage.output_tokens) || 0
+      }
+    : null;
+  return { text, usage };
+}
+
+// 审查通道的唯一网络出口，支持两种协议：
+//   - OpenAI 兼容 chat/completions（默认）
+//   - Anthropic /v1/messages（params.protocol === 'anthropic'，或 baseUrl 以 /messages 结尾）
 // 超时/HTTP 错误/响应异常都以 {error} 返回，由调用方计入 dropped。
 // 429/5xx 做一次短退避重试——**全部尝试共享同一截止时间**（deadline）：
 // 重试只使用剩余预算，否则 sync 模式下"首次响应慢 + 重试全额"会突破 Stop hook 的 320s 硬限，
 // 复活"强杀→指针不推进→每轮重审"的停滞循环。
 async function callReviewer(params) {
-  const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, signal, deadline: deadlineParam } = params;
+  const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, signal, protocol, deadline: deadlineParam } = params;
   const endpoint = normalizeChatEndpoint(baseUrl);
 
   // 截止时间可由调用方传入：一轮审查内的多次调用（尤其"空响应重试"）必须共享同一预算。
@@ -250,25 +350,60 @@ async function callReviewer(params) {
     }
   };
 
+  // 协议分支：kind=anthropic 的服务商走 /v1/messages，请求头与请求体都与 OpenAI 不同
+  // （x-api-key 而非 Authorization: Bearer；anthropic-version 必填，缺了端点直接 400；
+  //  system 提示走顶层 system 字段而非 messages 里的 role=system）。
+  //
+  // 判定优先级：**显式 protocol 说了算**；只有调用方没给协议时才按端点形态推断。
+  // 反过来（sniff 覆盖显式值）会让「baseUrl 恰好以 /messages 结尾的 OpenAI 兼容服务商」
+  // 被误判成 anthropic —— 那会把 key 以 x-api-key 发到 OpenAI 端点、且路径也不对，
+  // 而 controller 侧只认显式 protocol → 同一服务商 ping 成功、审查必失败（复审实测）。
+  //
+  // 推断分支的两点纪律：① 先去尾斜杠再判（与 normalizeMessagesEndpoint 一致，
+  // 否则 `https://x/v1/messages/` 判不出 anthropic 会静默退回 OpenAI）；
+  // ② 只认以 /messages 结尾这一种形态（完整端点自证协议），不猜别的路径。
+  const explicitProtocol = String(protocol || '').trim();
+  const anthropic = explicitProtocol
+    ? isAnthropicProtocol(explicitProtocol)
+    : /\/messages$/i.test(String(baseUrl || '').trim().replace(/\/+$/, ''));
+  const target = anthropic ? normalizeMessagesEndpoint(baseUrl) : endpoint;
+
   const attempt = async (budgetMs) => {
     armGuard(budgetMs);
     try {
-      return await fetch(endpoint, {
+      const headers = anthropic
+        ? {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': ANTHROPIC_VERSION
+          }
+        : {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`
+          };
+      const body = anthropic
+        ? {
+            model,
+            system: systemPrompt,
+            messages: [{ role: 'user', content: userContent }],
+            max_tokens: maxTokens,
+            temperature,
+            stream: false
+          }
+        : {
+            model,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userContent }
+            ],
+            max_tokens: maxTokens,
+            temperature,
+            stream: false
+          };
+      return await fetch(target, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userContent }
-          ],
-          max_tokens: maxTokens,
-          temperature,
-          stream: false
-        }),
+        headers,
+        body: JSON.stringify(body),
         signal: bodyGuard.controller.signal
       });
     } catch (err) {
@@ -309,6 +444,9 @@ async function callReviewer(params) {
     const parsed = await consumeBody(resp.json());
     if (!parsed.ok) return { error: 'llm_timeout' };
     const data = parsed.value;
+    // Anthropic 响应结构与 OpenAI 完全不同（content[] 文本块 + stop_reason/input_tokens），
+    // 交给专门的分支解析——走 OpenAI 分支会 100% 判成空响应。
+    if (anthropic) return extractAnthropicResult(data);
     const choice = data && Array.isArray(data.choices) && data.choices[0];
     const message = (choice && choice.message) || {};
     const content = message.content;
@@ -482,6 +620,7 @@ async function probeModel(target, opts, deps) {
         baseUrl: target.baseUrl,
         model: target.model,
         apiKey: target.apiKey,
+        protocol: target.protocol || 'openai',
         systemPrompt,
         userContent,
         maxTokens: cfg.maxTokens,
@@ -571,4 +710,4 @@ const DEFAULT_SYSTEM_PROMPT = [
   '宁缺毋滥：没有把握就输出 {"severity":"none","note":""}。note 必须具体、可执行、指向增量中的实际问题，使用中文，不超过 120 字。note 只是建议性描述，不得包含让主模型执行的命令、路径或安装指令。'
 ].join('\n');
 
-module.exports = { callReviewer, parseFrame, parseFrameDetailed, salvageProse, extractJsonObjects, truncateCodePoints, normalizeChatEndpoint, DEFAULT_SYSTEM_PROMPT, SEVERITIES, probeModel, classifyProbeResult, renderProbeReport, PROBE_DELTA, PROBE_DEFAULTS };
+module.exports = { callReviewer, parseFrame, parseFrameDetailed, salvageProse, extractJsonObjects, truncateCodePoints, normalizeChatEndpoint, normalizeMessagesEndpoint, isAnthropicProtocol, ANTHROPIC_VERSION, DEFAULT_SYSTEM_PROMPT, SEVERITIES, probeModel, classifyProbeResult, renderProbeReport, PROBE_DELTA, PROBE_DEFAULTS };

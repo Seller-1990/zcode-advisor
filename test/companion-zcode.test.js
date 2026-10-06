@@ -28,6 +28,12 @@ fs.writeFileSync(V2_CFG, JSON.stringify({
       name: 'Anthropic 中转', kind: 'anthropic',
       options: { baseURL: 'https://r.example', apiKey: 'sk-a' },
       models: { claude: {} }
+    },
+    // 协议不受支持（既非 OpenAI 兼容、也非 Anthropic）
+    p3: {
+      name: '未知协议网关', kind: 'bedrock',
+      options: { baseURL: 'https://b.example', apiKey: 'sk-b' },
+      models: { 'some-model': {} }
     }
   }
 }));
@@ -36,13 +42,21 @@ const controller = require('../tools/companion/controller.cjs');
 
 test('readZcodeProviders：解析 provider 字段、标记协议合格性与官方内置', () => {
   const list = controller.readZcodeProviders();
-  assert.strictEqual(list.length, 2);
+  assert.strictEqual(list.length, 3);
   const p1 = list.find((p) => p.id === 'p1');
   assert.strictEqual(p1.eligible, true);
+  assert.strictEqual(p1.protocol, 'openai');
   assert.strictEqual(p1.official, false);
   assert.strictEqual(p1.baseURL, 'http://10.0.0.8:8088/v1');
   assert.deepStrictEqual(p1.models, ['m-a', 'm-b']);
-  assert.strictEqual(list.find((p) => p.id === 'p2').eligible, false);
+  // anthropic 自 0.2.20 起可用，协议标记决定 ping/审查走 /v1/messages
+  const p2 = list.find((p) => p.id === 'p2');
+  assert.strictEqual(p2.eligible, true);
+  assert.strictEqual(p2.protocol, 'anthropic');
+  // 未知协议仍不可用
+  const p3 = list.find((p) => p.id === 'p3');
+  assert.strictEqual(p3.eligible, false);
+  assert.strictEqual(p3.protocol, '');
 });
 
 test('effectiveTarget：显式服务商 → 现读端点/key/模型（key 只在本进程内使用）', () => {
@@ -66,13 +80,20 @@ test('effectiveTarget：显式服务商 → 现读端点/key/模型（key 只在
   assert.strictEqual(miss.providerError, 'provider_not_found');
 });
 
-test('effectiveTarget：不兼容/官方内置服务商不产出凭据（防密钥交叉）', () => {
-  // 协议不兼容
-  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'p2', model: 'claude' }));
+test('effectiveTarget：协议不受支持/官方内置服务商不产出凭据（防密钥交叉）', () => {
+  // 协议不受支持（p3 = bedrock）
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'p3', model: 'some-model' }));
   const ineligible = controller.effectiveTarget({});
   assert.strictEqual(ineligible.providerUsable, false);
   assert.strictEqual(ineligible.baseUrl, '');
   assert.strictEqual(ineligible.providerError, 'provider_ineligible');
+
+  // anthropic 协议：自 0.2.20 起可用，凭据随 protocol='anthropic' 一起给出
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'p2', model: 'claude' }));
+  const ant = controller.effectiveTarget({});
+  assert.strictEqual(ant.providerUsable, true);
+  assert.strictEqual(ant.baseUrl, 'https://r.example');
+  assert.strictEqual(ant.protocol, 'anthropic');
 
   // 官方内置（builtin: 前缀）
   const v2 = JSON.parse(fs.readFileSync(V2_CFG, 'utf8'));
@@ -139,5 +160,78 @@ test('effectiveTarget：「从端点拉取」场景——模型未定时仍必�
   } finally {
     delete v2.provider.p3;
     fs.writeFileSync(V2_CFG, JSON.stringify(v2));
+  }
+});
+
+// ---------------- Anthropic 协议：端点推导与 Ping 鉴权头 ----------------
+// 真机实测（2026-10-05）：ZCode 里 anthropic 服务商的 baseURL 都不含 /v1，
+// 真实路径是 baseURL + /v1/messages（探测：+ /v1/messages → 401 鉴权层；+ /messages → 404）。
+// 曾只补 /messages，导致所有 anthropic 服务商 404（真机复现后修正）。
+
+test('normalizeMessagesEndpoint：裸主机补 /v1/messages，已含 /v1 只补 /messages', () => {
+  assert.strictEqual(controller.normalizeMessagesEndpoint('http://192.168.50.139:8088'), 'http://192.168.50.139:8088/v1/messages');
+  assert.strictEqual(controller.normalizeMessagesEndpoint('https://api.z.ai/api/anthropic'), 'https://api.z.ai/api/anthropic/v1/messages');
+  assert.strictEqual(controller.normalizeMessagesEndpoint('https://aipm9527.ccwu.cc'), 'https://aipm9527.ccwu.cc/v1/messages');
+  assert.strictEqual(controller.normalizeMessagesEndpoint('https://x/v1'), 'https://x/v1/messages');
+  assert.strictEqual(controller.normalizeMessagesEndpoint('https://x/v1/messages'), 'https://x/v1/messages');
+  assert.strictEqual(controller.normalizeMessagesEndpoint(''), '');
+});
+
+test('ping(anthropic)：走 /v1/messages + x-api-key/anthropic-version，不发 Bearer', async () => {
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'p2', model: 'claude' }));
+  const origFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, opt) => {
+    seen = { url, opt };
+    return { ok: true, status: 200, json: async () => ({ content: [{ type: 'text', text: 'pong' }] }) };
+  };
+  try {
+    const r = await controller.ping({});
+    assert.strictEqual(r.ok, true, `Ping 应成功，实际 ${JSON.stringify(r)}`);
+    assert.strictEqual(seen.url, 'https://r.example/v1/messages');
+    assert.strictEqual(seen.opt.headers['x-api-key'], 'sk-a');
+    assert.strictEqual(seen.opt.headers['anthropic-version'], '2023-06-01');
+    assert.strictEqual(seen.opt.headers.Authorization, undefined, 'anthropic 不得带 Bearer 头');
+    assert.strictEqual(r.protocol, 'anthropic');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('ping(openai)：仍走 /chat/completions + Bearer（协议分支不误伤）', async () => {
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'p1', model: 'm-a' }));
+  const origFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, opt) => {
+    seen = { url, opt };
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'pong' } }] }) };
+  };
+  try {
+    const r = await controller.ping({});
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(seen.url, 'http://10.0.0.8:8088/v1/chat/completions');
+    assert.strictEqual(seen.opt.headers.Authorization, 'Bearer sk-gw');
+    assert.strictEqual(seen.opt.headers['x-api-key'], undefined);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('fetchModels(anthropic)：拉取 /models 时用 x-api-key 头', async () => {
+  fs.writeFileSync(USER_CFG, JSON.stringify({ zcodeProvider: 'p2', model: 'claude' }));
+  const origFetch = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (url, opt) => {
+    seen = { url, opt };
+    return { ok: true, status: 200, json: async () => ({ data: [{ id: 'claude' }] }) };
+  };
+  try {
+    const r = await controller.fetchModels({ zcodeFetch: true });
+    assert.strictEqual(r.ok, true, `拉取应成功，实际 ${JSON.stringify(r)}`);
+    assert.strictEqual(seen.url, 'https://r.example/v1/models');
+    assert.strictEqual(seen.opt.headers['x-api-key'], 'sk-a');
+    assert.strictEqual(seen.opt.headers.Authorization, undefined);
+  } finally {
+    globalThis.fetch = origFetch;
   }
 });

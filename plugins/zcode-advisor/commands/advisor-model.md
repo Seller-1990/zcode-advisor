@@ -14,6 +14,6 @@ argument-hint: "[set <model-id> [provider:<id|名称>] | provider <id|名称> | 
 3. 如实报告输出。向用户说明：
    - **端点与 key 不在本命令范围**——它们永远由选中的 ZCode 第三方服务商解析得到，本命令不接受也不存储任何端点/key（状态文件里也没有明文 key）。
    - `set` 只覆盖当前会话、自下一轮审查起生效；`provider <id>` 只换服务商，会把本会话模型清空回落该服务商清单（旧模型多半不属于新服务商）。
-   - 优先级为**本会话覆盖 > 全局 > 该服务商登记清单首项**；服务商必须是**非官方内置**（`builtin:` 的 BigModel/Z.ai 通道被排除）且 OpenAI 兼容并已配端点与 key。
+   - 优先级为**本会话覆盖 > 全局 > 该服务商登记清单首项**；服务商必须是**非官方内置**（`builtin:` 的 BigModel/Z.ai 通道被排除）且协议受支持（OpenAI 兼容或 Anthropic）并已配端点与 key。
    - 无效模型/服务商会在 `/advisor-status` 的 `Dropped:llm_http_4xx` 与状态行中暴露。
 4. 全局默认的改法：🛡️ 角标 →「完整配置」面板（或本地配置面板 `127.0.0.1:8789`）选服务商 + 模型 → 保存；也可直接编辑 `~/.zcode/advisor.config.json` 的 `zcodeProvider` / `model`。

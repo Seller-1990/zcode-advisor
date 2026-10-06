@@ -400,3 +400,29 @@ test('degradeAlertLine：含主模型失败次数/时长/原因与备用模型�
   assert.match(line, /服务未中断/, '应说明服务未中断（备用在兜），而非谎报停摆');
   assert.match(line, /\/advisor-setup/);
 });
+
+// ---------------- protocol 透传（最高危回归） ----------------
+// Anthropic 服务商的 baseUrl 不含 /messages（真机：api.z.ai/api/anthropic、内网 192.168.50.139:8088），
+// 所以「协议」只能靠 target.protocol 传给 callReviewer。漏传时它不会报错，只会静默
+// 退回 OpenAI 路径（Bearer 头 + /chat/completions）→ 审查永远失败而看不出原因。
+// 复审指出：删掉 advisor-hook 的 protocol 透传后全部测试仍绿 —— 这里补锁。
+
+test('reviewTurn：target.protocol 必须透传给 callReviewer（缺省会静默退回 OpenAI）', async () => {
+  const H = require('../hooks/advisor-hook');
+  const seen = [];
+  const call = async (p) => { seen.push(p.protocol); return OK_FRAME; };
+  const target = { baseUrl: 'http://192.168.50.139:8088', model: 'claude-opus-5', apiKey: 'k', protocol: 'anthropic' };
+  await H.reviewTurn(mkCfg(), target, 'delta', false, { state: {}, callReviewer: call });
+  assert.ok(seen.length > 0, '应至少发起一次调用');
+  assert.ok(seen.every((p) => p === 'anthropic'),
+    `每次调用都必须带 protocol=anthropic，实际 ${JSON.stringify(seen)}`);
+});
+
+test('reviewTurn：target 未给 protocol 时回退 openai（不误判）', async () => {
+  const H = require('../hooks/advisor-hook');
+  const seen = [];
+  const call = async (p) => { seen.push(p.protocol); return OK_FRAME; };
+  await H.reviewTurn(mkCfg(), TARGET, 'delta', false, { state: {}, callReviewer: call });
+  assert.ok(seen.every((p) => p === 'openai'),
+    `未指定协议时必须是 openai，实际 ${JSON.stringify(seen)}`);
+});
