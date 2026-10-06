@@ -7,18 +7,19 @@
 #   - 也**不定时跑**：只在每个 PR 合并前调用一次。
 #
 # 模型降级链（provider|model，与 ~/.opencodereview/config.json 的 custom_providers 对应）：
-#   ⚠️ 本脚本含云端 provider，**只允许公开仓使用**（云端会把代码发往第三方）；
-#      私有仓用 ocr-review.sh.private 变体（NAS-only，见 ~/.dsh/templates/ocr-review/）。
-#   前四棒全 0 倍率免费（2026-10-04 成本优先，避开 kimi-k3 等贵模型）：
+#   【2026-10-04】隐私铁律暂缓（用户拍板）：私有仓也可用本链（私有副本用 ocr-review.sh.private
+#      变体，链走 chain-private，同样允许 cloud 条目）。
 #   主    nas-hy4     -> deepseek-v4.1-flash （8787 免费，工具调用已实测）
-#   备用① nas-octopus -> glm-5.3-flash      （8088 PM-API 免费分组）
-#   备用② nas-hy4     -> hy3                （8787 免费）
-#   备用③ nas-hy4     -> hy4-preview-f      （8787 免费）
-#   备用④ x666        -> ministral-14b-latest （云端 0 倍率，工具调用已实测）
-#   备用⑤ lucky-gem   -> gemini-3.6-flash   （云端，主人提供 key，工具调用已实测）
+#   备用① runanytime  -> z-ai/glm-5.2       （随时跑路中转，本机中继 127.0.0.1:18789，工具调用已实测）
+#   备用② nas-octopus -> glm-5.3-flash      （8088 PM-API 免费分组）
+#   备用③ nas-hy4     -> hy3                （8787 免费）
+#   备用④ nas-hy4     -> hy4-preview-f      （8787 免费）
+#   备用⑤ x666        -> ministral-14b-latest （云端 0 倍率，工具调用已实测；该站唯一可用，2026-10-04 全站复测）
 #   备用⑥ lucky       -> stealth/space-bunny-alpha （云端，工具调用已实测）
 #   备用⑦ lucky       -> step-5-preview     （云端，工具调用已实测）
 #   备用⑧ daigua      -> gpt-6-sol          （云端，顾问生产验证过工具调用）
+#   （lucky-gem/gemini-3.6-flash 已出链：2026-10-04 实测 503 无通道）
+#   ⚠️ 同站 kimi-k3 不支持工具调用（2026-10-04 三次探针无 tool_calls）→ 不能当 ocr 模型，勿加回。
 # 用法：
 #   ./scripts/ocr-review.sh              # 默认基准 origin/dev（不存在则回退 main）
 #   ./scripts/ocr-review.sh v1.8.8       # 对比 tag / 分支
@@ -132,18 +133,76 @@ fi
 AGENT_MODEL="$(tr -d '[:space:]' < "$AGENT_MODEL_FILE" 2>/dev/null || true)"
 [ -n "$AGENT_MODEL" ] && echo "（编码代理当前模型：${AGENT_MODEL}，评审将优先使用其他 provider）"
 
-# 降级链：逐个尝试，第一个**产出有效 JSON** 的即采用
+# === 降级链区块开始（由 ~/.dsh/bin/ocr-sync-reviewer.sh 从 chain-public 生成，勿手改）===
+# 降级链唯一真源：~/.dsh/templates/ocr-review/chain-public
+#   一行一条 scope|provider|model，顺序即优先级，第一个产出有效 JSON 的即采用。
+#   改链只改那个文件：副本运行时也直接读它，下面这份只是读不到时的兜底快照。
+CHAIN_FILE="${OCR_REVIEW_CHAIN_FILE:-$HOME/.dsh/templates/ocr-review/chain-public}"
+CHAIN_SCOPE="public"   # public 副本：cloud 条目合法，但仍以链文件为唯一真源
 CHAIN=(
   "nas-hy4|deepseek-v4.1-flash"
+  "runanytime|z-ai/glm-5.2"
   "nas-octopus|glm-5.3-flash"
   "nas-hy4|hy3"
   "nas-hy4|hy4-preview-f"
   "x666|ministral-14b-latest"
-  "lucky-gem|gemini-3.6-flash"
+  "runanytime-astra|gpt-6-astra"
+  "runanytime|z-ai/glm-5.3"
   "lucky|stealth/space-bunny-alpha"
   "lucky|step-5-preview"
   "daigua|gpt-6-sol"
 )
+# 运行时优先读链文件：读不到 / 解析出 0 条 → 保留上面的快照（脚本被单独拷走也跑得起来）。
+_chain_found=()
+if [ -r "$CHAIN_FILE" ]; then
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _line="${_line%%#*}"                       # 去掉行内注释
+    _line="${_line//[[:space:]]/}"             # 去空白，容忍手滑多打空格
+    _pipes="${_line//[!|]/}"                   # 只留竖线，用来数段数
+    [ "${#_pipes}" -eq 2 ] || continue         # 必须正好 scope|provider|model
+    _scope="${_line%%|*}"; _entry="${_line#*|}"
+    [ -n "$_scope" ] || continue
+    _p="${_entry%%|*}"; _m="${_entry#*|}"
+    [ -n "$_p" ] && [ -n "$_m" ] || continue
+    _chain_found[${#_chain_found[@]}]="$_entry"
+  done < "$CHAIN_FILE"
+fi
+if [ "${#_chain_found[@]}" -gt 0 ]; then
+  CHAIN=("${_chain_found[@]}")
+else
+  echo "（链文件 ${CHAIN_FILE} 不可用，用内嵌快照 ${#CHAIN[@]} 条）" >&2
+fi
+# === 降级链区块结束 ===
+
+# 时间预算：防"建连后永久挂起"把整条链卡死（本机无 GNU timeout，见 run_with_deadline）。
+#   HOP_TIMEOUT  单跳上限。完整评审实测 5–15 分钟，900s 覆盖正常耗时，只掐挂起。
+#   TOTAL_BUDGET 整条链最长耗时。公开链条目多，按 6 跳封顶——再长会把
+#                .git/ocr-review.lock 占用到之后每次推送都被误判"已有评审在进行"。
+HOP_TIMEOUT="${OCR_REVIEW_HOP_TIMEOUT:-900}"
+TOTAL_BUDGET="${OCR_REVIEW_TOTAL_BUDGET:-5400}"
+CHAIN_START="$(date +%s)"
+
+# 上游限流与资产噪音的稳定参数（都是实测踩出来的教训，不是默认值拍脑袋）：
+#   --concurrency：ocr 默认并发 8 个子任务，实测会打满 x666 的「25 请求/5 分钟」限流（429），
+#     曾连续 6 次评审全灭。降并发换稳；限流充裕的 provider 用 OCR_REVIEW_CONCURRENCY=8 调回。
+#   --exclude：二进制图片资产进 diff 只会塞爆每个分组的上下文，对文本评审是纯噪音
+#     （zcode-advisor 实测两个模型 20 组全返回空 comments）。要连图片一起审就设空串关掉。
+# 用数组而不是字符串展开：排除模式里的 **/*.png 是通配符，字符串展开会被
+# 当前目录里的真实文件 glob 成文件名，旗标就废了。
+OCR_REVIEW_CONCURRENCY="${OCR_REVIEW_CONCURRENCY:-2}"
+OCR_REVIEW_EXCLUDE="${OCR_REVIEW_EXCLUDE:-**/*.png,**/*.ico,**/*.icns,**/*.jpg,**/*.jpeg,**/*.gif,**/*.pdf}"
+OCR_EXTRA_ARGS=()
+OCR_EXTRA_ARGS+=(--concurrency "$OCR_REVIEW_CONCURRENCY")
+[ -n "$OCR_REVIEW_EXCLUDE" ] && OCR_EXTRA_ARGS+=(--exclude "$OCR_REVIEW_EXCLUDE")
+
+# 实际使用台账：每次评审把"用了哪个 provider/model、成没成"追加到一份公共日志，
+# 供 ~/.dsh/hooks/ocr-pool-status.sh 展示最近几跳（否则没人知道当前到底在用谁）。
+# 只写 provider/model 名与结果，不写 diff 内容、不写 key。
+USAGE_LOG="${OCR_REVIEW_USAGE_LOG:-$HOME/.dsh/hooks/ocr-pool-usage.log}"
+record_use() {  # $1=provider $2=model $3=ok|skip|fail
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$(basename "${REPO_ROOT:-$PWD}")" "$1" "$2" "$3" \
+    >>"$USAGE_LOG" 2>/dev/null || true
+}
 
 # 模板必须以 XXXXXX 结尾：GNU mktemp 把 -t 当 --tmpdir 并要求该后缀（BSD/macOS 两者都接受）。
 TMPDIR_OCR="${TMPDIR:-/tmp}"
@@ -152,6 +211,8 @@ OUT_JSON="$(mktemp "${TMPDIR_OCR%/}/ocr-review-XXXXXX" 2>/dev/null)" || {
 }
 [ -n "$OUT_JSON" ] || { echo "错误：mktemp 未返回路径" >&2; exit 1; }
 ATTEMPT_LOG=""
+# 注意：这个 trap 会覆盖前面的锁清理 trap，所以 rm -rf "$LOCK_DIR" 必须在这里再做一次，
+# 否则锁目录永不消失，之后每次运行都误报"陈旧锁"（虽然能接管，但看着像坏了）。
 # OCR_REVIEW_RAW_OUT（可选，由调用方提供，例如 pre-push hook）：把 ocr 的**原始 JSON**
 # 另存一份。它是权威产物（下面的渲染表由它生成），而 OUT_JSON 只是 mktemp 临时文件、
 # 退出时被本函数删掉 —— 此前评审成功后原始 JSON 一并消失，事后无法复核或重渲染。
@@ -201,7 +262,7 @@ cleanup() {
       # （dirname 对 "/foo.json" 返回 "/"、对 "foo.json" 返回 "."，**永不为空**，故无需兜底。）
     fi
   fi
-  rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}
+  rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}; rm -rf ${LOCK_DIR:+"$LOCK_DIR"}
 }
 trap cleanup EXIT INT TERM
 
@@ -242,6 +303,50 @@ if not isinstance(data.get("comments"), list):
 PYCHECK
 }
 
+# hard deadline：给一条命令套"最多 secs 秒"的上限，超时整组终止（含孙进程）。
+#
+# 为什么不用 `timeout`：本机是 macOS + bash 3.2，没有 GNU coreutils 的 timeout，
+# 也没有 gtimeout（防止某天被装进来）。
+# 为什么不用 `perl -e 'alarm N; exec @ARGV'`：alarm 只杀 perl 自己变出的那个进程，
+# ocr 派生的子进程会漏成孤儿。这里改用"自成进程组 + 整组 signale"：
+#   set -m 让后台任务成为组长（PGID == PID），超时时 kill -TERM -- -PID 全组带走。
+# 安全细节：只有在确认目标 PGID 等于自身 PID 时才发组信号，否则退化成
+# "先杀子进程、再杀父进程"，绝不可能误伤本脚本所在的进程组。
+# 退出码：快命令原样透传；被杀时 143(TERM)/137(KILL)，调用方据此判定超时。
+run_with_deadline() {
+  local secs="$1"; shift
+  case "$secs" in ''|*[!0-9]*) "$@"; return $? ;; esac
+  [ "$secs" -gt 0 ] || { "$@"; return $?; }
+  set -m
+  "$@" &
+  local cmd_pid=$!
+  set +m
+  (
+    sleep "$secs" 2>/dev/null
+    if [ "$(ps -o pgid= -p "$cmd_pid" 2>/dev/null | tr -d ' ')" = "$cmd_pid" ]; then
+      kill -TERM -- "-$cmd_pid" 2>/dev/null
+    else
+      pkill -TERM -P "$cmd_pid" 2>/dev/null
+      kill -TERM "$cmd_pid" 2>/dev/null
+    fi
+    sleep 2 2>/dev/null
+    if [ "$(ps -o pgid= -p "$cmd_pid" 2>/dev/null | tr -d ' ')" = "$cmd_pid" ]; then
+      kill -KILL -- "-$cmd_pid" 2>/dev/null
+    else
+      pkill -KILL -P "$cmd_pid" 2>/dev/null
+      kill -KILL "$cmd_pid" 2>/dev/null
+    fi
+  ) &
+  local watcher_pid=$!
+  # 下面三行的 || rc=$? / || true 是给 set -e 型调用方兜底：超时后这一跳返回 143，
+  # 裸 wait 在 set -euo pipefail 的脚本里会直接把整个评审带走，链就不再降级了（实测踩过）。
+  local rc=0
+  wait "$cmd_pid" 2>/dev/null || rc=$?
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  return $rc
+}
+
 echo "评审范围：$FROM .. $TO"
 CHOSEN=""
 SKIPPED=0
@@ -250,33 +355,41 @@ FAILURE_DIAG=""
 for entry in "${CHAIN[@]}"; do
   provider="${entry%%|*}"
   model="${entry##*|}"
+  # 总预算先用完就不再试后面的：宁可本次无评审，也不无限期占着锁
+  REMAIN=$(( TOTAL_BUDGET - ($(date +%s) - CHAIN_START) ))
+  if [ "$REMAIN" -le 0 ]; then
+    echo "  总预算 ${TOTAL_BUDGET}s 已用尽，剩余 provider 不再尝试"
+    break
+  fi
   if [ -n "$AGENT_MODEL" ] && [ "$model" = "$AGENT_MODEL" ]; then
     echo "  跳过 ${provider}（$model 正被编码代理占用）"
     SKIPPED=$((SKIPPED + 1))
     [ "$SKIPPED" -eq "${#CHAIN[@]}" ] && SKIPPED_ALL=1
     continue
   fi
+  HOP_LIMIT="$HOP_TIMEOUT"
+  [ "$HOP_LIMIT" -gt "$REMAIN" ] && HOP_LIMIT="$REMAIN"
   # 每次尝试前清空，防止失败后残留上次结果被误判为成功
   : > "$OUT_JSON"
   ATTEMPT_LOG="$(mktemp "${TMPDIR_OCR%/}/ocr-attempt-XXXXXX" 2>/dev/null || true)"
-  echo "  尝试 provider=$provider model=$model …"
-  # --concurrency 2：ocr 默认并发 8 个子任务（每组还有多轮工具调用），实测会打满
-  # x666 的「25 请求/5 分钟」限流（429）——连续 6 次评审全灭的根因。降并发换稳。
-  # 可用 OCR_REVIEW_CONCURRENCY 覆盖；限流充裕的 provider 可设回 8。
-  # --exclude 图片：assets/icon.png 是 ~1MB 二进制，进 diff 会塞爆每个分组的上下文，
-  # 实测两个模型全部返回空 comments（20 组全灭）——二进制资产对文本评审只有噪音。
-  if ocr review --from "$FROM" --to "$TO" --format json --output "$OUT_JSON" \
-       --concurrency "${OCR_REVIEW_CONCURRENCY:-2}" \
-       --exclude '**/*.png,**/*.ico,**/*.icns,**/*.jpg,**/*.jpeg,**/*.gif,**/*.pdf' \
-       --provider "$provider" --model "$model" >"${ATTEMPT_LOG:-/dev/null}" 2>&1 && valid_output; then
+  echo "  尝试 provider=$provider model=$model （上限 ${HOP_LIMIT}s）…"
+  HOP_RC=0
+  run_with_deadline "$HOP_LIMIT" ocr review --from "$FROM" --to "$TO" --format json --output "$OUT_JSON" \
+       ${OCR_EXTRA_ARGS[@]+"${OCR_EXTRA_ARGS[@]}"} \
+       --provider "$provider" --model "$model" >"${ATTEMPT_LOG:-/dev/null}" 2>&1 || HOP_RC=$?
+  if [ "$HOP_RC" -eq 0 ] && valid_output; then
     echo "  成功：$provider / $model"
     CHOSEN="$provider/$model"
+    record_use "$provider" "$model" ok
     [ -n "$ATTEMPT_LOG" ] && rm -f "$ATTEMPT_LOG"
     break
   fi
+  case "$HOP_RC" in
+    137|143) echo "  ⚠ 本跳到 ${HOP_LIMIT}s 上限被强制终止（退出码 ${HOP_RC}），降级到下一个" ;;
+    esac
   # 保留该次失败输出尾部，供全失败时排查（此前一律丢进 /dev/null）
   if [ -n "$ATTEMPT_LOG" ]; then
-    FAILURE_DIAG="${FAILURE_DIAG}--- ${provider}/${model} ---
+    FAILURE_DIAG="${FAILURE_DIAG}--- ${provider}/${model} (exit=${HOP_RC}, limit=${HOP_LIMIT}s) ---
 $(tail -5 "$ATTEMPT_LOG" 2>/dev/null)
 "
     rm -f "$ATTEMPT_LOG"
@@ -285,11 +398,12 @@ $(tail -5 "$ATTEMPT_LOG" 2>/dev/null)
 done
 
 if [ -z "$CHOSEN" ]; then
+  record_use "-" "-" fail
   if [ "$SKIPPED_ALL" = "1" ]; then
     echo "错误：所有 provider 都因与编码代理同模型被跳过（agent-model=${AGENT_MODEL}）。" >&2
     echo "      可临时指定：ocr review --provider <p> --model <m>" >&2
   else
-    echo "错误：三级 provider 全部失败，未产生有效评审结果。" >&2
+    echo "错误：${TOTAL_BUDGET}s 预算内没有一跳产出有效评审结果。" >&2
   fi
   if [ -n "$FAILURE_DIAG" ]; then
     echo "各 provider 输出尾部：" >&2
