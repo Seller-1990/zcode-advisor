@@ -1034,6 +1034,169 @@ test('inject.js：历史区头部键盘可达（role/aria-expanded + Enter 可�
 });
 
 
+// ---------------- 人工修改/确认意见注回（issue #9） ----------------
+//
+// 需求：角标面板每条意见旁提供「认同并转达 / 补充说明 / 驳回」，追加文字与原意见
+// 写进**同一个** pendingNotes 队列，下一轮 UserPromptSubmit 由 hook 送达；历史标注
+// 哪些条目被人工跟进过（闭环）。
+
+// 同时服务 /api/history 与 /api/note 的桩，并记录每次 POST 的载荷。
+function noteDom(items, noteReply) {
+  const calls = [];
+  const fetchStub = async (url, opt) => {
+    const u = String(url);
+    if (u.includes('/api/note')) {
+      let body = null;
+      try { body = JSON.parse((opt && opt.body) || '{}'); } catch (_) {}
+      calls.push({ url: u, method: (opt && opt.method) || 'GET', body, headers: (opt && opt.headers) || {} });
+      const reply = noteReply || { ok: true, queued: true, pending: 1, cap: 5 };
+      return { json: async () => reply };
+    }
+    if (u.includes('/api/history')) return { json: async () => ({ ok: true, history: items }) };
+    return { json: async () => ({ ok: false }) };
+  };
+  const dom = runInject({ fetch: fetchStub });
+  dom.noteCalls = calls;
+  return dom;
+}
+
+const ITEM = { ts: '2030-01-01T02:03:04.000Z', event: 'queued', severity: 'blocker', note: '这个分支没有覆盖 null 输入。' };
+
+test('issue #9：每条顾问意见旁提供三个动作按钮 + 补充说明输入框', async () => {
+  const dom = noteDom([ITEM]);
+  await openHistory(dom);
+  const ack = dom.byId.get('zca-hact-ack-0');
+  const note = dom.byId.get('zca-hact-note-0');
+  const dismiss = dom.byId.get('zca-hact-dismiss-0');
+  const input = dom.byId.get('zca-hinput-0');
+  assert.ok(ack && note && dismiss && input, '每条意见都应渲染认同/补充/驳回三个动作与输入框');
+  const box = dom.byId.get('zca-history-body');
+  assert.match(box.innerHTML, /认同并转达/, '应有「认同并转达」');
+  assert.match(box.innerHTML, /补充说明/, '应有「补充说明」');
+  assert.match(box.innerHTML, /驳回/, '应有「驳回」');
+  // 输入框而非 window.prompt：Electron 渲染进程不实现 window.prompt
+  assert.strictEqual(String(input.tagName).toUpperCase(), 'INPUT', '补充说明必须是面板内输入框');
+  assert.match(box.innerHTML, /type="text"/, '输入框应为文本输入');
+  // 可访问性：三个按钮都要有 aria-label（否则读屏只有"按钮"）
+  for (const el of [ack, note, dismiss]) assert.ok(el.getAttribute('aria-label'), '动作按钮应有 aria-label');
+});
+
+test('issue #9：点「认同并转达」POST /api/note，载荷带 action/severity/note，且如实告知"下一轮生效"', async () => {
+  const dom = noteDom([ITEM]);
+  await openHistory(dom);
+  dom.byId.get('zca-hact-ack-0')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(dom.noteCalls.length, 1, '应发出一次 /api/note');
+  const call = dom.noteCalls[0];
+  assert.strictEqual(call.method, 'POST');
+  assert.strictEqual(call.body.action, 'ack');
+  assert.strictEqual(call.body.severity, 'blocker', '必须回传原意见 severity（controller 据此组织注回文本）');
+  assert.strictEqual(call.body.note, ITEM.note, '必须回传原意见正文——controller 靠它与历史条目配对');
+  assert.strictEqual(call.headers['X-Advisor-Token'], 'test-token', 'POST 必须带令牌');
+  const msgEl = dom.byId.get('zca-msg');
+  assert.match(msgEl.textContent, /已入队/, '应提示已入队');
+  assert.match(msgEl.textContent, /下一轮/, '必须如实说"下一轮生效"——面板无送达能力，谎称已发送会让用户不再确认');
+  assert.match(msgEl.textContent, /1\/5/, '应显示队列占用（用户才知道还剩多少名额）');
+  assert.match(String(msgEl.className), /zca-ok/, '成功应是 ok 样式');
+});
+
+test('issue #9：点「驳回」传 action=dismiss；「补充说明」把输入框文字作为 text 一起传', async () => {
+  const dom = noteDom([ITEM]);
+  await openHistory(dom);
+  dom.byId.get('zca-hact-dismiss-0')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(dom.noteCalls[0].body.action, 'dismiss');
+  assert.strictEqual(dom.noteCalls[0].body.text, '', '驳回不需要补充文字');
+
+  dom.byId.get('zca-hinput-0').value = '  上游 API 字段名不能改  ';
+  dom.byId.get('zca-hact-note-0')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(dom.noteCalls.length, 2);
+  assert.strictEqual(dom.noteCalls[1].body.action, 'note');
+  assert.strictEqual(dom.noteCalls[1].body.text, '上游 API 字段名不能改', '输入文字应 trim 后作为 text 传回');
+});
+
+test('issue #9：「补充说明」空文字时本地就拦下（不发请求、给明确提示）', async () => {
+  const dom = noteDom([ITEM]);
+  await openHistory(dom);
+  dom.byId.get('zca-hinput-0').value = '   ';
+  dom.byId.get('zca-hact-note-0')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(dom.noteCalls.length, 0, '空补充说明不应发出请求——注回一条空话毫无价值');
+  const msgEl = dom.byId.get('zca-msg');
+  assert.match(msgEl.textContent, /需要先填写内容/);
+  assert.match(String(msgEl.className), /zca-bad/);
+});
+
+test('issue #9：controller 拒绝（队列满）时面板原样显示可操作提示，不假装成功', async () => {
+  const dom = noteDom([ITEM], { ok: false, error: 'queue_overflow', hint: '顺延队列已满（5/5 条待送达）——下一轮对话送达后即可再提交' });
+  await openHistory(dom);
+  dom.byId.get('zca-hact-ack-0')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  const msgEl = dom.byId.get('zca-msg');
+  assert.match(msgEl.textContent, /顺延队列已满/, '必须把 controller 的 hint 透传给用户（否则用户不知道怎么办）');
+  assert.match(String(msgEl.className), /zca-bad/, '失败不得显示成成功样式');
+});
+
+test('issue #9：历史标注被人工跟进过的条目（闭环），且 user_followup 条目自身不再提供动作', async () => {
+  const items = [
+    ITEM,
+    { ts: '2030-01-01T02:05:00.000Z', event: 'user_followup', severity: 'blocker', note: ITEM.note, action: 'ack', text: '' }
+  ];
+  const dom = noteDom(items);
+  await openHistory(dom);
+  const box = dom.byId.get('zca-history-body');
+  assert.match(box.innerHTML, /已跟进/, '被跟进过的条目必须标出来（issue #9 第 3 点）');
+  assert.match(box.innerHTML, /已跟进·认同并转达/, '标记应含动作名');
+  // 用户自己的跟进事件用 ev-user 着色，与机器事件区分
+  assert.match(box.innerHTML, /zca-history-item ev-user/, 'user_followup 条目应用 ev-user 类');
+  // 对刚提交的跟进再跟进没有意义 → 该条目不应渲染动作行
+  assert.ok(!dom.byId.get('zca-hact-ack-1'), 'user_followup 条目不应有动作按钮');
+  assert.ok(dom.byId.get('zca-hact-ack-0'), '普通顾问意见条目应有动作按钮');
+});
+
+test('issue #9：无 severity 或无语义的条目（如 delivered 计数行）不提供动作', async () => {
+  const dom = noteDom([
+    { ts: '2030-01-01T02:03:04.000Z', event: 'delivered', count: 2 },
+    { ts: '2030-01-01T02:03:05.000Z', event: 'queued', severity: 'nit' }   // 有 severity 但无正文
+  ]);
+  await openHistory(dom);
+  assert.ok(!dom.byId.get('zca-hact-ack-0'), 'delivered 计数行没有可跟进的意见');
+  assert.ok(!dom.byId.get('zca-hact-ack-1'), '没有正文的条目无法建立关联，不应提供动作');
+});
+
+test('issue #9：重复渲染不重复绑定（data-zca-wired 守卫），一次点击只提交一次', async () => {
+  const dom = noteDom([ITEM]);
+  await openHistory(dom);
+  const btn = dom.byId.get('zca-hact-ack-0');
+  assert.strictEqual((btn._listeners.click || []).length, 1, '首次渲染绑定一次');
+  // 真实的重渲染路径：提交成功后面板会 fetchHistory() 重读历史（刷新跟进标记与队列占用）。
+  // DOM 桩复用同 id 节点（真实浏览器里 innerHTML 重建会带来新节点，必然重绑），
+  // 正是守卫要挡的那条路径——没有守卫就会绑出第二个处理器，之后一次点击提交两次。
+  btn._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(dom.noteCalls.length, 1, '首次点击提交一次');
+  assert.strictEqual((dom.byId.get('zca-hact-ack-0')._listeners.click || []).length, 1,
+    '重渲染后不得重复绑定：否则一次点击会提交多次（重复注回同一条意见）');
+  // 再点一次：仍然只发一个请求（总数 2，而不是 3）
+  dom.byId.get('zca-hact-ack-0')._listeners.click[0]();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.strictEqual(dom.noteCalls.length, 2, '第二次点击也只应提交一次');
+});
+
+test('issue #9：面板容器用内联固定标记（不把意见正文当 HTML 注入）', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'tools', 'companion', 'inject.js'), 'utf8');
+  // 正文一律 textContent 填充；动作行是固定字面量，不含用户/模型内容
+  assert.match(src, /nodes\[i\]\.textContent\s*=\s*full\.slice/, '意见正文必须走 textContent');
+  assert.match(src, /USER_ACTION_LABELS\.ack/, '动作文案取自常量表，不拼用户输入');
+  // 面板完整版（controller 的 /panel）同样要提供这三个动作
+  const panel = fs.readFileSync(path.join(__dirname, '..', 'tools', 'companion', 'panel.cjs'), 'utf8');
+  for (const label of ['认同并转达', '补充说明', '驳回']) {
+    assert.ok(panel.includes(label), `panel.cjs 应同样提供「${label}」（两处入口功能一致）`);
+  }
+  assert.match(panel, /\/api\/note/, 'panel.cjs 应提交到同一 /api/note');
+});
+
 test('panel 契约：程序化赋值 select.value 不触发 change（故无需"回填"标志位）', () => {
   // 规范与实证：按 DOM 规范，**程序化**赋值 select.value 不派发 change 事件
   //（jsdom 实测：赋值 0 次、dispatchEvent 1 次）——所以 panel.cjs 的 change 处理器

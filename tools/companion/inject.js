@@ -131,6 +131,20 @@
 .zca-history-item.ev-delivered .h-sev{color:#6ee7b7}
 .zca-history-item.ev-queued .h-sev{color:#93c5fd}
 .zca-history-item[class*="ev-dropped"] .h-sev{color:#fca5a5}
+/* 人工跟进（issue #9）：用户自己的动作事件用紫色，与机器事件（绿/蓝/红）一眼可分 */
+.zca-history-item.ev-user .h-sev{color:#c4b5fd}
+/* 「已被人工跟进」标记：贴在原意见那一条上（读侧关联 user_followup 事件得出） */
+.zca-hmark{display:inline-block;padding:0 6px;border-radius:999px;font-size:10px;
+ border:1px solid rgba(139,92,246,.55);color:#c4b5fd;vertical-align:middle}
+.zca-hmark:empty{display:none}
+/* 每意见的人工动作行：认同并转达 / 补充说明 / 驳回 */
+.zca-hact{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:6px}
+.zca-hbtn{font-size:11px;line-height:1.6;padding:1px 8px;border-radius:6px;
+ border:1px solid #3b4150;background:#2b303b;color:#c8cdd6;cursor:pointer}
+.zca-hbtn:hover{border-color:#4b5563;color:#e6e8ec}
+.zca-hbtn[disabled]{opacity:.5;cursor:default}
+.zca-hinput{flex:1 1 110px;min-width:0;font-size:11px;padding:1px 6px;border-radius:6px;
+ border:1px solid #3b4150;background:#1f232b;color:#e6e8ec}
 .zca-history-empty{color:#6b7280;font-size:12px;padding:4px 0}
 .zca-hint{color:#6b7280;font-size:11px;margin-top:8px}
 /* 健康图例：状态含义常驻可见，不让用户靠 hover 才知道灯的意思 */
@@ -227,13 +241,38 @@
   }
 
   // 顾问意见历史：读 controller 的 /api/history（JSONL 追加日志，新的在前）。
-  // 数据侧写入点在 hooks/lib/history（入队/丢弃/送达三个事件），此处只读。
+  // 数据侧写入点在 hooks/lib/history（入队/丢弃/送达三个事件）+ controller 的
+  // /api/note（人工跟进 user_followup，issue #9），此处只读。
+  //
+  // 人工动作按钮的三种语义文案（issue #9）。写成常量：语气差异是设计决定
+  // （ack 鼓励照办 / dismiss 明确叫停 / note 只是补充），不该散落在拼串里；
+  // 与 controller 侧 USER_ACTIONS 的 label 保持一致。
+  const USER_ACTION_LABELS = { ack: '认同并转达', note: '补充说明', dismiss: '驳回' };
+
+  // 最近一次渲染的条目：动作按钮的处理器按**索引**回查（索引由按钮 id 末位给出），
+  // 而不是把条目对象闭包进处理器。这样重新渲染后，即便桩/浏览器复用同一节点，
+  // 处理器取到的也是当前列表里的那一条，不会提交上一次渲染的旧意见。
+  let historyItems = [];
+
+  // 「已被人工跟进」判定：user_followup 事件里存了原意见的 severity 与正文，据此与
+  // queued/delivered 条目配对。为什么用内容配对而不是 id：历史是 JSONL 追加日志，
+  // 入队事件与跟进事件由**两个进程**先后写入，没有可共享的自增 id；(severity, note)
+  // 是二者唯一共同持有的键。局限：只看最近 10 条窗口，跟进后原意见被挤出窗口就不再标注。
+  function followupOf(items, it) {
+    const sev = String(it.severity || '');
+    const note = String(it.note || '');
+    if (!sev || !note) return null;
+    return items.find((x) => x && x.event === 'user_followup'
+      && String(x.severity || '') === sev && String(x.note || '') === note) || null;
+  }
+
   async function fetchHistory() {
     const box = document.getElementById('zca-history-body');
     if (!box) return;
     try {
       const r = await api('/api/history');
       const items = (r && r.ok && Array.isArray(r.history)) ? r.history.slice(0, 10) : []; // 0.2.15 精简：只看最近 10 条
+      historyItems = items;
       if (items.length === 0) {
         box.innerHTML = '<div class="zca-history-empty">暂无记录——顾问意见产生后会出现在这里</div>';
         return;
@@ -244,13 +283,33 @@
       // 但既然走 innerHTML 拼接，就不该默认「来源一定干净」——注入链防线应一致。
       const escHtml = (v) => String(v).replace(/[&<>"']/g, (c) => (
         { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-      box.innerHTML = items.map((it) => {
+      box.innerHTML = items.map((it, i) => {
         const ts = escHtml(fmtTs(it.ts));
         const sev = escHtml(it.severity || it.event || '-');
-        const cls = it.event === 'delivered' ? 'ev-delivered' : (String(it.event).startsWith('dropped') ? 'ev-dropped' : 'ev-queued');
+        // 用户自己的动作事件用 ev-user（紫），与机器事件（绿/蓝/红）区分
+        const cls = it.event === 'user_followup' ? 'ev-user'
+          : (it.event === 'delivered' ? 'ev-delivered'
+            : (String(it.event).startsWith('dropped') ? 'ev-dropped' : 'ev-queued'));
+        // 动作行只挂在「顾问意见」条目上：必须同时有 severity 与正文，且不是用户自己的
+        // 跟进事件（对刚提交的跟进再跟进没有意义）。
+        const actionable = it.event !== 'user_followup' && Boolean(it.severity) && Boolean(it.note);
+        const fu = actionable ? followupOf(items, it) : null;
+        const mark = fu
+          ? `<span class="zca-hmark" title="已人工跟进">已跟进·${escHtml(USER_ACTION_LABELS[fu.action] || fu.action || '')}</span>`
+          : '';
+        // 按钮/输入框都带 id：既便于脚本按索引回查，也让 DOM 桩能建出可断言的节点。
+        // 输入框而非 window.prompt：Electron 渲染进程不实现 window.prompt（返回 null）。
+        const act = actionable
+          ? '<div class="zca-hact">'
+            + `<button type="button" class="zca-hbtn" id="zca-hact-ack-${i}" aria-label="认同并转达这条意见">${USER_ACTION_LABELS.ack}</button>`
+            + `<input type="text" class="zca-hinput" id="zca-hinput-${i}" aria-label="补充说明内容" placeholder="补充说明…">`
+            + `<button type="button" class="zca-hbtn" id="zca-hact-note-${i}" aria-label="连同补充说明一起转达">${USER_ACTION_LABELS.note}</button>`
+            + `<button type="button" class="zca-hbtn" id="zca-hact-dismiss-${i}" aria-label="驳回这条意见">${USER_ACTION_LABELS.dismiss}</button>`
+            + '</div>'
+          : '';
         return `<div class="zca-history-item ${cls}">`
-          + `<span class="h-ts">${ts}</span> <span class="h-sev">${sev}</span>`
-          + `<div class="h-note"></div></div>`;
+          + `<span class="h-ts">${ts}</span> <span class="h-sev">${sev}</span>${mark}`
+          + `<div class="h-note"></div>${act}</div>`;
       }).join('');
       // 用 textContent 填正文，避免把模型产出当作 HTML 注入（注入链防线的一部分）
       const nodes = box.querySelectorAll('.h-note');
@@ -262,8 +321,51 @@
           nodes[i].setAttribute('title', full.slice(0, 1000));
         }
       });
+      // 动作按钮绑定。data-zca-wired 守卫：浏览器里 innerHTML 重建会带来全新节点
+      // （守卫不生效、必然重绑），而 DOM 桩会复用同 id 节点——两条路径下都只绑一次。
+      const bind = (id, action) => {
+        const btn = document.getElementById(id);
+        if (!btn || btn.getAttribute('data-zca-wired') === '1') return;
+        btn.setAttribute('data-zca-wired', '1');
+        btn.addEventListener('click', () => {
+          // 索引从自身 id 末位解析，而不是闭包捕获——列表重排后仍指向当前那一条。
+          const m = /(\d+)$/.exec(String(btn.id || ''));
+          submitUserAction(m ? parseInt(m[1], 10) : -1, action);
+        });
+      };
+      items.forEach((it, i) => {
+        if (it.event === 'user_followup' || !it.severity || !it.note) return;
+        bind(`zca-hact-ack-${i}`, 'ack');
+        bind(`zca-hact-note-${i}`, 'note');
+        bind(`zca-hact-dismiss-${i}`, 'dismiss');
+      });
     } catch (e) {
       box.innerHTML = `<div class="zca-history-empty">读取失败：${String(e).slice(0, 80)}</div>`;
+    }
+  }
+
+  // 提交人工动作（issue #9）：三种动作写的是**同一个** pendingNotes 队列，区别只在注回文案。
+  // 必须如实告知「下一轮生效」——面板没有送达能力，送达发生在 hook 的 UserPromptSubmit 边界；
+  // 谎称"已发送"会让用户以为主模型已经看到，从而不再确认。
+  async function submitUserAction(idx, action) {
+    const it = historyItems[idx];
+    if (!it) { msg('这条意见已不在列表中，请重新展开历史', false); return; }
+    const inp = document.getElementById('zca-hinput-' + idx);
+    const text = inp ? String(inp.value || '').trim() : '';
+    if (action === 'note' && !text) { msg('「补充说明」需要先填写内容', false); return; }
+    const label = USER_ACTION_LABELS[action] || action;
+    try {
+      const r = await api('/api/note', {
+        action, severity: String(it.severity || ''), note: String(it.note || ''), text
+      });
+      if (r && r.ok) {
+        msg(`${label}已入队（${r.pending}/${r.cap}）——下一轮对话开始时随顾问意见一起送达`, true);
+        fetchHistory();   // 重新读历史：跟进标记与队列占用立刻可见
+      } else {
+        msg('提交失败：' + ((r && (r.hint || r.error)) || '未知'), false);
+      }
+    } catch (e) {
+      msg('提交失败：' + (e && e.message ? e.message : e), false);
     }
   }
 

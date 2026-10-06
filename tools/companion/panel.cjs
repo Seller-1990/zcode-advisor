@@ -52,6 +52,17 @@ details summary:hover{color:#e6e8ec}
 .hitem.ev-delivered .sev{color:#6ee7b7}
 .hitem.ev-queued .sev{color:#93c5fd}
 .hitem[class*="ev-dropped"] .sev{color:#fca5a5}
+/* 人工跟进（issue #9）：用户自己的动作事件用紫色，与机器事件（绿/蓝/红）一眼可分 */
+.hitem.ev-user .sev{color:#c4b5fd}
+.hmark{display:inline-block;padding:0 6px;border-radius:999px;font-size:10px;
+ border:1px solid rgba(139,92,246,.55);color:#c4b5fd;vertical-align:middle}
+.hmark:empty{display:none}
+.hact{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:6px}
+.hbtn{font-size:11px;line-height:1.6;padding:1px 8px;border-radius:6px;
+ border:1px solid #3b4150;background:#2b303b;color:#c8cdd6;cursor:pointer}
+.hbtn:hover{border-color:#4b5563;color:#e6e8ec}
+.hinput{flex:1 1 110px;min-width:0;font-size:11px;padding:1px 6px;border-radius:6px;
+ border:1px solid #3b4150;background:#1f232b;color:#e6e8ec}
 </style></head><body><div class="wrap">
 <h3><span>ZCode Advisor · 完整配置</span></h3>
 <div class="status" id="st">读取中…</div>
@@ -234,20 +245,95 @@ details summary:hover{color:#e6e8ec}
     } catch (e) { msg('Ping 失败：' + (e && e.message || e), false); }
   }
 
+  // 人工动作三种语义（issue #9）：与角标面板、controller 侧 USER_ACTIONS 的 label 一致。
+  const USER_ACTION_LABELS = { ack: '认同并转达', note: '补充说明', dismiss: '驳回' };
+  // 最近渲染的条目：按钮处理器按索引回查（索引由按钮 id 末位给出），不用闭包捕获——
+  // 重新渲染后处理器取到的始终是当前列表里的那一条。
+  let histItems = [];
+
+  // 「已被人工跟进」判定：user_followup 事件与原意见的 (severity, note) 配对。
+  // 历史是 JSONL 追加日志、由两个进程先后写入，没有可共享的自增 id，内容键是唯一共有的关联。
+  function followupOf(items, it) {
+    const sev = String(it.severity || '');
+    const note = String(it.note || '');
+    if (!sev || !note) return null;
+    return items.find(x => x && x.event === 'user_followup'
+      && String(x.severity || '') === sev && String(x.note || '') === note) || null;
+  }
+
   async function loadHistory() {
     try {
       const r = await api('/api/history');
       const items = (r && r.ok && Array.isArray(r.history)) ? r.history : [];
+      histItems = items;
       const box = $('hist');
       if (!items.length) { box.innerHTML = '<div class="hitem">暂无记录</div>'; return; }
-      box.innerHTML = items.slice(0, 12).map(it => {
+      box.innerHTML = items.slice(0, 12).map((it, i) => {
         const ts = esc(String(it.ts || '').replace('T', ' ').slice(5, 16));
         const sev = esc(it.severity || it.event || '-');
-        const cls = it.event === 'delivered' ? 'ev-delivered' : (String(it.event).startsWith('dropped') ? 'ev-dropped' : 'ev-queued');
-        return '<div class="hitem ' + cls + '"><span class="ts">' + ts + '</span><span class="sev">' + sev + '</span>'
-          + '<div>' + esc(String(it.note || it.event || '').slice(0, 200)) + '</div></div>';
+        // 用户自己的动作事件用 ev-user（紫），与机器事件（绿/蓝/红）区分
+        const cls = it.event === 'user_followup' ? 'ev-user'
+          : (it.event === 'delivered' ? 'ev-delivered'
+            : (String(it.event).startsWith('dropped') ? 'ev-dropped' : 'ev-queued'));
+        // 动作行只挂在「顾问意见」条目上：需同时有 severity 与正文，且不是用户自己的跟进事件。
+        const actionable = it.event !== 'user_followup' && Boolean(it.severity) && Boolean(it.note);
+        const fu = actionable ? followupOf(items, it) : null;
+        const mark = fu
+          ? '<span class="hmark" title="已人工跟进">已跟进·' + esc(USER_ACTION_LABELS[fu.action] || fu.action || '') + '</span>'
+          : '';
+        // 输入框而非 window.prompt：Electron 渲染进程不实现 window.prompt（返回 null）。
+        const act = actionable
+          ? '<div class="hact">'
+            + '<button type="button" class="hbtn" id="hact-ack-' + i + '" aria-label="认同并转达这条意见">' + USER_ACTION_LABELS.ack + '</button>'
+            + '<input type="text" class="hinput" id="hinput-' + i + '" aria-label="补充说明内容" placeholder="补充说明…">'
+            + '<button type="button" class="hbtn" id="hact-note-' + i + '" aria-label="连同补充说明一起转达">' + USER_ACTION_LABELS.note + '</button>'
+            + '<button type="button" class="hbtn" id="hact-dismiss-' + i + '" aria-label="驳回这条意见">' + USER_ACTION_LABELS.dismiss + '</button>'
+            + '</div>'
+          : '';
+        return '<div class="hitem ' + cls + '"><span class="ts">' + ts + '</span><span class="sev">' + sev + '</span>' + mark
+          + '<div>' + esc(String(it.note || it.event || '').slice(0, 200)) + '</div>' + act + '</div>';
       }).join('');
+      items.slice(0, 12).forEach((it, i) => {
+        if (it.event === 'user_followup' || !it.severity || !it.note) return;
+        bindAction('hact-ack-' + i, 'ack');
+        bindAction('hact-note-' + i, 'note');
+        bindAction('hact-dismiss-' + i, 'dismiss');
+      });
     } catch (e) { $('hist').innerHTML = '<div class="hitem">读取失败</div>'; }
+  }
+
+  // 动作按钮绑定（幂等：重复渲染同一 id 不重复绑）
+  function bindAction(id, action) {
+    const btn = $(id);
+    if (!btn || btn.getAttribute('data-zca-wired') === '1') return;
+    btn.setAttribute('data-zca-wired', '1');
+    btn.addEventListener('click', () => {
+      // 索引从自身 id 末位解析，而非闭包捕获——列表重排后仍指向当前那一条。
+      const m = /(\d+)$/.exec(String(btn.id || ''));
+      submitUserAction(m ? parseInt(m[1], 10) : -1, action);
+    });
+  }
+
+  // 提交人工动作（issue #9）：三种动作写的是**同一个** pendingNotes 队列，区别只在注回文案。
+  // 必须如实告知「下一轮生效」——本面板没有送达能力，送达发生在 hook 的 UserPromptSubmit 边界。
+  async function submitUserAction(idx, action) {
+    const it = histItems[idx];
+    if (!it) { msg('这条意见已不在列表中，请重新展开历史', false); return; }
+    const inp = $('hinput-' + idx);
+    const text = inp ? String(inp.value || '').trim() : '';
+    if (action === 'note' && !text) { msg('「补充说明」需要先填写内容', false); return; }
+    const label = USER_ACTION_LABELS[action] || action;
+    try {
+      const r = await api('/api/note', {
+        action, severity: String(it.severity || ''), note: String(it.note || ''), text
+      });
+      if (r && r.ok) {
+        msg(label + '已入队（' + r.pending + '/' + r.cap + '）——下一轮对话开始时随顾问意见一起送达', true);
+        loadHistory();   // 重新读历史：跟进标记与队列占用立刻可见
+      } else {
+        msg('提交失败：' + ((r && (r.hint || r.error)) || '未知'), false);
+      }
+    } catch (e) { msg('提交失败：' + (e && e.message || e), false); }
   }
 
   $('zprovider').addEventListener('change', () => { clearManualIfPicked(); fillModels(); });

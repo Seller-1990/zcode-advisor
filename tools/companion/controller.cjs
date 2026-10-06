@@ -50,6 +50,33 @@ function readHistory(limit) {
   }
 }
 
+// —— 顾问意见历史**写入**（issue #9：人工跟进事件）——
+// 为什么不复用 hooks/lib/history.appendHistory：同 readHistory 的理由（发行包不含 hooks/）。
+// 事件格式必须与 hooks 侧逐字一致——两侧读写**同一个** JSONL 文件，格式漂移会让
+// 面板读不懂 hooks 写的行（反之亦然）。
+const HISTORY_MAX_LINES = 500;   // 必须与 hooks/lib/history.js 的 HISTORY_MAX_LINES 一致
+
+function appendHistoryRecord(event) {
+  try {
+    const record = Object.assign({ ts: new Date().toISOString() }, event);
+    // 目录 0o700 / 文件 0o600：历史含意见正文，仅属主可读（同 hooks 侧纪律）。
+    fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(HISTORY_FILE, JSON.stringify(record) + '\n', { encoding: 'utf8', mode: 0o600 });
+    try { fs.chmodSync(HISTORY_FILE, 0o600); } catch (_) {}
+    // 裁剪：hooks 侧是高频写入方（每轮 append 都会触发），但「用户关掉 hook 只留面板」
+    // 时本函数就是唯一写入方——不裁剪会让文件无上限增长。故两侧各自裁剪，上限同源。
+    try {
+      const lines = fs.readFileSync(HISTORY_FILE, 'utf8').split('\n').filter(Boolean);
+      if (lines.length > HISTORY_MAX_LINES) {
+        fs.writeFileSync(HISTORY_FILE, lines.slice(-Math.floor(HISTORY_MAX_LINES / 2)).join('\n') + '\n', 'utf8');
+      }
+    } catch (_) { /* 裁剪失败下次再试 */ }
+    return true;
+  } catch (_) {
+    return false;   // 磁盘满/权限等：历史缺失可接受，绝不影响主流程
+  }
+}
+
 // —— 健康信标读取（M1）——
 // 同样内联（发行包不含 hooks/，无法 require hooks/lib/health.js）。
 // 路径解析与 hooks/lib/health.js 的 resolveHealthDir 必须一致（含 STATE_DIR 隔离），
@@ -137,6 +164,32 @@ const CDP_PORT_RANGE = [9333, 9350];
 const API_PORT_RANGE = [9420, 9429];
 const CDP_LAUNCH_TIMEOUT_MS = 25000;
 const POLL_INTERVAL_MS = 3000;
+
+// —— issue #7：CDP 调试模式的风控告知（启动期，一次性）——
+//
+// 现象（issue #7 报告）：由本启动器以 `--remote-debugging-port` 拉起的 ZCode 实例里，
+// 发送前的风控验证会**持续失败**（阿里云验证码 F008，报告者 7/7 次失败）；同一账号
+// 直接双击 ZCode 启动则正常。指向「调试端口/调试器附着」被风控判为自动化特征。
+//
+// 为什么不宣称"已修复"：本机（macOS）无法复现该因果——本机日志里 22 条 F008 全部
+// 早于本外挂安装（09-28 vs 10-05），且 10-06 装了外挂跑调试实例时 6 次 send_preflight
+// 零失败。没有可复现链路就声称修好，等于让用户在再次失败时失去唯一的排查线索。
+//
+// 因此采纳 issue 里给出的第二个期望行为：**启动阶段就把风险讲清楚**。
+// 用户遇到 F008 时的正确第一反应是「换非调试实例重试」，而不是反复重试发送。
+// 文案做成常量（而非内联字符串）：测试可直接断言内容，不必去抓日志。
+const CDP_RISK_NOTICE = [
+  '⚠ 本实例以 CDP 调试模式启动：调试端口/调试器附着可能被宿主风控视为自动化特征。',
+  '⚠ 已知现象：部分账号在调试实例里「发送前验证」会持续失败（阿里云验证码 F008），'
+    + '而直接双击 ZCode 启动的实例正常。',
+  '⚠ 若你遇到发送前验证反复失败：完全退出本实例后**直接双击 ZCode 启动**'
+    + '（此时角标不可用，但对话发送不受影响）。'
+];
+
+// 启动期打印风控告知。只讲事实与可操作动作，不承诺"已修复"。
+function warnCdpRisk() {
+  for (const line of CDP_RISK_NOTICE) log(line);
+}
 
 // 受监督模式（launchd 自启动注入 ZCODE_ADVISOR_SUPERVISED=1）。
 // plist 用 KeepAlive{SuccessfulExit:false}：**只有非零退出才会被重启**。
@@ -405,7 +458,14 @@ function attachTarget(target) {
   ws.addEventListener('open', () => {
     log(`已附着页面 ${target.title || target.url || target.id}`);
     try {
-      ws.send(JSON.stringify({ id: 1, method: 'Runtime.enable' }));
+      // 刻意**不开 Runtime 域**（issue #7）：本外挂只需要两个能力——
+      //   Runtime.evaluate（注入脚本，injectInto）与 Page.addScriptToEvaluateOnNewDocument
+      //   （持久注入，addPersistentScript）。
+      // Runtime.enable 会让 renderer 持续向本连接推送 Runtime.consoleAPICalled /
+      // exceptionThrown 等事件，而本进程**一个都不消费**（只消费 Page.loadEventFired）：
+      // 纯粹增大「调试器已附着」的暴露面，却不带来任何功能。
+      // 风控（阿里云验证码）的反自动化检测正是以「调试器附着/调试端口」为高风险信号，
+      // 少开一个域就少一分特征——即使这不是 F008 的充分条件，也没有理由留着它。
       ws.send(JSON.stringify({ id: 2, method: 'Page.enable' }));
       // 当前文档立即注入（不依赖 Page 域，Runtime.evaluate 即可）
       injectInto(ws);
@@ -1115,6 +1175,205 @@ function setSessionTarget(provider, model) {
   }
 }
 
+// —— issue #9：人工修改/确认意见注回会话 ——
+//
+// 目标：角标面板里对每条顾问意见可以「认同并转达 / 补充说明 / 驳回」，用户的话连同
+// 原意见一起**注回会话**，让主模型知道人的判断。
+//
+// 为什么复用 pendingNotes 而不是新开一条注入通道：pendingNotes 是既有且**唯一**的
+// 送达通道——hooks/advisor-hook.js 在下一个 UserPromptSubmit 边界把队列原样拼进
+// additionalContext 并清空。任何写进该队列的字符串都会在下一轮原样送达，无需改动
+// hook、无需新通道、天然 advisory-only（不进任何门禁判定）。
+//
+// 前缀用 [advisor:user:*] 而非 [advisor:<severity>]：
+//   - hooks/lib/transcript.js 的 ADVISOR_PREFIXES 已含 '[advisor:'，故渲染时会同样
+//     跳过这段文本，不会污染用户看到的对话正文；
+//   - 与机器产出的 [advisor:nit|concern|blocker] 区分开，面板/日志一眼能看出这条是
+//     「人的意见」而不是「模型的意见」。
+//
+// 容量与截断必须与 hook 侧**同源**（S1.K1）：同一个 pendingNotes 数组、同一个
+// pendingNotesCap、同一个 maxNoteChars。因此这里的取值顺序与 hooks/lib/config.js
+// 一致：内置默认(5/768) <- 用户配置 advisor.config.json <- 环境变量。
+// 若两侧取值漂移，面板认为"还能再放 3 条"而 hook 认为已满，用户会看到消息发出去了
+// 但下一轮什么都没注回。
+const QUEUE_CAP_DEFAULT = 5;        // 同 hooks/lib/config.js 的 pendingNotesCap
+const MAX_NOTE_CHARS_DEFAULT = 768; // 同 hooks/lib/config.js 的 maxNoteChars
+
+// 与 hooks/lib/config.js 的 toInt 同构：parseInt 后非有限数才回退。
+function toIntOr(value, fallback) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+// 与 hooks/lib/config.js 的 POSITIVE_INT_KEYS 守卫同构：非有限数或 <= 0 回退。
+function positiveIntOr(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+// 队列上限解析，**逐字复刻** hooks/lib/config.js 的取值算法（见该文件的 applyLayer /
+// toInt / POSITIVE_INT_KEYS 守卫）。三步顺序不能改：
+//   ① 层值**原样采纳**——hook 的 applyLayer 不做 parseInt，故字符串 "3" 会被第 ③ 步
+//      判为非有限数而回退默认，这里也必须一样（早先版本在此 parseInt，导致两侧漂移）；
+//   ② env 层走 toInt：parseInt 成功才覆盖，否则**保持当前层值**；
+//   ③ 最后统一过正整数守卫：非有限或 <= 0 一律回退**内置默认**，而不是回退下一层值。
+// 第 ③ 步是关键：把 pendingNotesCap 配成 0 时 hook 用 5（默认）而不是用户配置里的 3。
+// 早先版本按层回退（0 → 用户层 3），实测与 hook 分歧 → 面板认为"还能再放 2 条"而
+// hook 认为已满。测试 test/user-note.test.js 的 S1.K1 行为守卫逐层比对两侧真实取值。
+function queueLimits() {
+  const c = readUserConfig();
+  let cap = c.pendingNotesCap;
+  let maxChars = c.maxNoteChars;
+  if (process.env.ZCODE_ADVISOR_PENDING_NOTES_CAP != null) {
+    cap = toIntOr(process.env.ZCODE_ADVISOR_PENDING_NOTES_CAP, cap);
+  }
+  if (process.env.ZCODE_ADVISOR_MAX_NOTE_CHARS != null) {
+    maxChars = toIntOr(process.env.ZCODE_ADVISOR_MAX_NOTE_CHARS, maxChars);
+  }
+  cap = positiveIntOr(cap, QUEUE_CAP_DEFAULT);
+  maxChars = positiveIntOr(maxChars, MAX_NOTE_CHARS_DEFAULT);
+  return { cap, maxChars };
+}
+
+// 按**码点**截断（Array.from 而非 String.slice）：后者按 UTF-16 码元切，会把代理对
+// 劈成两半——emoji 与部分汉字（扩展 B 区）会变成乱码。与 hooks/lib/reviewer.js 的
+// normalizeFrame 同一规则（那处截的是模型产出，这里截用户输入，必须同样安全）。
+function truncateByCodepoint(s, max) {
+  const str = String(s == null ? '' : s);
+  const chars = Array.from(str);
+  if (chars.length <= max) return str;
+  return chars.slice(0, max).join('') + '…';
+}
+
+// 三种人工动作的语义文案。写成常量：测试直接断言，且三种动作的语气差异是设计决定
+// （ack 鼓励照办、dismiss 明确叫停、note 只是补充信息），不该散落在拼串里。
+const USER_ACTIONS = {
+  ack: { label: '认同并转达', lead: '用户已确认并转达以下顾问意见，请据此调整（advisory-only，不强制）。' },
+  note: { label: '补充说明', lead: '用户对以下顾问意见作了补充说明，请连同补充内容一并考虑。' },
+  dismiss: { label: '驳回', lead: '用户**驳回**了以下顾问意见，请勿据此改动代码。' }
+};
+
+// 把「用户动作 + 原意见 + 用户补充」拼成一条注回文本，再按 maxNoteChars 码点截断。
+// 原意见带上 severity：主模型需要知道这是 blocker 还是 nit 才能判断权重。
+function composeUserNote(action, severity, originalNote, text, maxChars) {
+  const meta = USER_ACTIONS[action];
+  const parts = [
+    `[advisor:user:${action}] ${meta.lead}`,
+    `原意见（${severity || 'unknown'}）：${originalNote}`
+  ];
+  if (text) parts.push(`用户补充：${text}`);
+  return truncateByCodepoint(parts.join('\n'), maxChars);
+}
+
+// 写入最近活动会话的顺延队列。与 toggleSessionEnabled / setSessionTarget 同款
+// <file>.wrlock 锁协议互斥（hooks 侧 mutateStateExclusive 用同一把锁）——
+// 不互斥的话「用户点面板」与「hook 正在入队」会各自读-改-写整个状态文件，
+// 后写者把前者的 pendingNotes 整个覆盖掉（丢消息，且无任何报错）。
+function enqueueUserNote(payload) {
+  const p = payload && typeof payload === 'object' ? payload : {};
+  const action = String(p.action || '').trim();
+  if (!USER_ACTIONS[action]) {
+    return { ok: false, error: 'bad_action', hint: 'action 必须是 ack / note / dismiss 之一' };
+  }
+  const severity = String(p.severity || '').trim().slice(0, 40);
+  const originalNote = String(p.note || '').trim();
+  if (!originalNote) {
+    return { ok: false, error: 'bad_note', hint: '缺少原意见正文，无法建立关联（请刷新历史后重试）' };
+  }
+  const text = String(p.text || '').trim();
+  // 「补充说明」的全部价值就是那段文字；空着提交等于注回一条空话，直接拒绝并说明。
+  if (action === 'note' && !text) {
+    return { ok: false, error: 'text_required', hint: '「补充说明」需要先填写内容' };
+  }
+
+  const b = locateLatestSessionBeacon();
+  if (!b) {
+    return { ok: false, error: 'no_session', hint: '没有可操作的会话——先在 ZCode 里打开一个会话并让它跑起来（信标尚不存在）' };
+  }
+  const stateFile = path.join(String(b.stateDir), `sess-${sanitizeSessionIdForState(b.sessionId)}.json`);
+  const lock = `${stateFile}.wrlock`;
+  const myPid = String(process.pid);
+  let got = false;
+  for (let i = 0; i < 40 && !got; i++) {
+    try {
+      fs.writeFileSync(lock, myPid, { flag: 'wx' });
+      got = true;
+    } catch (_) {
+      try {
+        const st = fs.statSync(lock);
+        if (Date.now() - st.mtimeMs > 10000) { try { fs.unlinkSync(lock); } catch (_) {} }
+      } catch (_) {}
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); } catch (_) {}
+    }
+  }
+  if (!got) return { ok: false, error: 'lock_timeout', hint: '会话状态正被审查进程写入，请稍后重试' };
+  const ownLock = () => { try { return fs.readFileSync(lock, 'utf8').trim() === myPid; } catch (_) { return false; } };
+  try {
+    if (!ownLock()) return { ok: false, error: 'lock_timeout', hint: '会话状态正被审查进程写入，请稍后重试' };
+    let st;
+    try {
+      st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    } catch (_) {
+      return { ok: false, error: 'state_unreadable', hint: '会话状态文件不可读（可能尚未生成）：' + stateFile };
+    }
+    if (!st || typeof st !== 'object') {
+      return { ok: false, error: 'state_unreadable', hint: '会话状态文件内容异常：' + stateFile };
+    }
+    stripLegacySecrets(st);
+    const { cap, maxChars } = queueLimits();
+    const queue = Array.isArray(st.pendingNotes) ? st.pendingNotes : [];
+    // 容量判定与 hooks/lib/route.js 的 enqueueNote 逐字同构（同一 cap、同一语义）。
+    // 满了就明确拒绝而不是静默丢弃：用户刚打完一段补充说明，必须知道它没送出去。
+    if (queue.length >= cap) {
+      // 计数器与 hook 侧同形（dropped[reason] / droppedAt[reason]），否则面板的
+      // 丢弃统计会漏掉"面板侧溢出"这一类。queue_overflow 不在 failStreak 白名单里，
+      // 故不动 failStreak——它表示"队列满"，不是"审查失败"。
+      st.dropped = st.dropped || {};
+      st.dropped.queue_overflow = (st.dropped.queue_overflow || 0) + 1;
+      st.droppedAt = st.droppedAt || {};
+      st.droppedAt.queue_overflow = new Date().toISOString();
+      const tmp0 = `${stateFile}.tmp-${process.pid}`;
+      try {
+        fs.writeFileSync(tmp0, JSON.stringify(st, null, 2), { encoding: 'utf8', mode: 0o600 });
+        fs.renameSync(tmp0, stateFile);
+      } catch (_) { try { fs.unlinkSync(tmp0); } catch (_) {} }
+      appendHistoryRecord({
+        event: 'dropped:queue_overflow', severity, note: text || originalNote,
+        sessionId: st.sessionId || String(b.sessionId || ''), mode: 'panel', action
+      });
+      return {
+        ok: false, error: 'queue_overflow',
+        hint: `顺延队列已满（${queue.length}/${cap} 条待送达）——下一轮对话送达后即可再提交`,
+        pending: queue.length, cap
+      };
+    }
+    const composed = composeUserNote(action, severity, originalNote, text, maxChars);
+    queue.push(composed);
+    st.pendingNotes = queue;
+    const tmp = `${stateFile}.tmp-${process.pid}`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(st, null, 2), { encoding: 'utf8', mode: 0o600 });
+      fs.renameSync(tmp, stateFile);
+    } catch (err) {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+      return { ok: false, error: 'state_write_failed', hint: String(err && err.message || err).slice(0, 120) };
+    }
+    // 历史标注（issue #9 第 3 点）：记一条 user_followup，note/severity 与原 queued 事件
+    // 对齐，面板据此把「这条意见被人工跟进过」标出来。写历史失败不影响已入队的事实。
+    appendHistoryRecord({
+      event: 'user_followup', severity, action,
+      note: originalNote, text,
+      sessionId: st.sessionId || String(b.sessionId || ''), mode: 'panel'
+    });
+    return {
+      ok: true, queued: true, action, severity,
+      pending: queue.length, cap,
+      sessionId: String(b.sessionId || '')
+    };
+  } finally {
+    try { if (fs.readFileSync(lock, 'utf8').trim() === myPid) fs.unlinkSync(lock); } catch (_) {}
+  }
+}
+
 // —— 本机 API ——
 // CORS 放行任意来源：真正的访问控制是共享令牌（X-Advisor-Token，只存在于注入脚本
 // 与 controller 内存中）。这样无论 ZCode 页面用 file:// 还是自定义协议都能访问面板 API。
@@ -1347,6 +1606,13 @@ function startApi(cdpPort, apiPort, token) {
         const body = await readBody();
         return done(200, setSessionTarget(body && body.provider, body && body.model));
       }
+      // 人工修改/确认意见注回会话（issue #9）：action = ack | note | dismiss。
+      // 写入的是**同一个** pendingNotes 队列，下一轮 UserPromptSubmit 由 hook 原样送达。
+      // 注意这不是"立即发送"——面板必须如实告诉用户"下一轮生效"。
+      if (req.method === 'POST' && req.url === '/api/note') {
+        const body = await readBody();
+        return done(200, enqueueUserNote(body));
+      }
       if (req.method === 'POST' && req.url === '/api/ping') {
         const body = await readBody();
         return done(200, await ping(body));
@@ -1450,6 +1716,10 @@ async function main() {
   } catch (_) { /* 自动启用失败不阻断外挂 */ }
 
   const cdpPort = await ensureCdp();
+  // 风控告知（issue #7）：此刻已确定工作实例处于 CDP 调试模式（无论是本次 spawn 的，
+  // 还是附着到已在运行的调试实例）——两者都是同一风险面，故在汇合点统一告知，
+  // 而不是只在 spawn 分支里讲（那条分支会漏掉"上次启动的调试实例还活着"这种情况）。
+  warnCdpRisk();
   // 锁心跳：把「当前 CDP 端口」写进租约，证明服务可用（僵尸租约靠它被识别）。
   cdpPortRef.value = cdpPort;
   startLockHeartbeat(cdpPortRef);
@@ -1480,5 +1750,8 @@ if (require.main === module) {
 
 module.exports = { findZcodePath, normalizeChatEndpoint, normalizeMessagesEndpoint, ping, fetchModels, main, saveUserConfig, readHistory, resolveHistoryFile, readZcodeProviders, pickZcodeProvider, effectiveTarget, deriveHealth, staleThresholdMs, readHealth, HEALTH_DIR, startApi,
   readSessionSnapshot, toggleSessionEnabled, setSessionTarget,
+  // issue #9：人工意见注回通道（写同一 pendingNotes 队列 + user_followup 历史事件）
+  enqueueUserNote, appendHistoryRecord, composeUserNote, truncateByCodepoint, queueLimits, warnCdpRisk,
+  CDP_RISK_NOTICE, USER_ACTIONS, HISTORY_MAX_LINES,
   // 供单测直接验证单实例锁与主实例探测（不启动进程）
   _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, exitCodeFor, classifySpawnError, RETRY_EXIT_CODE, SUPERVISED, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS } };
