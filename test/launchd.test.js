@@ -235,6 +235,32 @@ test('install --now：沙箱 dir 只落盘，绝不 bootstrap 进真实 gui 域'
   assert.ok(fs.existsSync(L.plistPath(dir)), 'plist 仍应正常落盘');
 });
 
+// uid() 取不到时也必须走「跳过」分支：此时 canTouchLaunchd 为 false，绝不能落到
+// launchctl bootstrap（拿不到 uid 还去 bootstrap 只会失败或打错域）。返回值必须和
+// 沙箱路径一样明确报 skipped=true，否则调用方会把「没加载」当成「加载失败」。
+// 用删除 process.getuid 来模拟（uid() 在调用时按 typeof 判断，故 require 前删即可）。
+test('install --now：拿不到 uid 时同样报 skipped=true 且不调 launchctl', () => {
+  const dir = tmpDir();
+  const runner = `
+    delete process.getuid;
+    const cp = require('child_process');
+    const calls = [];
+    cp.execFileSync = (f, a) => { calls.push([f, a]); return ''; };
+    const L = require(${JSON.stringify(path.join(__dirname, '../tools/companion/launchd.cjs'))});
+    const r = L.install(${JSON.stringify({ dir, now: true, nodeBin: '/x/node', controllerPath: '/x/controller.cjs' })});
+    process.stdout.write(JSON.stringify({ r, calls }));
+  `;
+  const out = require('child_process').execFileSync(process.execPath, ['-e', runner], {
+    encoding: 'utf8',
+    env: Object.assign({}, process.env)
+  });
+  const probe = JSON.parse(out.trim());
+  assert.deepStrictEqual(probe.calls, [], '拿不到 uid 时不得调用任何 launchctl');
+  assert.strictEqual(probe.r.loaded, false);
+  assert.strictEqual(probe.r.skipped, true, '拿不到 uid 也要明确报「跳过」而不是「失败」');
+  assert.match(probe.r.warn, /uid/);
+});
+
 // 符号链接规范化：只做 path.resolve 时，「指向真实 LaunchAgents 目录的链接」会被判成
 // 另一个位置 → 真实卸载被静默跳过（卸载功能失效）。macOS 上 /var → /private/var 就是
 // 这类链接。这里用自建链接锁死语义，不依赖平台上的 /var 是否存在。

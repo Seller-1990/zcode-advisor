@@ -219,7 +219,7 @@ function isLoaded(label) {
 // install/uninstall 的返回值沿用同一含义，调用方据此决定是否自行拉起进程。
 function ensureLoaded(plistFile, changed, label) {
   const l = label || LABEL;
-  if (uid() === null) return { loaded: false, warn: '无法获取 uid，跳过加载' };
+  if (uid() === null) return { loaded: false, skipped: true, warn: '无法获取 uid，跳过加载' };
   if (!canTouchLaunchd(plistFile)) {
     // 只落盘，由调用方决定是否需要别的加载方式；不谎报「已加载」。
     return { loaded: false, skipped: true, warn: '目标不是用户真实 LaunchAgent，跳过 launchd 加载（避免影响真实自启作业）' };
@@ -240,7 +240,8 @@ function ensureLoaded(plistFile, changed, label) {
 //   ok:true  + skipped:true  —— 只落盘、**没去碰** launchd 域（沙箱/非 darwin/无 uid）
 //   ok:true  + loaded:true   —— 已交给 launchd 加载（changed 表示这次是否重写了 plist）
 //   ok:true  + loaded:false + warn —— 碰了域但 bootstrap 失败
-// skipped 与 warn 互斥地表达「故意跳过」与「尝试后失败」，调用方据此决定是否自行拉起进程。
+// skipped=true 时 warn 说明跳过的原因（两者会同时出现）；loaded=true 时才代表真的
+// 交给了 launchd。调用方据此决定是否自行拉起进程。
 function install(opts) {
   const o = opts || {};
   const rt = o.nodeBin && o.controllerPath
