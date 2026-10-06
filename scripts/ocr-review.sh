@@ -161,8 +161,29 @@ ATTEMPT_LOG=""
 #     OUT_JSON 里留着最后一跳的 partial/无效输出，照拷会把上一份好结论覆盖成半成品。
 #   - 命中锁而提前退出的进程根本走不到这里（锁检查在 OUT_JSON 创建之前）。
 cleanup() {
-  if [ -n "${OCR_REVIEW_RAW_OUT:-}" ] && [ -n "${CHOSEN:-}" ] && [ -s "$OUT_JSON" ]; then
-    cp -f "$OUT_JSON" "$OCR_REVIEW_RAW_OUT" 2>/dev/null || true
+  if [ -n "${OCR_REVIEW_RAW_OUT:-}" ] && [ -n "${CHOSEN:-}" ]; then
+    # 这里不再检查 OUT_JSON 非空：$CHOSEN 只在 valid_output 通过后赋值，而 valid_output
+    # 首行就是 [ -s "$OUT_JSON" ]，故「CHOSEN 非空」已蕴含「有完整评审可拷」。
+    if [ -d "$OCR_REVIEW_RAW_OUT" ]; then
+      # 传目录进来时 cp/mv 会把文件塞进目录、还顺带覆盖同名文件，与「保存到该路径」的
+      # 契约不符；明确拒绝好过默默塞进去。
+      echo "警告：OCR_REVIEW_RAW_OUT 是目录（期望文件路径），跳过保存原始 JSON" >&2
+    else
+      # 先写同目录临时文件再 mv，而不是直接 cp：
+      #   ① cp 是「打开目标→截断→写入」，并发读者会看到 0 字节或半截文件；本脚本用
+      #      OCR_REVIEW_FORCE=1 明确支持并行运行，两个评审会争同一目标，必须原子发布。
+      #   ② cp 会**跟随**目标符号链接（把内容写穿到链接指向的文件）；mv 替换链接本身。
+      #   ③ 只有同目录的 mv 才是原子的（跨文件系统会退化成 copy+unlink）。
+      local _raw_tmp="${OCR_REVIEW_RAW_OUT}.tmp.$$"
+      if cp -f "$OUT_JSON" "$_raw_tmp" 2>/dev/null && mv -f "$_raw_tmp" "$OCR_REVIEW_RAW_OUT" 2>/dev/null; then
+        :
+      else
+        # 静默失败最坑：这个功能存在的意义就是「事后能复核」，写不成功必须说一声。
+        # 但不改退出码——cleanup 不该篡改脚本本身的成败。
+        rm -f "$_raw_tmp" 2>/dev/null || true
+        echo "警告：保存原始 JSON 到 $OCR_REVIEW_RAW_OUT 失败（事后复核将不可用）" >&2
+      fi
+    fi
   fi
   rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}
 }
