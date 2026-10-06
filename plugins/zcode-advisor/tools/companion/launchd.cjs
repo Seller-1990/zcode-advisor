@@ -111,6 +111,9 @@ function uid() {
   try { return typeof process.getuid === 'function' ? process.getuid() : null; } catch (_) { return null; }
 }
 
+// launchctl 固定在 /bin/launchctl：这是 macOS 系统自带、不随版本漂移的绝对路径，
+// 刻意不走 PATH 查找——PATH 上的同名文件可能被用户环境劫持，而这里的调用会
+// bootout 用户真实的自启作业。
 function launchctl(args) {
   return execFileSync('/bin/launchctl', args, { stdio: 'pipe', timeout: 20000, encoding: 'utf8' });
 }
@@ -232,6 +235,12 @@ function ensureLoaded(plistFile, changed, label) {
   }
 }
 
+// 返回契约：{ ok, path, changed, loaded, skipped, warn?, reason? }
+//   ok:false + reason        —— 未安装（找不到 controller / 工作树布局 / 写盘失败）
+//   ok:true  + skipped:true  —— 只落盘、**没去碰** launchd 域（沙箱/非 darwin/无 uid）
+//   ok:true  + loaded:true   —— 已交给 launchd 加载（changed 表示这次是否重写了 plist）
+//   ok:true  + loaded:false + warn —— 碰了域但 bootstrap 失败
+// skipped 与 warn 互斥地表达「故意跳过」与「尝试后失败」，调用方据此决定是否自行拉起进程。
 function install(opts) {
   const o = opts || {};
   const rt = o.nodeBin && o.controllerPath
