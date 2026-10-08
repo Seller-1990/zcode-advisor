@@ -1,27 +1,27 @@
 #!/bin/bash
-# ocr 评审包装脚本（标准链版 · 新机 Windows 适配）
-# 基线：zcode-advisor origin/main 的成熟版（锁所有权/原子发布/JSON 状态白名单全保留），
-# 仅移植平台差异：① 公共 git 目录定位（worktree 安全）② GNU timeout 优先
-# ③ python 优先于 WindowsApps 的 python3 壳 ④ Windows npm 全局路径补 PATH
-# ⑤ timeout 退出码 124 计入「被强制终止」判定。
+# ocr 评审包装脚本（zcode-advisor）
+#
+# 平台适配（Windows / Git Bash 与新机，2026-10-08）：
+#   ① 公共 git 目录定位（worktree 下 .git 是文件，写死会 ENOTDIR）② GNU timeout 优先
+#   ③ python 优先于 WindowsApps 的 python3 壳 ④ Windows npm 全局路径补 PATH
+#   ⑤ timeout 退出码 124 计入「被强制终止」判定。
+#   这几项是**脚本级能力**：必须落在模板里，否则下次跑 ocr-sync-reviewer.sh 时
+#   会被整文件覆盖掉（standard 模式 = 模板内容直写）。
 #
 # 设计（与 ~/.dsh/AGENTS.md 一致）：
 #   - 评审工具**不进 CI**：模型网关是内网地址（192.168.50.139），GitHub runner 够不着；
 #     拦截靠 CI 的确定性检查，评审只作为 advisory 关卡。
 #   - 也**不定时跑**：只在每个 PR 合并前调用一次。
 #
-# 模型降级链（provider|model，与 ~/.opencodereview/config.json 的 custom_providers 对应）：
-#   ⚠️ 链的**唯一真源**是 ~/.dsh/templates/ocr-review/chain-public（运行时直接读它）。
-#      本文件里那段 CHAIN 数组只是读不到链文件时的**兜底快照**，别在这里找当前顺序——
-#      它必然滞后（改链不必改脚本，也就没人会记得同步它）。
-#      改链：编辑 chain-public 再跑 bash ~/.dsh/bin/ocr-sync-reviewer.sh 刷快照。
-#   这里不再逐条列举模型名与顺序：链外置的全部意义就是「枚举会过期」，再抄一份
-#   只会制造第二处会撒谎的注释（2026-10-06 实测：注释写着主棒 deepseek，运行时首跳
-#   其实是 chain-public 的 minimax-m3）。各模型的可用性/耗时/成本结论写在链文件里，
-#   那才是它们生效的地方。
-#   【2026-10-04】隐私铁律暂缓（用户拍板）：私有仓也可用本链（私有副本用 ocr-review.sh.private
-#      变体，链走 chain-private，同样允许 cloud 条目）。
-#   ⚠️ kimi-k3 不支持工具调用（三次探针无 tool_calls）→ 不能当 ocr 模型，勿加回。
+# 模型降级链：**唯一真源是 ~/.dsh/templates/ocr-review/chain-public**（本脚本下方的
+#   CHAIN=(...) 只是读不到链文件时的兜底快照，由 ocr-sync-reviewer.sh 生成，勿手改）。
+#   此处不再逐条列举模型名与顺序——枚举必然过期（2026-10-06 实测：本注释曾写"主棒
+#   deepseek"，而运行时首跳早已是链文件里的另一个模型）。要改链请改链文件。
+#   【2026-10-04】隐私铁律暂缓（用户拍板）：私有仓也可用云端条目（私有副本用
+#      ocr-review.sh.private 变体，链走 chain-private，同样允许 cloud 条目）。
+#   ⚠️ 同站 kimi-k3 不支持工具调用（2026-10-04 三次探针无 tool_calls）→ 不能当 ocr 模型，勿加回。
+#   ⚠️ lucky / lucky-gem 需在 config.json 配 user_agent + headers.User-Agent，否则被
+#      Cloudflare 按 UA 拦截返回 403（不是服务失效）。
 # 用法：
 #   ./scripts/ocr-review.sh              # 默认基准 origin/dev（不存在则回退 main）
 #   ./scripts/ocr-review.sh v1.8.8       # 对比 tag / 分支
@@ -32,10 +32,10 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
-# 公共 git 目录：worktree 下 .git 是文件不是目录，写死会失败（指南 §11 第 11 条）。
+# 公共 git 目录：worktree 下 .git 是文件不是目录，写死会失败（AGENTS.md §11 第 11 条）。
 GIT_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || echo .git)"
 case "$GIT_COMMON_DIR" in
-  /*|?:*) ;;
+  /*|?:*) ;;                                    # 已是绝对路径（worktree 常见）
   *) GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR" ;;
 esac
 
@@ -92,7 +92,10 @@ if ! command -v ocr >/dev/null 2>&1; then
   fi
   # 再按版本号倒序扫（字典序会把 v10 排在 v20 之前，可能命中陈旧的全局安装）
   if ! command -v ocr >/dev/null 2>&1; then
-    for candidate in $(ls -1d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -Vr) \n        /usr/local/bin /opt/homebrew/bin \n        "${APPDATA:-$HOME/AppData/Roaming}/npm" "$HOME/AppData/Roaming/npm"; do
+    for candidate in \
+        $(ls -1d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -Vr) \
+        /usr/local/bin /opt/homebrew/bin \
+        "${APPDATA:-$HOME/AppData/Roaming}/npm" "$HOME/AppData/Roaming/npm"; do
       if [ -x "$candidate/ocr" ]; then
         PATH="$candidate:$PATH"
         break
@@ -108,10 +111,18 @@ fi
 
 AGENT_MODEL_FILE="$HOME/.opencodereview/agent-model"
 
-# python 解释器：Windows 上 python3 常是 WindowsApps 应用执行别名（会打 shebang 警告），
-# 优先用真实安装的 python；两者都没有时 python3 兜底（macOS 无 python 只有 python3）。
-PY="$(command -v python || command -v python3 || true)"
-[ -n "$PY" ] || { echo "错误：找不到 python 解释器（渲染评审结果需要）" >&2; exit 1; }
+# python 解释器：Windows 上 python3 常是 WindowsApps 应用执行别名（跑起来只会弹应用商店），
+# 故优先真实安装的 python；但内嵌脚本用了 f-string，**只接受 Python 3** —— 若 python 指向
+# Python 2 就跳过它继续找 python3，不能靠"命令存在"就认定可用。
+PY=""
+for _cand in python python3; do
+  _p="$(command -v "$_cand" 2>/dev/null || true)"
+  [ -n "$_p" ] || continue
+  if "$_p" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' 2>/dev/null; then
+    PY="$_p"; break
+  fi
+done
+[ -n "$PY" ] || { echo "错误：找不到可用的 Python 3 解释器（渲染评审结果需要）" >&2; exit 1; }
 
 # 校验 ref 是否真实存在（避免把非法参数带进 ocr）
 require_ref() {
@@ -161,17 +172,19 @@ CHAIN_FILE="${OCR_REVIEW_CHAIN_FILE:-$HOME/.dsh/templates/ocr-review/chain-publi
 CHAIN_SCOPE="public"   # public 副本：cloud 条目合法，但仍以链文件为唯一真源
 CHAIN=(
   "nas-hy4|space-bunny"
+  "lucky-gem|gemini-3.6-flash"
   "x666|ministral-14b-latest"
   "runanytime-astra|gpt-6-astra"
   "lucky|step-5-preview"
+  "daigua|gpt-6-sol"
+  "nas-hy4|gemini-3.8-flash"
   "nas-octopus|gemini-3.7-flash"
-  "nas-hy4|gemini-3.5-flash"
   "nas-hy4|deepseek-v4.1-flash"
   "nas-hy4|deepseek-v4.1-flash-sg"
-  "nas-hy4|glm-5.3"
-  "nas-hy4|gpt-6-astra"
-  "nas-hy4|gemini-3.8-flash"
-  "nas-hy4|kimi-k2.8-preview"
+  "nas-octopus|deepseek-v4-flash-0731"
+  "runanytime|z-ai/glm-5.2"
+  "runanytime|z-ai/glm-5.3"
+  "nas-hy4|glm-5.3-flash"
   "nas-hy4|hy3"
   "nas-hy4|hy4-preview-f"
 )
@@ -234,16 +247,9 @@ OUT_JSON="$(mktemp "${TMPDIR_OCR%/}/ocr-review-XXXXXX" 2>/dev/null)" || {
 }
 [ -n "$OUT_JSON" ] || { echo "错误：mktemp 未返回路径" >&2; exit 1; }
 ATTEMPT_LOG=""
-# 注意：这个 trap 会覆盖前面的锁清理 trap，所以 rm -rf "$LOCK_DIR" 必须在这里再做一次，
-# 否则锁目录永不消失，之后每次运行都误报"陈旧锁"（虽然能接管，但看着像坏了）。
-# OCR_REVIEW_RAW_OUT（可选，由调用方提供，例如 pre-push hook）：把 ocr 的**原始 JSON**
-# 另存一份。它是权威产物（下面的渲染表由它生成），而 OUT_JSON 只是 mktemp 临时文件、
-# 退出时被本函数删掉 —— 此前评审成功后原始 JSON 一并消失，事后无法复核或重渲染。
-#
-# 两道守卫，缺一不可：
-#   - `$CHOSEN` 非空 = 确有一跳产出完整评审。**不能**只看 OUT_JSON 非空：链全失败时
-#     OUT_JSON 里留着最后一跳的 partial/无效输出，照拷会把上一份好结论覆盖成半成品。
-#   - 命中锁而提前退出的进程根本走不到这里（锁检查在 OUT_JSON 创建之前）。
+# 注意：这个 trap 会覆盖前面的锁清理 trap，所以锁回收必须在这里再做一次。
+# 但只在**自己持锁**时回收（LOCK_ACQUIRED）——FORCE=1 根本没取锁，无条件删会把
+# 并行评审的锁拆掉。
 cleanup() {
   if [ -n "${OCR_REVIEW_RAW_OUT:-}" ] && [ -n "${CHOSEN:-}" ]; then
     # 这里不再检查 OUT_JSON 非空：$CHOSEN 只在 valid_output 通过后赋值，而 valid_output
