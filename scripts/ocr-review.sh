@@ -1,5 +1,9 @@
 #!/bin/bash
-# ocr 评审包装脚本（zcode-advisor）
+# ocr 评审包装脚本（标准链版 · 新机 Windows 适配）
+# 基线：zcode-advisor origin/main 的成熟版（锁所有权/原子发布/JSON 状态白名单全保留），
+# 仅移植平台差异：① 公共 git 目录定位（worktree 安全）② GNU timeout 优先
+# ③ python 优先于 WindowsApps 的 python3 壳 ④ Windows npm 全局路径补 PATH
+# ⑤ timeout 退出码 124 计入「被强制终止」判定。
 #
 # 设计（与 ~/.dsh/AGENTS.md 一致）：
 #   - 评审工具**不进 CI**：模型网关是内网地址（192.168.50.139），GitHub runner 够不着；
@@ -28,6 +32,13 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
+# 公共 git 目录：worktree 下 .git 是文件不是目录，写死会失败（指南 §11 第 11 条）。
+GIT_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || echo .git)"
+case "$GIT_COMMON_DIR" in
+  /*|?:*) ;;
+  *) GIT_COMMON_DIR="$REPO_ROOT/$GIT_COMMON_DIR" ;;
+esac
+
 # ── 并发锁（实测教训）──
 # pre-push hook 每次推送都会起一个评审，而完整评审要 5–15 分钟。
 # 连续推送（或 tag + main 分开推）会让多个评审同时跑：既争抢上游配额，
@@ -38,7 +49,7 @@ cd "$REPO_ROOT" || exit 1
 # 锁内含 pid + 起始时间；发现锁时：
 #   - 持锁进程仍活着 → 提示并退出（不重复评审）
 #   - 持锁进程已死（崩溃/被 kill）→ 视为陈旧锁，接管
-LOCK_DIR="$REPO_ROOT/.git/ocr-review.lock"
+LOCK_DIR="$GIT_COMMON_DIR/ocr-review.lock"
 LOCK_INFO="$LOCK_DIR/info"
 # 只有**自己拿到锁**才允许在退出时删锁。OCR_REVIEW_FORCE=1 整段跳过、根本不取锁，
 # 若无条件删就会把另一个正在跑的评审的锁连根拔掉——而并行评审正是 FORCE 的用途，
@@ -55,7 +66,7 @@ if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
     [ -f "$LOCK_INFO" ] && HOLD_PID="$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)"
     if [ -n "$HOLD_PID" ] && kill -0 "$HOLD_PID" 2>/dev/null; then
       echo "[ocr-review] 已有评审在进行（pid ${HOLD_PID}），本次跳过以免重复消耗。"
-      echo "[ocr-review] 已有报告：$REPO_ROOT/.git/ocr-review-last.txt"
+      echo "[ocr-review] 已有报告：$GIT_COMMON_DIR/ocr-review-last.txt"
       echo "[ocr-review] 如需强制并行，设 OCR_REVIEW_FORCE=1"
       exit 0
     fi
@@ -81,7 +92,7 @@ if ! command -v ocr >/dev/null 2>&1; then
   fi
   # 再按版本号倒序扫（字典序会把 v10 排在 v20 之前，可能命中陈旧的全局安装）
   if ! command -v ocr >/dev/null 2>&1; then
-    for candidate in $(ls -1d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -Vr) /usr/local/bin /opt/homebrew/bin; do
+    for candidate in $(ls -1d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -Vr) \n        /usr/local/bin /opt/homebrew/bin \n        "${APPDATA:-$HOME/AppData/Roaming}/npm" "$HOME/AppData/Roaming/npm"; do
       if [ -x "$candidate/ocr" ]; then
         PATH="$candidate:$PATH"
         break
@@ -96,6 +107,11 @@ if ! command -v ocr >/dev/null 2>&1; then
 fi
 
 AGENT_MODEL_FILE="$HOME/.opencodereview/agent-model"
+
+# python 解释器：Windows 上 python3 常是 WindowsApps 应用执行别名（会打 shebang 警告），
+# 优先用真实安装的 python；两者都没有时 python3 兜底（macOS 无 python 只有 python3）。
+PY="$(command -v python || command -v python3 || true)"
+[ -n "$PY" ] || { echo "错误：找不到 python 解释器（渲染评审结果需要）" >&2; exit 1; }
 
 # 校验 ref 是否真实存在（避免把非法参数带进 ocr）
 require_ref() {
@@ -144,17 +160,20 @@ AGENT_MODEL="$(tr -d '[:space:]' < "$AGENT_MODEL_FILE" 2>/dev/null || true)"
 CHAIN_FILE="${OCR_REVIEW_CHAIN_FILE:-$HOME/.dsh/templates/ocr-review/chain-public}"
 CHAIN_SCOPE="public"   # public 副本：cloud 条目合法，但仍以链文件为唯一真源
 CHAIN=(
-  "nas-hy4|deepseek-v4.1-flash"
-  "runanytime|z-ai/glm-5.2"
-  "nas-octopus|glm-5.3-flash"
-  "nas-hy4|hy3"
-  "nas-hy4|hy4-preview-f"
+  "nas-hy4|space-bunny"
   "x666|ministral-14b-latest"
   "runanytime-astra|gpt-6-astra"
-  "runanytime|z-ai/glm-5.3"
-  "lucky|stealth/space-bunny-alpha"
   "lucky|step-5-preview"
-  "daigua|gpt-6-sol"
+  "nas-octopus|gemini-3.7-flash"
+  "nas-hy4|gemini-3.5-flash"
+  "nas-hy4|deepseek-v4.1-flash"
+  "nas-hy4|deepseek-v4.1-flash-sg"
+  "nas-hy4|glm-5.3"
+  "nas-hy4|gpt-6-astra"
+  "nas-hy4|gemini-3.8-flash"
+  "nas-hy4|kimi-k2.8-preview"
+  "nas-hy4|hy3"
+  "nas-hy4|hy4-preview-f"
 )
 # 运行时优先读链文件：读不到 / 解析出 0 条 → 保留上面的快照（脚本被单独拷走也跑得起来）。
 _chain_found=()
@@ -289,7 +308,7 @@ trap cleanup EXIT INT TERM
 # 误拒完整结果、触发无谓重跑。覆盖完整性以 status 为准。
 valid_output() {
   [ -s "$OUT_JSON" ] || return 1
-  python3 - "$OUT_JSON" <<'PYCHECK' >/dev/null 2>&1
+  "$PY" - "$OUT_JSON" <<'PYCHECK' >/dev/null 2>&1
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
@@ -323,6 +342,13 @@ run_with_deadline() {
   local secs="$1"; shift
   case "$secs" in ''|*[!0-9]*) "$@"; return $? ;; esac
   [ "$secs" -gt 0 ] || { "$@"; return $?; }
+  # 新机（Windows Git Bash / 装了 coreutils 的机器）有 GNU timeout，优先用它：
+  # 语义清晰（超时退出码 124），且 MSYS 会一并带走子进程树。
+  # 没有 timeout 时才走下面的进程组方案（macOS 自带 bash 3.2 的原始实现）。
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+    return $?
+  fi
   set -m
   "$@" &
   local cmd_pid=$!
@@ -391,7 +417,7 @@ for entry in "${CHAIN[@]}"; do
     break
   fi
   case "$HOP_RC" in
-    137|143) echo "  ⚠ 本跳到 ${HOP_LIMIT}s 上限被强制终止（退出码 ${HOP_RC}），降级到下一个" ;;
+    124|137|143) echo "  ⚠ 本跳到 ${HOP_LIMIT}s 上限被强制终止（退出码 ${HOP_RC}），降级到下一个" ;;
     esac
   # 保留该次失败输出尾部，供全失败时排查（此前一律丢进 /dev/null）
   if [ -n "$ATTEMPT_LOG" ]; then
@@ -426,7 +452,7 @@ fi
 #   { status, llm, message, summary, tool_calls, comments[], groups[], session_id, manifest, retry_report }
 #   comments[] 元素键：path, content, suggestion_code, existing_code, start_line, end_line, thinking, category, severity
 # 渲染失败必须让脚本非零退出（set -e 未开启，故显式传递）。
-if ! python3 - "$OUT_JSON" "$CHOSEN" <<'PY'
+if ! "$PY" - "$OUT_JSON" "$CHOSEN" <<'PY'
 import json, sys
 
 path, chosen = sys.argv[1], sys.argv[2]
