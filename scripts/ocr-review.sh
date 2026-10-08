@@ -344,8 +344,12 @@ run_with_deadline() {
   [ "$secs" -gt 0 ] || { "$@"; return $?; }
   # 新机（Windows Git Bash / 装了 coreutils 的机器）有 GNU timeout，优先用它：
   # 语义清晰（超时退出码 124），且 MSYS 会一并带走子进程树。
-  # 没有 timeout 时才走下面的进程组方案（macOS 自带 bash 3.2 的原始实现）。
-  if command -v timeout >/dev/null 2>&1; then
+  #
+  # ⚠️ 必须用 `timeout --version` 探测而不是 `command -v timeout`：Windows 自带
+  #    C:/Windows/System32/timeout.exe 是同名异物（等 N 秒的延时命令，不包装别的命令），
+  #    命中它会把 `timeout 900 ocr review …` 当成非法参数静默跑偏。
+  #    GNU 版有 --version，Windows 版没有（实测其退出码与输出均不同）。
+  if timeout --version >/dev/null 2>&1; then
     timeout "$secs" "$@"
     return $?
   fi
