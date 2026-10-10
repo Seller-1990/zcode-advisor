@@ -476,10 +476,14 @@ test('ocr-review.sh：链文件存在但零条合法条目时同样退回快照'
   assert.match(r.stdout, COMPLETED_RE);
 });
 
-// 单跳超时：本机 macOS + bash 3.2 没有 GNU timeout，run_with_deadline 用「自成进程组 +
-// 整组 TERM」实现。这里锁住两个行为：① 挂起的一跳会被掐掉并降级；② **孙进程**也必须死
+// 单跳超时：run_with_deadline 有两条实现路径，走哪条取决于本机有没有 GNU timeout。
+//   - 有 GNU timeout（CI 的 ubuntu-latest 就有）：`timeout "$secs" "$@"`，到点自杀返回 124；
+//   - 没有（macOS + bash 3.2，本机开发环境）：「自成进程组 + 整组 TERM」，返回 137/143。
+// 两条路径都必须满足同样的两个行为：① 挂起的一跳会被掐掉并降级；② **孙进程**也必须死
 // （用 perl alarm 或裸 kill 只杀直接子进程，ocr 派生的子进程会漏成孤儿）。
-test('ocr-review.sh：单跳挂起会被强杀并降级（退出码 137/143 透传）', skipUnlessDeadline, () => {
+// 所以断言只认「脚本判定为被强制终止」的那组退出码（脚本的 case 也是 124|137|143），
+// 不锁死某一个平台的码 —— 曾经只写 137|143，结果 Linux CI 打印 124 就红了。
+test('ocr-review.sh：单跳挂起会被强杀并降级（退出码 124/137/143 透传）', skipUnlessDeadline, () => {
   const sb = mkSandbox();
   const childPidFile = path.join(sb.root, 'grandchild.pid');
   const state = path.join(sb.root, 'state');
@@ -510,7 +514,9 @@ printf '%s\\n' '${JSON.stringify(COMPLETE_JSON)}' > "$out"
   assert.strictEqual(r.code, 0, '第一跳超时后应降级到第二跳并成功');
   // 超时提示走 stdout（与「尝试 provider=…」同一路），且必须带上真实退出码，
   // 否则看起来和「普通失败」一模一样，排查时会误判成 provider 坏了。
-  assert.match(r.stdout, /上限被强制终止（退出码 (137|143)）/, '超时必须明说并带上退出码');
+  // 124 = GNU timeout 到点自杀的退出码；143/137 = 进程组被 TERM/KILL 打掉。
+  // 这里只要求「是脚本认定为被强制终止的码」，不锁死平台。
+  assert.match(r.stdout, /上限被强制终止（退出码 (124|137|143)）/, '超时必须明说并带上退出码');
   assert.match(r.stdout, /成功：fake \/ m1/, '应降级到下一跳');
 
   // 孙进程必须已被回收（组信号生效）。给它一点时间完成 TERM→KILL。
