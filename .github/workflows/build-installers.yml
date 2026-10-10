@@ -3,11 +3,19 @@ name: build-installers
 # 触发：
 # - push tag `v*`   → 构建安装包并发布到 Release
 # - push main       → 只跑 test job（防「镜像漂移/坏改动」静默合入 main）
+# - PR → main       → 只跑 test job（构建类 job 有 if 条件，PR 上不会执行）
 # - 手动触发         → 只构建并上传 Actions artifact（用于验证）
 #
-# 为什么加 push main：此前只有 tag 与 PR 触发测试，直接 push main 不跑任何 CI，
+# 为什么加 push main：此前只有 tag 触发测试，直接 push main 不跑任何 CI，
 # 而本仓有「根目录 ↔ plugins/zcode-advisor/ 双副本」结构，忘同步就会把旧代码合入。
 # 只跑 test（构建类 job 已加 if 条件，不在 push main 时执行）：快、无网络依赖，够堵住漂移。
+#
+# 为什么还要加 pull_request：push main 是「事后」，红灯只在已经坏在 main 上之后才亮。
+# 2026-10 实测踩过：PR #14/#15 的 ocr-review 适配里，GNU timeout 分支在 Linux 上返回
+# 124（macOS 没有 timeout，走进程组回退返回 143），测试只断言了 137|143，于是本机全绿、
+# 合并后 main 两次变红。PR 阶段跑一遍 test，这类「只在 Linux 成立」的差异就拦在合并前。
+# 注：构建类 job 都带 `startsWith(github.ref,'refs/tags/v') || event_name == 'workflow_dispatch'`
+# 守卫，PR 上只剩 test 这一个 job，代价就是一条 ubuntu 单元测试。
 #
 # 工具链选择依据（2026-09 查证 actions/runner-images）：
 # - windows-2022 预装 NSIS 3.10，可直接产出 setup.exe（windows-2025 未预装 NSIS，只有 InnoSetup）
@@ -18,6 +26,8 @@ on:
     branches: [main]
     tags:
       - 'v*'
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       mac_arch:
