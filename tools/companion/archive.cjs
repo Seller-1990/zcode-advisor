@@ -260,8 +260,27 @@ function readOctalField(buf, offset, length) {
   return Number.isFinite(n) ? n : 0;
 }
 
+// tar 头校验和（字段 148..156 按空格参与求和）。字段为空返回 null——非 ustar 产出
+// 不该被我们判死，只对有值却对不上的情况报错。
+function readTarChecksum(header) {
+  const raw = header.subarray(148, 156).toString('ascii').replace(/\0.*$/, '').trim();
+  if (!raw) return null;
+  const n = parseInt(raw, 8);
+  return Number.isFinite(n) ? n : null;
+}
+
+function computeTarChecksum(header) {
+  let sum = 0;
+  for (let i = 0; i < TAR_BLOCK; i++) sum += (i >= 148 && i < 156) ? 0x20 : header[i];
+  return sum;
+}
+
 // 解析（可能 gzip 压缩的）tar，返回 [{ path, data, mode, type }]。
 // 只支持 ustar 普通文件与目录；不做 PAX/GNU 长名扩展（官方 Node 发行包是 ustar）。
+//
+// 完整性（R16）：先验头校验和，再验 size 是否超出实际数据。缺了这两步，`subarray` 在
+// 数据不足时会**静默返回短 buffer**，于是损坏/截断的发行包会被当成好包提取出半截 node
+// 二进制，最终表现为"装完即崩"。
 function readTarGz(input) {
   const buf = zlib.gunzipSync(input);
   const entries = [];
@@ -278,7 +297,18 @@ function readTarGz(input) {
     const type = String.fromCharCode(header[156] || 0x30);
     const name = prefixField ? `${prefixField}/${nameField}` : nameField;
 
+    const declaredSum = readTarChecksum(header);
+    if (declaredSum !== null) {
+      const actualSum = computeTarChecksum(header);
+      if (declaredSum !== actualSum) {
+        throw new Error(`archive: tar 头校验和不符（${name || '?'}：声明 ${declaredSum}，实际 ${actualSum}）—— 归档已损坏`);
+      }
+    }
+
     pos += TAR_BLOCK;
+    if (size > 0 && pos + size > buf.length) {
+      throw new Error(`archive: tar 数据区被截断（${name || '?'}：声明 ${size} 字节，实际仅剩 ${buf.length - pos}）—— 归档已损坏`);
+    }
     if (type === '0' || type === '\0' || type === '') {
       entries.push({ path: name, data: buf.subarray(pos, pos + size), mode, type: 'file' });
     } else if (type === '5') {
@@ -312,6 +342,9 @@ function extractFromTarGz(input, wantedPath) {
 // 从中央目录解析条目。刻意走中央目录而非顺序扫 local header：
 // 流式写入的 zip 会在 local header 置 bit 3（data descriptor），此时 local header 里的
 // 大小为 0，只有中央目录记录的才是真实值。官方 Node zip 即可能带该标志。
+//
+// 完整性（R16）：除签名与解压后长度外，还比对中央目录记录的 CRC-32（+16）。只验长度时，
+// 内容被改写但长度不变的损坏归档会被无声接受（store 条目尤其如此）。
 function readZipEntries(buf) {
   // 从尾部找 EOCD（注释最长 65535，向前最多找 64KB）
   let eocdAt = -1;
@@ -330,6 +363,7 @@ function readZipEntries(buf) {
       throw new Error(`archive: central directory 第 ${i} 条签名错误 @${pos}`);
     }
     const method = buf.readUInt16LE(pos + 10);
+    const crcExpected = buf.readUInt32LE(pos + 16);
     const compSize = buf.readUInt32LE(pos + 20);
     const rawSize = buf.readUInt32LE(pos + 24);
     const nameLen = buf.readUInt16LE(pos + 28);
@@ -355,6 +389,10 @@ function readZipEntries(buf) {
 
     if (data.length !== rawSize) {
       throw new Error(`archive: 解压大小不符（${name}: ${data.length} != ${rawSize}）`);
+    }
+    const actualCrc = crc32(data);
+    if (actualCrc !== crcExpected) {
+      throw new Error(`archive: ZIP CRC 校验失败（${name}: 声明 ${crcExpected.toString(16)}，实际 ${actualCrc.toString(16)}）—— 归档已损坏`);
     }
     out.push({ path: name, data, size: rawSize, mode: (externalAttrs >>> 16) & 0o7777 });
     pos += 46 + nameLen + extraLen + commentLen;

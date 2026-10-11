@@ -114,8 +114,15 @@ function findZcodeCli() {
 //    会误判"持锁者仍在运行"→ 每次启动都跳过 → 干净机器上插件**永远装不上
 //    且无重试**。因此加 **TTL**：持锁超过 LOCK_TTL_MS 一律视为陈旧（正常一次
 //    启用只需数秒），并把 pid 存活仅作为辅助判断。
-//    （另有 zcode-advisor 自检：TTL 远大于单次启用耗时，不会误杀正常持锁。）
-const LOCK_TTL_MS = 5 * 60 * 1000;   // 5 分钟：单次启用只需数秒，超时必属异常
+// ③ **单步耗时有上界**：TTL 判据要成立，必须保证真实持锁者不会超过 TTL 不续租。
+//    单次启用最坏 = alreadyEnabled(≤60s) + 4×(≤120s) = 540s，**大于 5 分钟 TTL**
+//    （原注释断言「TTL 远大于单次启用耗时」，实测不成立：长安装跑到第 6 分钟就会被
+//    后到的实例判为陈旧并接管，两个实例同时对同一份宿主插件缓存跑 CLI）。
+//    因此每个步骤边界都续租（见 renewFlight），使「未续租间隔」的上界恒为
+//    **单步超时 120s < TTL 300s**；而真正死掉（或 pid 被复用）的锁没人续租，
+//    仍会在 TTL 之后按预期被接管——两条语义同时成立。
+// ④ **释放要认主**：只有租约还写着自己 pid 时才删锁，否则会把接管者的锁删掉。
+const LOCK_TTL_MS = 5 * 60 * 1000;   // 5 分钟：单步最长 2 分钟，超时必属异常
 
 function readLockInfo(info) {
   try {
@@ -169,6 +176,10 @@ function acquireSingleFlight() {
   const lockDir = path.join(os.homedir(), '.zcode', 'advisor-auto-enable.lock');
   const info = path.join(lockDir, 'info');
   try {
+    // 干净机器上 ~/.zcode 可能还不存在（ZCode 首次运行才创建）。排他 mkdir 要求父目录已就位：
+    // recursive:false 在父目录缺失时直接 ENOENT，会被下面的 catch 误判成「已有实例在运行」而
+    // 静默跳过自动启用。只递归补父目录，锁目录本身仍是 recursive:false（保持排他语义）。
+    fs.mkdirSync(path.dirname(lockDir), { recursive: true });
     fs.mkdirSync(lockDir, { recursive: false });
     fs.writeFileSync(info, `pid=${process.pid}\nstarted=${Date.now()}\n`, 'utf8');
     return { lockDir, acquired: true };
@@ -179,6 +190,22 @@ function acquireSingleFlight() {
     if (tryTakeOver(lockDir, info)) return { lockDir, acquired: true, stale: true };
     const after = readLockInfo(info);
     return { lockDir, acquired: false, holder: String(after.pid || '') };
+  }
+}
+
+// 续租：把 started 刷成「现在」，证明持锁者还在干活。
+// 续租前先确认锁仍是自己的：一旦被接管（TTL 误判 / pid 被复用），就停止续租，
+// 绝不把接管者的租约改回自己的名字（与 controller 的心跳同一纪律）。
+function renewFlight(lockDir) {
+  if (!lockDir) return false;
+  try {
+    const info = path.join(lockDir, 'info');
+    const cur = readLockInfo(info);
+    if (cur.pid !== process.pid) return false;
+    fs.writeFileSync(info, `pid=${process.pid}\nstarted=${Date.now()}\n`, 'utf8');
+    return true;
+  } catch (_) {
+    return false;
   }
 }
 
@@ -195,11 +222,22 @@ function main() {
     return 0;
   }
   if (flight.stale) log('发现陈旧自动启用锁（持锁进程已退出），接管');
-  const releaseFlight = () => { try { fs.rmSync(flight.lockDir, { recursive: true, force: true }); } catch (_) {} };
+  const releaseFlight = () => {
+    try {
+      const info = path.join(flight.lockDir, 'info');
+      const cur = readLockInfo(info);
+      // 租约已被别人接管（pid 不是自己）→ 绝不删别人的锁。
+      if (cur.pid && cur.pid !== process.pid) return;
+      // 先摘掉自己的租约再删目录：目录非空说明新主已写入租约，
+      // rmdir 会失败（我们不再动它）——避免"删除空壳目录"把新主的锁一起删掉。
+      try { fs.unlinkSync(info); } catch (_) {}
+      fs.rmdirSync(flight.lockDir);
+    } catch (_) {}
+  };
   process.on('exit', releaseFlight);
 
   try {
-    return runEnable();
+    return runEnable(flight.lockDir);
   } finally {
     releaseFlight();
   }
@@ -306,7 +344,7 @@ function parseInstallPath(out) {
     const l = lines[i];
     // 走到下一个插件条目（以 `- ` 开头的行）就停，避免越界到别的插件
     if (/^\s*-\s/.test(l)) break;
-    const m = /cache\/[^:\n]*:\s*([^\n]+)/.exec(l);
+    const m = /cache[\\/][^:\n]*:\s*([^\n]+)/.exec(l);
     if (m) return m[1].trim();
   }
   return '';
@@ -318,11 +356,18 @@ function parseInstallPath(out) {
 //
 // fps 可选：{ payload, installed } 两个内容指纹。给了就启用「同版本漂移检测」；
 // 不给则行为与旧版完全一致（现有单测不受影响）。
+// R09：`plugins list` 的 cache 路径在 Windows 上是反斜杠形态
+// （`cache\zcode-advisor-local: C:\…\zcode-advisor\0.2.20`）。以下版本/目录匹配必须
+// 同时接受 `\` 与 `/`；只认正斜杠时，Windows 上「已装版本」永远解析不出来 →
+// 每次启动都重装插件，且「不降级」「同版本内容漂移」两条判据双双失效。
+const hasVersionInList = (out, ver) =>
+  out.includes(`zcode-advisor/${ver}`) || out.includes(`zcode-advisor\\${ver}`);
+
 function isReadyFromList(out, pkgVersion, fps) {
   if (!/zcode-advisor@\S+\s+\[enabled\]/.test(out)) return false;
   if (!pkgVersion) return true;
-  // 已装版本从 cache 路径解析：`…/zcode-advisor/<ver>`
-  const installed = ((/zcode-advisor\/(\d+\.\d+\.\d+)/.exec(out) || [])[1]) || '';
+  // 已装版本从 cache 路径解析：`…/zcode-advisor/<ver>`（Windows 为 `…\zcode-advisor\<ver>`）
+  const installed = ((/zcode-advisor[\\/](\d+\.\d+\.\d+)/.exec(out) || [])[1]) || '';
   if (installed) {
     const c = cmpSemver(installed, pkgVersion);
     if (c > 0) return true;        // 已装更高 → 就绪（绝不降级）
@@ -332,7 +377,7 @@ function isReadyFromList(out, pkgVersion, fps) {
     if (fps && fps.payload && fps.installed) return fps.payload === fps.installed;
     return true;
   }
-  return out.includes(`zcode-advisor/${pkgVersion}`);           // 解析不出 → 退回精确匹配
+  return hasVersionInList(out, pkgVersion);                     // 解析不出 → 退回精确匹配
 }
 
 function alreadyEnabled(cli, nodeBin, payload) {
@@ -358,11 +403,11 @@ function alreadyEnabled(cli, nodeBin, payload) {
 
     const ready = isReadyFromList(out, pkgVersion, fps);
     if (!ready && pkgVersion && installedDir && fps.payload && fps.installed
-        && fps.payload !== fps.installed && out.includes(`zcode-advisor/${pkgVersion}`)) {
+        && fps.payload !== fps.installed && hasVersionInList(out, pkgVersion)) {
       // 版本号相同、内容却不同：宿主 cache 里的插件是旧快照（真机故障根因）。
       // 必须报出来——否则用户只会看到「修了没生效」，无从判断卡在哪一步。
       log(`已装 ${pkgVersion} 与包内版本号相同但内容不一致（宿主 cache 是旧快照）——强制重装`);
-    } else if (ready && pkgVersion && !out.includes(`zcode-advisor/${pkgVersion}`)) {
+    } else if (ready && pkgVersion && !hasVersionInList(out, pkgVersion)) {
       log(`已装版本不低于包内 ${pkgVersion}——跳过（不降级）`);
     }
     return ready;
@@ -372,7 +417,7 @@ function alreadyEnabled(cli, nodeBin, payload) {
 }
 
 // 实际的启用流程（由 main 在持有单飞锁后调用）
-function runEnable() {
+function runEnable(lockDir) {
   const payload = findPluginPayload();
   if (!payload) {
     log('未找到插件市场目录（.claude-plugin/marketplace.json）——跳过自动启用');
@@ -406,6 +451,9 @@ function runEnable() {
     ['plugins', 'enable', 'zcode-advisor']
   ];
   for (const args of steps) {
+    // 步骤边界续租：单步最长 120s < TTL 300s，因此真实持锁者永远不会
+    // 在跑长安装的过程中被别人判成陈旧（R02）。
+    renewFlight(lockDir);
     try {
       // 剥离 ELECTRON_RUN_AS_NODE：否则宿主包装器被当作 Node 解释器（报 bad option）
       const env = Object.assign({}, process.env);

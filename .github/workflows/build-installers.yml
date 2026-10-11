@@ -15,7 +15,7 @@ name: build-installers
 # 124（macOS 没有 timeout，走进程组回退返回 143），测试只断言了 137|143，于是本机全绿、
 # 合并后 main 两次变红。PR 阶段跑一遍 test，这类「只在 Linux 成立」的差异就拦在合并前。
 # 注：构建类 job 都带 `startsWith(github.ref,'refs/tags/v') || event_name == 'workflow_dispatch'`
-# 守卫，PR 上只剩 test 这一个 job，代价就是一条 ubuntu 单元测试。
+# 守卫，PR 上运行 Linux/macOS/Windows 的确定性测试；不执行安装器发布。
 #
 # 工具链选择依据（2026-09 查证 actions/runner-images）：
 # - windows-2022 预装 NSIS 3.10，可直接产出 setup.exe（windows-2025 未预装 NSIS，只有 InnoSetup）
@@ -38,17 +38,25 @@ on:
         options: ['both', 'x64', 'arm64']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # ---------- 确定性检查（不依赖网络/模型，作为发布前置门禁） ----------
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # OCR shell 集成测试仅在 POSIX 运行；Windows 将明确显示 skip，核心测试不跳过。
       - name: 单元测试
         run: npm test
 
@@ -73,6 +81,12 @@ jobs:
 
       - name: 构建（跳过 macOS）
         run: node tools/companion/build-installer.cjs --skip-mac
+
+      - name: 确认 Windows 交付物完整
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/*.zip')) { throw '缺少 Windows zip' }
+          if (-not (Test-Path 'dist/*.exe')) { throw '缺少 Windows NSIS 安装器' }
 
       - name: 列出产物
         shell: pwsh
@@ -178,6 +192,8 @@ jobs:
   # ---------- 发布：把安装包挂到 Release ----------
   release:
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
@@ -200,4 +216,4 @@ jobs:
             artifacts/*.tar.gz
             artifacts/*.dmg
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true

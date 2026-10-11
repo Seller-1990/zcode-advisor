@@ -9,7 +9,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 
 const T = require('../tools/companion/install-templates.cjs');
 const { COMPANION_FILES, companionRuntimeFiles } = require('../tools/companion/build-meta.cjs');
@@ -74,11 +74,63 @@ test('MAC_INSTALL_SH：语法健全、生成 .app、LSUIElement、内嵌 node �
   assert.ok(!sh.includes('</dict></plist>\nPLIST') || sh.includes("<<'PLIST'"), 'heredoc 应加引号');
 });
 
+test('MAC_INSTALL_SH：首次安装从持久路径执行自动启用（含空格/中文 HOME）', {
+  skip: process.platform === 'win32'
+}, (t) => {
+  const root = tmpDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const home = path.join(root, '用户 home');
+  const src = path.join(root, '安装包 source');
+  fs.mkdirSync(path.join(src, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(src, 'plugin', '.claude-plugin'), { recursive: true });
+  fs.writeFileSync(path.join(src, 'plugin', '.claude-plugin', 'marketplace.json'), '{}');
+  for (const f of ['controller.cjs', 'launchd.cjs', 'auto-enable.cjs']) fs.writeFileSync(path.join(src, f), '');
+  // A fake embedded runtime records invocation, never runs host registration or launchd.
+  fs.writeFileSync(path.join(src, 'bin', 'node'), '#!/bin/bash\nprintf "%s\\n" "$1" >> "$HOME/auto-enable-called"\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(src, 'install.sh'), T.MAC_INSTALL_SH(['controller.cjs']));
+  const out = execFileSync('bash', [path.join(src, 'install.sh')], {
+    env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 15000
+  });
+  const support = path.join(home, 'Library', 'Application Support', 'ZCodeAdvisor');
+  assert.equal(fs.readFileSync(path.join(home, 'auto-enable-called'), 'utf8').trim(), path.join(support, 'auto-enable.cjs'));
+  assert.ok(fs.existsSync(path.join(support, 'plugin', '.claude-plugin', 'marketplace.json')));
+  assert.doesNotMatch(out, /插件自动启用未完成/);
+});
+
 test('MAC_INSTALL_SH：内嵌 node 缺失时回退系统 node，两者都无则明确失败', () => {
   const sh = T.MAC_INSTALL_SH(COMPANION_FILES);
   assert.match(sh, /command -v node/);
   assert.match(sh, /exit 1/);
   assert.match(sh, /包内未内嵌 Node/);
+});
+
+test('MAC_INSTALL_SH：无内嵌或系统 Node 时中止，不打印成功或运行自动启用', {
+  skip: process.platform === 'win32'
+}, (t) => {
+  const root = tmpDir();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const src = path.join(root, 'source');
+  const bin = path.join(root, 'path-without-node');
+  const home = path.join(root, '隔离 home');
+  fs.mkdirSync(src);
+  fs.mkdirSync(bin);
+  // Only expose the system utilities used before the runtime check, not Node.
+  for (const name of ['dirname', 'mkdir', 'cp']) {
+    const tool = execFileSync('which', [name], { encoding: 'utf8' }).trim();
+    fs.symlinkSync(tool, path.join(bin, name));
+  }
+  for (const f of ['controller.cjs', 'launchd.cjs']) fs.writeFileSync(path.join(src, f), '');
+  const script = path.join(src, 'install.sh');
+  fs.writeFileSync(script, T.MAC_INSTALL_SH(['controller.cjs']));
+  const bash = execFileSync('which', ['bash'], { encoding: 'utf8' }).trim();
+  const result = spawnSync(bash, [script], {
+    env: { ...process.env, HOME: home, PATH: bin }, encoding: 'utf8', timeout: 15000
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /系统 PATH 上找不到 node/);
+  assert.equal(result.stdout.trim(), '');
+  assert.ok(!fs.existsSync(path.join(home, 'Applications', 'ZCode Advisor.app', 'Contents', 'Info.plist')));
 });
 
 test('macReadme：按是否内嵌给出不同说明', () => {

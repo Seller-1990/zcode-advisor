@@ -44,7 +44,7 @@ node tools/companion/controller.cjs     # 控制台保持开启
   「发现已运行的调试实例（端口 9333），直接附着」或「CDP 通道就绪」→「已附着页面」；
   ZCode 输入框右下角出现 🛡️ 角标。
 - 点击角标 → 设置面板可打开（已实测页面内 `__zcodeAdvisorInjected=true`、`zca-badge` 元素存在）。
-- 面板内完成「填端点 + key → 拉取模型 → Ping → 保存」，`~/.zcode/advisor.config.json` 被写入。
+- 先在 ZCode 的「第三方服务商」设置中配置端点、API key 与模型，再在顾问面板内「选择服务商 + 模型 → 探测 → 保存」。`~/.zcode/advisor.config.json` 只保存选择和行为参数，不保存 API key；不要使用旧版插件级 key/端点字段。
 - 刷新页面或新开窗口后角标应自动恢复（`addScriptToEvaluateOnNewDocument` 通道）。
 - ⚠️ **破坏性验证需用户自行执行**：若要验证「由本脚本冷启动 ZCode」，须先完全退出 ZCode
   并停掉 zcode-plus 的 controller（避免调试端口争抢）；执行前请确认 ZCode 内无未保存工作。
@@ -57,7 +57,7 @@ node tools/companion/controller.cjs     # 控制台保持开启
    列表应显示「ZCode 顾问 / ZCode Advisor」（展示元数据来自 marketplace.json）。
 2. **新开会话**，发送任意一条消息（如"你好"）。
    ⚠️ 注意：斜杠命令与注册行都在**会话创建时**注册——安装前就打开的旧会话里没有它们，新建会话即可，不是故障。
-3. ✅ 通过标准：该消息前出现以 `[advisor]` 开头的注册行（含"脚本"与"状态文件"两个绝对路径；未配 key 时还会有一行"门禁未满足：missing:apiKey"——这本身也是被验证的行为）。
+3. ✅ 通过标准：该消息前出现以 `[advisor]` 开头的注册行（含「脚本」与「状态文件」两个绝对路径）；未配置可用服务商时应出现明确的门禁/来源诊断。请据 `/advisor-status` 检查 ZCode 第三方服务商与模型选择，不要向插件配置补写旧 `apiKey` 字段。
 4. 顺带验证命令链：运行 `/advisor-status`，应能执行并输出状态块（而不是"未挂载"）。
 5. 顺带验证插件设置表单（⚠️ 预期**不渲染**）：
    ZCode 官方插件规范（plugin-creator 的 `plugin-json-spec.md`）未定义 `userConfig`；
@@ -67,7 +67,7 @@ node tools/companion/controller.cjs     # 控制台保持开启
 
 ## 实验 2：后台审查链路存活（覆盖：detached worker 在 hook 退出后存活、转录文件持续性）
 
-1. 先完成 key 配置（`/advisor-setup`，Ping OK）或临时用 mock（见下）。
+1. 先在 ZCode 中配置第三方服务商，再用 `/advisor-setup` 选择服务商/模型并完成探测；也可临时用完全隔离的 mock（见下）。
 2. 发起一轮会触发工具调用的任务（如"读取 README.md 并总结"），等回合结束。
 3. **等 2 分钟**（worker 异步审查），然后运行 `/advisor-status`。
 4. ✅ 通过标准：`审查次数 ≥ 1`；状态文件目录（注册行中有路径）下 `*.lock` 已消失；`Dropped` 无 `no_transcript`。
@@ -83,16 +83,25 @@ node tools/companion/controller.cjs     # 控制台保持开启
 
 - **resume/compact 重发注册行**：长会话触发压缩后，下一条消息应重新出现注册行（依赖宿主 SessionStart stdin 是否带 `source` 字段——未验证项）。
 - **sync 模式**：`advisor.config.json` 配 `reviewMode: "sync"`，观察 blocker 是否当轮打断、每轮收尾延迟是否可接受。
-- **mock 快速自检**（不消耗 key，Git Bash）：
+- **mock 快速自检**（不消耗 key，Git Bash；须使用含测试 fixture 的源码仓库，安装缓存不包含 `test/`）：
 
   ```bash
-  cd "<安装缓存里的插件目录>"
-  mkdir -p state && touch state/.mock-allowed
+  cd "<仓库根目录>"
+  mock_home="$(mktemp -d)"
+  mkdir -p "$mock_home/state" "$mock_home/.zcode"
+  touch "$mock_home/state/.mock-allowed"
+  printf '{"enabled":true}\n' > "$mock_home/.zcode/advisor.config.json"
+  HOME="$mock_home" USERPROFILE="$mock_home" ZCODE_ADVISOR_STATE_DIR="$mock_home/state" \
   ZCODE_ADVISOR_MOCK=1 ZCODE_ADVISOR_MOCK_FRAME='{"severity":"blocker","note":"演示"}' \
-  ZCODE_ADVISOR_API_KEY=e2e-key ZCODE_ADVISOR_REVIEW_MODE=sync \
+  ZCODE_ADVISOR_BASE_URL=http://127.0.0.1:9/v1/chat/completions \
+  ZCODE_ADVISOR_API_KEY=e2e-key ZCODE_ADVISOR_MODEL=mock-model ZCODE_ADVISOR_REVIEW_MODE=sync \
     node hooks/advisor-hook.js stop <<< '{"session_id":"demo","transcript_path":"test/fixtures/transcript-basic.jsonl","stop_hook_active":false}'
   # 期望 stdout：{"decision":"block","reason":"[advisor:blocker] 演示（以上来自审查副模型……）"}
+  printf '隔离目录（验证后可手动删除）：%s\n' "$mock_home"
   ```
+
+  端点与 key 必须成对覆盖；上例的回环端点只用于安全的 mock 配置，不是可用模型服务。
+  `.mock-allowed` 必须与 `ZCODE_ADVISOR_STATE_DIR` 指向同一目录。
 
 ## 结果记录
 

@@ -1197,7 +1197,97 @@ test('issue #9：面板容器用内联固定标记（不把意见正文当 HTML 
   assert.match(panel, /\/api\/note/, 'panel.cjs 应提交到同一 /api/note');
 });
 
-test('panel 契约：程序化赋值 select.value 不触发 change（故无需"回填"标志位）', () => {
+// ---------------- 审计回归：异步代际与持久 panel ----------------
+test('审计：旧令牌在途健康响应不得覆盖新一代状态', async () => {
+  let finishOld;
+  const dom = runInject({ token: 'old', fetch: () => new Promise(r => { finishOld = r; }) });
+  runInject({ reuse: dom, token: 'new', fetch: async () => ({ json: async () => ({ ok: true, state: 'ok' }) }) });
+  await new Promise(r => setImmediate(r));
+  finishOld({ json: async () => ({ ok: false, error: 'bad_token' }) });
+  await new Promise(r => setImmediate(r));
+  assert.ok(dom.byId.get('zca-badge').classList.contains('zca-h-ok'));
+});
+
+for (const failure of ['bad_token', 'network_reject']) {
+  test(`审计复核：旧令牌会话开关 ${failure} 不得回滚新面板`, async () => {
+    let failOld;
+    const reply = value => ({ json: async () => value });
+    const fetchFor = (old) => async (url) => {
+      if (String(url).includes('/api/session-toggle')) {
+        return new Promise((resolve, reject) => {
+          failOld = () => failure === 'bad_token'
+            ? resolve(reply({ ok: false, error: 'bad_token' }))
+            : reject(new Error('fixture network failure'));
+        });
+      }
+      if (String(url).endsWith('/api/session')) return reply({ ok: true, hasSession: true, enabled: !old, sessionId: 'sess_fixture' });
+      if (String(url).endsWith('/api/config')) return reply({ ok: true, config: {} });
+      return reply({ ok: false });
+    };
+    const dom = runInject({ token: 'old-toggle', fetch: fetchFor(true) });
+    dom.byId.get('zca-badge')._listeners.click[0]();
+    await new Promise(r => setImmediate(r));
+    const previous = dom.byId.get('zca-session-enabled');
+    previous.checked = true;
+    previous._listeners.change[0]({ target: { checked: true } });
+    assert.strictEqual(typeof failOld, 'function');
+    runInject({ reuse: dom, token: 'new-toggle', fetch: fetchFor(false) });
+    dom.byId.get('zca-badge')._listeners.click[0]();
+    await new Promise(r => setImmediate(r));
+    const current = dom.byId.get('zca-session-enabled');
+    assert.strictEqual(current.checked, true);
+    failOld();
+    await new Promise(r => setImmediate(r));
+    assert.strictEqual(current.checked, true, '旧请求失败不可改变新代际的会话开关');
+  });
+}
+
+test('审计：badge 被宿主重建后复用仍存在的 panel', () => {
+  const dom = runInject();
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  const panel = dom.byId.get('zca-panel');
+  dom.byId.get('zca-badge').remove();
+  dom.observers[0].cb();
+  dom.byId.get('zca-badge')._listeners.click[0]();
+  assert.strictEqual(dom.body.children.filter(e => e.id === 'zca-panel').length, 1);
+  assert.strictEqual(dom.byId.get('zca-panel'), panel);
+});
+
+function settingsDom(config, fetchModels) {
+  const dom = makeDom();
+  const html = require('../tools/companion/panel.cjs');
+  dom.body.innerHTML = html;
+  const providers = ['A', 'B'].map(id => ({ id, name: id, models: [id + '-listed'], baseURL: 'http://fixture', hasApiKey: true, eligible: true }));
+  const fetchStub = async (url) => ({ json: async () => url === '/api/config' ? { ok: true, config }
+    : url === '/api/zcode-providers' ? { ok: true, providers }
+      : url === '/api/models' ? await fetchModels() : { ok: false } });
+  const source = html.match(/<script>([\s\S]*)<\/script>/)[1]
+    .replace('  refreshStatus();\n})();', '  return {refreshStatus,fetchZcodeModels,formValues};\n})();');
+  // 执行实际页面脚本；只暴露闭包入口，不改任何生产分支。
+  dom.api = new Function('document', 'fetch', 'location', 'return ' + source.trim())(dom.document, fetchStub, { hash: '#fixture' });
+  return dom;
+}
+
+test('审计：完整面板回填不在清单中的已保存手填模型', async () => {
+  const dom = settingsDom({ zcodeProvider: 'A', model: 'custom', maxTokens: 4096 }, async () => ({ ok: false }));
+  await dom.api.refreshStatus();
+  assert.strictEqual(dom.api.formValues().model, 'custom');
+  dom.byId.get('zprovider').value = 'B'; dom.byId.get('zprovider')._listeners.change[0]();
+  assert.strictEqual(dom.api.formValues().model, 'B-listed');
+});
+
+test('审计：服务商切换后忽略旧模型响应，包括切回同一服务商', async () => {
+  let finish;
+  const dom = settingsDom({ zcodeProvider: 'A', model: 'A-listed', maxTokens: 4096 }, () => new Promise(r => { finish = r; }));
+  await dom.api.refreshStatus();
+  const pending = dom.api.fetchZcodeModels(); await new Promise(r => setImmediate(r));
+  dom.byId.get('zprovider').value = 'B'; dom.byId.get('zprovider')._listeners.change[0]();
+  dom.byId.get('zprovider').value = 'A'; dom.byId.get('zprovider')._listeners.change[0]();
+  finish({ ok: true, models: ['A-stale'] }); await pending;
+  assert.strictEqual(dom.api.formValues().model, 'A-listed');
+});
+
+ test('panel 契约：程序化赋值 select.value 不触发 change（故无需"回填"标志位）', () => {
   // 规范与实证：按 DOM 规范，**程序化**赋值 select.value 不派发 change 事件
   //（jsdom 实测：赋值 0 次、dispatchEvent 1 次）——所以 panel.cjs 的 change 处理器
   // 只会被真实用户交互触发，fillModels 的回填不会误清手填模型框。

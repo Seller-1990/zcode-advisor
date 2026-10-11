@@ -251,7 +251,7 @@ test('enqueueUserNote：超长注回文本按 maxNoteChars 码点截断', () => 
 
 test('enqueueUserNote：与 hook 侧活锁并发 → lock_timeout（互斥而非互相覆盖）', () => {
   writeState({ pendingNotes: [] });
-  fs.writeFileSync(`${STATE_FILE()}.wrlock`, '1');   // pid 1 恒存在 + mtime 新鲜 = 活锁
+  fs.writeFileSync(`${STATE_FILE()}.wrlock`, String(process.pid)); // 本进程在所有平台都存活
   try {
     const r = controller.enqueueUserNote({ action: 'ack', severity: 'nit', note: 'x' });
     assert.strictEqual(r.ok, false);
@@ -280,9 +280,11 @@ test('appendHistoryRecord：与 hooks/lib/history.js 写出的行格式一致（
   const obj = JSON.parse(line);
   assert.strictEqual(obj.event, 'user_followup');
   assert.ok(obj.ts, '必须带 ts（hooks 侧同款，面板 fmtTs 依赖它）');
-  // 文件权限：历史含意见正文，仅属主可读
-  const mode = fs.statSync(historyFile).mode & 0o777;
-  assert.strictEqual(mode, 0o600, `历史文件应为 0600，实际 ${mode.toString(8)}`);
+  // Windows 的 mode 不表示 POSIX 属主权限；其余历史内容断言仍全平台执行。
+  if (process.platform !== 'win32') {
+    const mode = fs.statSync(historyFile).mode & 0o777;
+    assert.strictEqual(mode, 0o600, `历史文件应为 0600，实际 ${mode.toString(8)}`);
+  }
 });
 
 test('appendHistoryRecord：超过 HISTORY_MAX_LINES 时裁剪到一半（面板侧是唯一写入方时不能无界增长）', () => {

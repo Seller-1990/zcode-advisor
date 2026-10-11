@@ -53,12 +53,42 @@ function appendHistory(event) {
 
 // 超过上限时裁剪到一半（按**行数**判断，不是字节——每行约 70B，500 行仅 ~35KB，
 // 若以 64KB 字节为门槛，行数上限将永远不会触发，测试已抓到该缺陷）
+//
+// 并发语义（R05）：原来是「读全量 → 整段重写同一个文件」，两者之间别的进程 append
+// 的记录会被这次重写整段覆盖——历史里凭空少记录，且没有任何错误可观测。现在改为：
+//   1) 裁剪结果先写同目录临时文件（写坏了也不动原文件）；
+//   2) 再从「裁剪前读到的字节数」偏移处，把期间被并发追加的尾巴补读并 append 到临时文件；
+//   3) rename 原子替换（与 state.js 的写盘口径一致）。
+// 残余窗口（如实披露，未声称竞态已消除）：最后一次补读与 rename 之间新追加的记录仍会丢。
 function trimIfNeeded() {
   try {
     const raw = fs.readFileSync(HISTORY_FILE, 'utf8');
     const lines = raw.split('\n').filter(Boolean);
     if (lines.length <= HISTORY_MAX_LINES) return;
-    fs.writeFileSync(HISTORY_FILE, lines.slice(-Math.floor(HISTORY_MAX_LINES / 2)).join('\n') + '\n', 'utf8');
+    const keep = lines.slice(-Math.floor(HISTORY_MAX_LINES / 2)).join('\n') + '\n';
+    const tmp = `${HISTORY_FILE}.trim-${process.pid}-${Date.now()}`;
+    try {
+      fs.writeFileSync(tmp, keep, { encoding: 'utf8', mode: 0o600 });
+      // 补读并发追加：以裁剪前读到的字节数为界，多轮循环把新尾部搬进临时文件。
+      let offset = Buffer.byteLength(raw, 'utf8');
+      for (let i = 0; i < 3; i++) {
+        const size = fs.statSync(HISTORY_FILE).size;
+        if (size <= offset) break;
+        const fd = fs.openSync(HISTORY_FILE, 'r');
+        try {
+          const buf = Buffer.alloc(size - offset);
+          const read = fs.readSync(fd, buf, 0, buf.length, offset);
+          if (read > 0) fs.appendFileSync(tmp, buf.subarray(0, read));
+          offset += read;
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
+      fs.chmodSync(tmp, 0o600);
+      fs.renameSync(tmp, HISTORY_FILE);
+    } finally {
+      try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+    }
   } catch (_) { /* 裁剪失败下次再试 */ }
 }
 

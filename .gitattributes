@@ -1,0 +1,11 @@
+# 跨平台换行策略（首次 CI 三平台真跑前补上）。
+#
+# 为什么需要：本仓的测试会**读取 shell 脚本源码做文本匹配**——例如
+# test/ocr-review-caps.test.js 解析 `# zca-caps:` 能力声明、test/ocr-review.test.js
+# 抽取 `run_with_deadline()` 函数体。Windows runner 上若按全局 core.autocrlf 把 .sh
+# 检出成 CRLF，`(.+)$` 会连 `\r` 一起捕获（能力名被解析成 `lock_cleanup\r`），
+# 于是用例静默 skip 或误判。强制 LF 检出可以消除这一整类「只在某个平台成立」的差异。
+*.sh text eol=lf
+
+# Windows 批处理保持 CRLF：LF 的 .cmd 在部分 cmd.exe 版本上 goto/label 会出错。
+*.cmd text eol=crlf

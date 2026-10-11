@@ -17,7 +17,25 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
-const SYNC = path.join(ROOT, 'tools', 'sync-plugin-dir.cjs');
+// ZCA_SYNC_TOOL：红灯用例指向修复前的快照（与 ZCA_OCR_REVIEWER / ZCA_HOOK_PATH 同惯例）。
+const SYNC = process.env.ZCA_SYNC_TOOL || path.join(ROOT, 'tools', 'sync-plugin-dir.cjs');
+
+test('sync：README 引用的 ARCHITECTURE.md 随插件副本发布', () => {
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-architecture-'));
+  const source = path.join(sandbox, 'source');
+  const dest = path.join(sandbox, 'dest');
+  fs.mkdirSync(source);
+  fs.writeFileSync(path.join(source, 'README.md'), '[Architecture](ARCHITECTURE.md)\n');
+  fs.writeFileSync(path.join(source, 'ARCHITECTURE.md'), '# Architecture fixture\n');
+  const env = { ...process.env, ZCODE_ADVISOR_SYNC_ROOT: source, ZCODE_ADVISOR_SYNC_DEST: dest };
+  try {
+    execFileSync(process.execPath, [SYNC], { encoding: 'utf8', stdio: 'pipe', env });
+    assert.strictEqual(fs.readFileSync(path.join(dest, 'ARCHITECTURE.md'), 'utf8'), '# Architecture fixture\n');
+    execFileSync(process.execPath, [SYNC, '--check'], { encoding: 'utf8', stdio: 'pipe', env });
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
+});
 
 test('plugins/zcode-advisor 与仓库根无漂移（否则宿主会装出旧代码）', () => {
   let out = '';
@@ -286,4 +304,64 @@ test('同步脚本：副本里的 __pycache__ 不被当作"残留"隔离', (t) =
   execFileSync(process.execPath, [SYNC], { encoding: 'utf8', stdio: 'pipe', env });
   const orphans = fs.readdirSync(fxDest).filter((n) => n.startsWith('.orphan-'));
   assert.strictEqual(orphans.length, 0, '__pycache__ 不该被隔离进 .orphan-*');
+});
+
+test('同步脚本：文件/目录类型冲突先隔离再写（回归：旧形态会让整轮同步崩在 EEXIST/EISDIR）', (t) => {
+  // 现场：副本里留着同名但**类型相反**的旧形态（历史上源侧是文件、后来改成目录，或反之，
+  // 例如 commands 曾经是单文件、README.md 曾经是目录结构）。旧实现直接进入复制分支：
+  // 源是目录 → mkdirSync(dest) 撞上同名文件抛 EEXIST；源是文件 → renameSync 撞上同名目录抛
+  // EISDIR/ENOTDIR（都不是 EPERM/EACCES，重试循环直接 rethrow）→ 未捕获异常崩掉整轮同步，
+  // 副本停在半同步状态，宿主装出的插件目录结构就是错的。
+  // 修法：先把类型冲突的旧形态按回收站语义隔离进 .orphan-*，再复制正确形态。
+  const fx = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-sync-type-'));
+  const fxRoot = path.join(fx, 'src');
+  const fxDest = path.join(fx, 'dest');
+  t.after(() => { try { fs.rmSync(fx, { recursive: true, force: true }); } catch (_) {} });
+
+  fs.mkdirSync(path.join(fxRoot, 'commands'), { recursive: true });
+  fs.writeFileSync(path.join(fxRoot, 'commands', 'keep.md'), 'keep\n', 'utf8');
+  fs.writeFileSync(path.join(fxRoot, 'README.md'), 'new readme\n', 'utf8');
+  fs.mkdirSync(path.join(fxRoot, 'hooks'), { recursive: true });
+  fs.writeFileSync(path.join(fxRoot, 'hooks', 'a.js'), 'new a\n', 'utf8');
+
+  fs.mkdirSync(fxDest, { recursive: true });
+  // ① 源是目录、副本是文件（顶层 ITEM 冲突）
+  fs.writeFileSync(path.join(fxDest, 'commands'), 'stale file where dir expected\n', 'utf8');
+  // ② 源是文件、副本是目录（顶层 ITEM 冲突，另一种方向）
+  fs.mkdirSync(path.join(fxDest, 'README.md'), { recursive: true });
+  fs.writeFileSync(path.join(fxDest, 'README.md', 'old.md'), 'old\n', 'utf8');
+  // ③ 嵌套冲突：源 hooks/a.js 是文件、副本 hooks/a.js 是目录
+  fs.mkdirSync(path.join(fxDest, 'hooks', 'a.js'), { recursive: true });
+  fs.writeFileSync(path.join(fxDest, 'hooks', 'a.js', 'old.md'), 'old\n', 'utf8');
+
+  const env = Object.assign({}, process.env, {
+    ZCODE_ADVISOR_SYNC_ROOT: fxRoot,
+    ZCODE_ADVISOR_SYNC_DEST: fxDest
+  });
+  const run = (args) => {
+    try {
+      return { code: 0, out: execFileSync(process.execPath, [SYNC, ...args], { encoding: 'utf8', stdio: 'pipe', env }) };
+    } catch (err) {
+      return { code: err.status, out: String(err.stdout || '') + String(err.stderr || '') };
+    }
+  };
+
+  const synced = run([]);
+  assert.strictEqual(synced.code, 0, `类型冲突不该让同步崩掉：\n${synced.out}`);
+  assert.ok(fs.statSync(path.join(fxDest, 'commands')).isDirectory(), 'ITEM 目录应就位');
+  assert.strictEqual(fs.readFileSync(path.join(fxDest, 'commands', 'keep.md'), 'utf8'), 'keep\n');
+  assert.ok(fs.statSync(path.join(fxDest, 'README.md')).isFile(), 'README.md 应是文件');
+  assert.strictEqual(fs.readFileSync(path.join(fxDest, 'README.md'), 'utf8'), 'new readme\n');
+  assert.ok(fs.statSync(path.join(fxDest, 'hooks', 'a.js')).isFile(), '嵌套的 a.js 应是文件');
+  assert.strictEqual(fs.readFileSync(path.join(fxDest, 'hooks', 'a.js'), 'utf8'), 'new a\n');
+  assert.strictEqual(run(['--check']).code, 0, '同步后应无漂移');
+
+  // 旧形态必须按回收站语义留档（不是直接删）
+  const orphans = fs.readdirSync(fxDest).filter((n) => n.startsWith('.orphan-'));
+  assert.strictEqual(orphans.length, 1, '应恰好产生一个隔离目录');
+  const bin = path.join(fxDest, orphans[0]);
+  assert.strictEqual(fs.readFileSync(path.join(bin, 'commands'), 'utf8'), 'stale file where dir expected\n',
+    '被替换掉的文件形态应可在隔离目录里回捞');
+  assert.ok(fs.existsSync(path.join(bin, 'README.md', 'old.md')), '被替换掉的目录形态应可在隔离目录里回捞');
+  assert.ok(fs.existsSync(path.join(bin, 'hooks', 'a.js', 'old.md')), '嵌套冲突的旧目录应可在隔离目录里回捞');
 });

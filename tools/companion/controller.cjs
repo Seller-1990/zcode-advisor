@@ -266,7 +266,10 @@ const maskKey = (k) => { const s = String(k || ''); return s.length <= 8 ? '****
 // 三处加固（范式抄自 auto-enable.cjs 的单飞锁，那边是仓库里唯一正确的实现）：
 //   ① TTL：持锁超过 LOCK_TTL_MS 视为陈旧，允许接管（防 pid 复用永久阻塞）；
 //   ② 心跳：持锁者周期刷新 started，证明「我还活着且在干活」——僵尸不再能续租；
-//   ③ 原子接管：写唯一 tmp → rename → 回读确认是自己，避免两个实例同时持锁。
+//   ③ 原子创建：写唯一 tmp → link 到锁路径（已存在则 EEXIST，绝不覆盖）。
+//      注意不能用 rename：rename 会静默覆盖目标，于是并发启动时
+//      「读不到锁 → rename → 回读=自己」两台机器都能通过，双双持锁。
+//      link 在目标已存在时不覆盖，天然是「只有一个赢家」的排他创建。
 const LOCK_TTL_MS = 60 * 1000;        // 1 分钟：心跳每 20s 一次，三拍不跳即判心跳死亡
 const LOCK_HEARTBEAT_MS = 20 * 1000;
 // 僵尸宽限：进程活着、心跳正常，但**长时间没有 CDP 可用** → 判为僵尸租约，允许接管。
@@ -324,6 +327,39 @@ function writeLock(lockFile, cdpPort) {
   return readLockInfo(lockFile).pid === process.pid;
 }
 
+// 排他创建（只管「从无到有」这一件事，不覆盖已有锁）：
+// 写唯一 tmp → link 到锁路径。link 在目标已存在时报 EEXIST，因此
+// 并发创建时只有一个进程成功；其余进程拿到 false 后重读锁状态即可。
+// 不支持硬链接的文件系统（少数网络盘 / 特殊挂载）退回 O_EXCL 写入，同样是排他语义。
+function createLockExclusive(lockFile, cdpPort) {
+  const now = Date.now();
+  const body = `pid=${process.pid}\nstarted=${now}\ncdp=${cdpPort || 0}\ncdpSince=${now}\n`;
+  const tmp = `${lockFile}.tmp-${process.pid}-${now}`;
+  fs.writeFileSync(tmp, body, 'utf8');
+  try {
+    fs.linkSync(tmp, lockFile);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'EEXIST') return false;
+    try {
+      const fd = fs.openSync(lockFile, 'wx');
+      try {
+        fs.writeSync(fd, body);
+      } finally {
+        fs.closeSync(fd);
+      }
+      return true;
+    } catch (err2) {
+      if (err2 && err2.code === 'EEXIST') return false;
+      throw err2;
+    }
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_) {}
+  }
+}
+
 let lockHeartbeat = null;
 // 持锁者心跳：续租（刷新 started）并把当前 CDP 端口写进租约——证明服务确实可用。
 function startLockHeartbeat(cdpPortRef) {
@@ -338,31 +374,122 @@ function startLockHeartbeat(cdpPortRef) {
   if (lockHeartbeat.unref) lockHeartbeat.unref();
 }
 
+// 接管闸门（R22）：把「判定陈旧 → 移走旧租约 → 建新锁」整段变成跨进程串行临界区。
+// 没有它时这段是「读 → rename → link/unlink」三步，而 rename 是无条件替换目标：B 读到
+// 的是陈旧租约，但 A 可能在 B rename 之前就接管并写下**新鲜**租约，于是 B 把 A 的活锁
+// 搬进了隔离文件；B 的「放回原位」在 LOCK 已被第三方重建时只会拿到 EEXIST（被 catch
+// 吞掉，同一 try 里的 unlink 也不执行）→ 孤儿租约永久留在磁盘，A 仍自认持锁而锁路径
+// 已空 → 下一个进程排他创建成功，两个实例同时持锁（实测：12 路并发接管空载 12 轮内
+// 复现 3 轮双持锁）。闸门本身是「排他创建的短租约文件」：活不过 5s 就当崩溃残留清掉，
+// 抢不到就重读一轮，最终 fail-closed 退出。
+const STEAL_GUARD_FILE = `${LOCK_FILE}.steal`;
+const STEAL_GUARD_STALE_MS = 5000;
+
+function acquireStealGuard() {
+  const myPid = String(process.pid);
+  for (let i = 0; i < 60; i++) {
+    try {
+      fs.writeFileSync(STEAL_GUARD_FILE, myPid, { flag: 'wx' });
+      return true;
+    } catch (e) {
+      if (!e || e.code !== 'EEXIST') return false; // 目录不可写等：不假装拿到闸门
+      try {
+        const st = fs.statSync(STEAL_GUARD_FILE);
+        if (Date.now() - st.mtimeMs > STEAL_GUARD_STALE_MS) {
+          try {
+            fs.unlinkSync(STEAL_GUARD_FILE);
+          } catch (_) {}
+        }
+      } catch (_) {}
+      sleepSync(20);
+    }
+  }
+  return false;
+}
+
+function releaseStealGuard() {
+  try {
+    if (fs.readFileSync(STEAL_GUARD_FILE, 'utf8').trim() === String(process.pid)) fs.unlinkSync(STEAL_GUARD_FILE);
+  } catch (_) {}
+}
+
 function acquireLock() {
-  const cur = readLockInfo(LOCK_FILE);
-  if (cur.pid && cur.pid !== process.pid) {
-    if (!isStale(cur)) {
+  // 最多 3 轮：每轮「（闸门外）前置判断 →（闸门内）重读并决定 → 排他创建」。
+  // EEXIST 只说明对手比我们快，重读一轮就能看到它刚写下的新鲜租约。
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cur = readLockInfo(LOCK_FILE);
+    if (cur.pid === process.pid) {
+      // 重入：锁已经是自己的，只续租不重建。
+      try {
+        writeLock(LOCK_FILE, cur.cdp || 0);
+      } catch (_) {}
+      return true;
+    }
+    if (cur.pid && !isStale(cur)) {
+      // 无副作用的前置判断：活着的主人明确拒绝，不必进闸门。
       log(`已有 companion 实例在运行（pid ${cur.pid}），本实例退出`);
       return false;
     }
-    log(`检测到陈旧的 companion 锁（pid ${cur.pid}：心跳超时 / 进程不存在 / 长期无 CDP）——接管`);
-  }
-  try {
-    if (!writeLock(LOCK_FILE, 0)) {
-      log('锁竞争失败（已被其他实例接管），本实例退出');
-      return false;
-    }
-  } catch (e) {
-    // 写锁失败不应致命（如 tmpdir 只读）：记录后继续，行为退化为旧版（无锁保护）
-    log(`写单实例锁失败（${String(e).slice(0, 80)}）——继续启动，但可能多实例`);
-    return true;
-  }
-  process.on('exit', () => {
+    if (!acquireStealGuard()) continue; // 闸门本身抢不到 → 重读一轮
+    let won = false;
     try {
-      if (readLockInfo(LOCK_FILE).pid === process.pid) fs.unlinkSync(LOCK_FILE);
-    } catch (_) {}
-  });
-  return true;
+      // 闸门内重读：所有对 LOCK 的判定与改写都在这里串行化。
+      const now = readLockInfo(LOCK_FILE);
+      if (now.pid === process.pid) {
+        try {
+          writeLock(LOCK_FILE, now.cdp || 0);
+        } catch (_) {}
+        won = true;
+      } else if (now.pid && !isStale(now)) {
+        won = false; // 等闸门期间主人又活了（心跳回来）→ 让给它
+      } else if (!now.pid) {
+        won = createLockExclusive(LOCK_FILE, 0);
+      } else {
+        log(`检测到陈旧的 companion 锁（pid ${now.pid}：心跳超时 / 进程不存在 / 长期无 CDP）——接管`);
+        // 移走而不是直接删：rename 是原子替换，闸门保证这期间没有第三方改写 LOCK，
+        // 因此隔离出来的必然就是刚才那把陈旧锁；仍核对一次内容，不符就放回，宁可放弃
+        // 也不留孤儿租约（放回用 link 而非 rename，绝不覆盖别人刚建的新锁）。
+        const quarantine = `${LOCK_FILE}.stale-${process.pid}-${Date.now()}`;
+        try {
+          fs.renameSync(LOCK_FILE, quarantine);
+        } catch (e) {
+          if (!e || e.code !== 'ENOENT') throw e; // ENOENT：这期间它已消失 → 直接创建
+        }
+        const moved = readLockInfo(quarantine);
+        if (moved.pid && moved.pid !== now.pid) {
+          try {
+            fs.linkSync(quarantine, LOCK_FILE);
+            fs.unlinkSync(quarantine);
+          } catch (e) {
+            log(`隔离出的租约放不回原位（${String(e).slice(0, 80)}）——留档 ${path.basename(quarantine)}，本次不接管`);
+          }
+        } else {
+          try {
+            fs.unlinkSync(quarantine);
+          } catch (_) {}
+        }
+        // 移走的那把确实是刚读到的陈旧锁 → 允许创建；否则说明有别的东西在写 LOCK
+        const safeToCreate = !moved.pid || moved.pid === now.pid;
+        won = safeToCreate ? createLockExclusive(LOCK_FILE, 0) : false;
+      }
+    } catch (e) {
+      // 写锁失败不应致命（如 tmpdir 只读）：记录后继续，行为退化为旧版（无锁保护）
+      log(`写单实例锁失败（${String(e).slice(0, 80)}）——继续启动，但可能多实例`);
+      return true;
+    } finally {
+      releaseStealGuard();
+    }
+    if (won) {
+      process.on('exit', () => {
+        try {
+          if (readLockInfo(LOCK_FILE).pid === process.pid) fs.unlinkSync(LOCK_FILE);
+        } catch (_) {}
+      });
+      return true;
+    }
+  }
+  log('锁竞争失败（已被其他实例接管），本实例退出');
+  return false;
 }
 
 // —— 外挂自身配置（zcodePath 等）——
@@ -777,7 +904,17 @@ function saveUserConfig(patch) {
   // 抢锁前先建目录：wx 建锁需要父目录存在（否则 ENOENT 被误判为永久性失败立即放弃）。
   fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true, mode: 0o700 });
   const outcome = withConfigLock(USER_CONFIG, () => {
-    const merged = Object.assign({}, readUserConfig(), allowed);
+    let existing;
+    try {
+      existing = JSON.parse(fs.readFileSync(USER_CONFIG, 'utf8'));
+    } catch (err) {
+      if (err && err.code === 'ENOENT') existing = {};
+      else return { error: '配置文件已损坏或不可读，拒绝覆盖；请检查 ' + USER_CONFIG };
+    }
+    if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
+      return { error: '配置文件必须是 JSON 对象，拒绝覆盖；请检查 ' + USER_CONFIG };
+    }
+    const merged = Object.assign({}, existing, allowed);
     // 配置文件可能残留旧版手动 key/端点：写入时一并清掉，避免「手动 key 发往服务商端点」
     // 的密钥交叉面（0.2.17 起端点/key 只来自 ZCode 服务商，插件配置不参与解析）。
     // ⚠️ 这是**有意的破坏性迁移**：升级用户的 key 会从这里消失。必须留日志痕迹，
@@ -910,9 +1047,8 @@ function readZcodeProviders() {
       source: 'config'
     });
   }
-  // 合并第二个源。⚠️ 两源有 ID 重叠（实测 4 个）：端点/key 实测相同，
-  // 但 provider_config 的模型清单更全 → 重叠项**补全模型**（并集），不整体替换，
-  // 以免丢掉 config.json 侧的 official/source 标记与既有顺序。
+  // 模型清单取并集；端点、凭据与协议只能来自同一个完整可用源。
+  // config 完整时优先，否则整个连接元组切换到 provider_config，绝不逐字段拼 key。
   const byId = new Map(out.map((p) => [p.id, p]));
   for (const p of readProviderConfigRules()) {
     const exist = byId.get(p.id);
@@ -920,8 +1056,10 @@ function readZcodeProviders() {
       const merged = exist.models.slice();
       for (const m of p.models) if (!merged.includes(m)) merged.push(m);
       exist.models = merged;
-      if (!exist.baseURL && p.baseURL) exist.baseURL = p.baseURL;
-      if (!exist.apiKey && p.apiKey) exist.apiKey = p.apiKey;
+      if (!(exist.eligible && exist.baseURL && exist.apiKey) && p.eligible && p.baseURL && p.apiKey) {
+        Object.assign(exist, { baseURL: p.baseURL, apiKey: p.apiKey, kind: p.kind,
+          protocol: p.protocol, eligible: p.eligible, source: p.source });
+      }
       continue;
     }
     byId.set(p.id, p);
@@ -1500,11 +1638,8 @@ async function fetchModels(body) {
         ? { 'x-api-key': t.apiKey, 'anthropic-version': ANTHROPIC_VERSION }
         : { Authorization: `Bearer ${t.apiKey}` };
       r = await fetch(url, { headers: hdrs, signal: ctl.signal });
-    } finally {
-      clearTimeout(timer);
-    }
-    try {
       if (!r.ok) {
+        if (r.body) await r.body.cancel();
         const hint = r.status === 401 || r.status === 403 ? '服务商 key 无效' : '该端点可能不提供 /models';
         return { ok: false, error: `http_${r.status}`, hint };
       }
@@ -1512,8 +1647,10 @@ async function fetchModels(body) {
       if (!parsed.ok && parsed.error === 'unexpected_envelope') parsed.hint = '响应信封无法识别';
       return parsed;
     } catch (err) {
-      const aborted = err && (err.name === 'AbortError' || String(err).includes('abort'));
-      return { ok: false, error: aborted ? 'models_timeout' : 'models_error', hint: '拉取失败：' + (err && err.message || err).slice(0, 80) };
+      const aborted = ctl.signal.aborted || (err && (err.name === 'AbortError' || String(err).includes('abort')));
+      return { ok: false, error: aborted ? 'models_timeout' : 'models_error', hint: '拉取失败：' + String(err && err.message || err).slice(0, 80) };
+    } finally {
+      clearTimeout(timer);
     }
   }
   // 登记清单：当前选中项排前（多模型服务商不再只剩一项）
@@ -1541,10 +1678,21 @@ function startApi(cdpPort, apiPort, token) {
     // 防止本机其他网页（无令牌）驱动本接口改写配置。
     if ((req.headers['x-advisor-token'] || '') !== token) return done(403, { ok: false, error: 'bad_token' });
 
-    const readBody = () => new Promise((resolve) => {
+    const readBody = () => new Promise((resolve, reject) => {
       let b = '';
+      const invalid = (message) => reject(Object.assign(new Error(message), { statusCode: 400 }));
       req.on('data', (c) => { b += c; if (b.length > 1e6) req.destroy(); });
-      req.on('end', () => { try { resolve(JSON.parse(b || '{}')); } catch (_) { resolve({}); } });
+      req.on('aborted', () => invalid('请求已中断'));
+      req.on('error', reject);
+      req.on('end', () => {
+        let body;
+        try { body = JSON.parse(b || '{}'); }
+        catch (_) { invalid('请求体不是合法 JSON'); return; }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          invalid('请求体必须是 JSON 对象'); return;
+        }
+        resolve(body);
+      });
     });
 
     try {
@@ -1580,6 +1728,7 @@ function startApi(cdpPort, apiPort, token) {
       if (req.method === 'POST' && req.url === '/api/config') {
         const body = await readBody();
         const r = saveUserConfig(body);
+        if (r && r.error) return done(400, { ok: false, error: r.error });
         // 锁超时必须以失败态呈现：保存不会「下次再补」，静默 ok:true 会让用户以为存上了。
         if (r && r.lockTimeout) {
           return done(503, { ok: false, error: '配置文件正被其他进程写入，请等几秒重试；若持续出现，删除 ~/.zcode/advisor.config.json.lock 后再试' });
@@ -1647,7 +1796,7 @@ function startApi(cdpPort, apiPort, token) {
       }
       return done(404, { ok: false, error: 'not_found' });
     } catch (err) {
-      return done(500, { ok: false, error: String(err).slice(0, 200) });
+      return done(err && err.statusCode === 400 ? 400 : 500, { ok: false, error: String(err).slice(0, 200) });
     }
   });
   server.on('error', (err) => {

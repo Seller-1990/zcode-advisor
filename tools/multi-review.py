@@ -60,30 +60,47 @@ def pick_slot3(chain_path, taken):
     return None
 
 
-def run_one(slot_no, provider, model, frm, to, outfile):
-    """跑一个槽位；完整输出与 returncode 都留着，供主流程判定。"""
+def run_one(slot_no, provider, model, frm, to, outfile, timeout=900):
+    """跑一个槽位；失败也返回结构化结果，不丢失其它槽位的意见。"""
     cmd = ['ocr', 'review', '--from', frm, '--to', to, '--format', 'json',
            '--output', outfile, '--provider', provider, '--model', model]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    data = None
+    result = {
+        'slot': slot_no, 'provider': provider, 'model': model,
+        'exit': None, 'status': 'no-output', 'comments': [],
+        'coverage_ok': False, 'stderr_tail': '',
+    }
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding='utf8',
+                              errors='replace', timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr or ''
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode('utf8', errors='replace')
+        result.update(exit=124, status='timeout', stderr_tail=stderr[-400:])
+        return result
+    except OSError as exc:
+        result.update(exit=127, status='error', stderr_tail=str(exc)[-400:])
+        return result
+    result.update(exit=proc.returncode, stderr_tail=(proc.stderr or '')[-400:])
     try:
         with open(outfile, encoding='utf8') as fh:
             data = json.load(fh)
-    except Exception:
-        data = None
-    status = (data or {}).get('status') or 'no-output'
-    comments = (data or {}).get('comments') or []
-    return {
-        'slot': slot_no,
-        'provider': provider,
-        'model': model,
-        'exit': proc.returncode,
-        'status': status,
-        'comments': comments,
-        # partial/failed 必须让下游看得见：它的"没意见"不等于"没问题"
-        'coverage_ok': status == 'complete',
-        'stderr_tail': (proc.stderr or '')[-400:],
-    }
+    except (OSError, ValueError):
+        return result
+    # 外部 JSON 不能直接进入 merge：它会调用 comment.get/content.lower，并排序行号。
+    comments = data.get('comments') if isinstance(data, dict) else None
+    if (not isinstance(data, dict) or not isinstance(data.get('status'), str)
+            or not isinstance(comments, list)
+            or any(not isinstance(c, dict)
+                   or (c.get('content') is not None and not isinstance(c['content'], str))
+                   or (c.get('start_line') is not None and type(c['start_line']) is not int)
+                   for c in comments)):
+        result['status'] = 'invalid-output'
+        return result
+    result.update(status=data['status'], comments=comments,
+                  # partial/failed 的沉默不是“没问题”，非零退出也不能被 JSON 伪装成成功。
+                  coverage_ok=proc.returncode == 0 and data['status'] == 'complete')
+    return result
 
 
 def norm(s):

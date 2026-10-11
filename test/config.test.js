@@ -23,6 +23,15 @@ function hermeticEnv(extra) {
   }, extra);
 }
 
+test('core regression: maxTokens 数字字符串保持专用守卫契约', (t) => {
+  const root = tmpRoot();
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'advisor.config.json'), JSON.stringify({ maxTokens: '8192' }));
+  const cfg = loadConfig(root, hermeticEnv());
+  assert.strictEqual(cfg.maxTokens, 8192);
+  assert.ok(!cfg.problems.some((p) => p.includes('maxTokens')));
+});
+
 test('无配置文件时返回内置默认值', () => {
   const cfg = loadConfig(tmpRoot(), hermeticEnv());
   // 0.2.17：model 不再是硬编码默认（glm-5.3-flash）——留空表示「取所选服务商清单首项」。
@@ -451,4 +460,65 @@ test('readZcodeProviders：provider_config.json 缺失/损坏时只返回 config
     ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(dir, 'does-not-exist.json')
   });
   assert.strictEqual(list.length, 1, '第二个源不可用时应正常降级，不抛错、不挂空条目');
+});
+
+function providerPairFixture(t, primary, secondary) {
+  const dir = tmpRoot();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const config = path.join(dir, 'config.json');
+  const rules = path.join(dir, 'provider_config.json');
+  if (primary !== null) fs.writeFileSync(config, typeof primary === 'string' ? primary : JSON.stringify({ provider: { p: primary } }));
+  fs.writeFileSync(rules, JSON.stringify({ config: { providerConfigRules: { providerRules: [
+    { providerId: 'p', providerName: '第二来源', config: {
+      api: { type: secondary.kind, baseUrl: secondary.baseURL },
+      access: { apiKey: secondary.apiKey }, personalModelIds: ['second-model']
+    } }
+  ] } } }));
+  return hermeticEnv({ ZCODE_ADVISOR_ZCODE_CONFIG: config, ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: rules });
+}
+
+for (const missing of [null, '{invalid json']) {
+  test(`core regression: provider_config 独立可读（primary=${missing}）`, (t) => {
+    const env = providerPairFixture(t, missing, { kind: 'anthropic-messages', baseURL: 'https://second.invalid', apiKey: 'sk-second-abc' });
+    const { readZcodeProviders } = require('../hooks/lib/config');
+    const providers = readZcodeProviders(env);
+    assert.strictEqual(providers.length, 1);
+    assert.strictEqual(providers[0].protocol, 'anthropic');
+  });
+}
+
+test('core regression: 不完整主来源必须整体切换第二来源的凭据与协议', (t) => {
+  const env = providerPairFixture(t,
+    { kind: 'openai', options: { baseURL: 'https://first.invalid/v1' }, models: { first: {} } },
+    { kind: 'anthropic-messages', baseURL: 'https://second.invalid', apiKey: 'sk-second-abc' });
+  const { readZcodeProviders } = require('../hooks/lib/config');
+  const p = readZcodeProviders(env)[0];
+  assert.strictEqual(p.baseURL, 'https://second.invalid');
+  assert.strictEqual(p.apiKey, 'sk-second-abc');
+  assert.strictEqual(p.kind, 'anthropic-messages');
+  assert.strictEqual(p.protocol, 'anthropic');
+  assert.strictEqual(p.source, 'provider_config');
+  assert.deepStrictEqual(p.models, ['first', 'second-model']);
+});
+
+test('core regression: 两个不完整来源不得拼成完整凭据元组', (t) => {
+  const env = providerPairFixture(t,
+    { kind: 'openai', options: { baseURL: 'https://first.invalid/v1' } },
+    { kind: 'openai-chat-completions', baseURL: '', apiKey: 'sk-second-abc' });
+  const { readZcodeProviders, resolveProviderTarget } = require('../hooks/lib/config');
+  const providers = readZcodeProviders(env);
+  assert.strictEqual(providers[0].apiKey, '');
+  assert.strictEqual(resolveProviderTarget(providers, 'p', 'm').ok, false);
+});
+
+test('core regression: 已完整主来源保留自己的端点密钥协议', (t) => {
+  const env = providerPairFixture(t,
+    { kind: 'openai', options: { baseURL: 'https://first.invalid/v1', apiKey: 'sk-first-abc' } },
+    { kind: 'anthropic-messages', baseURL: 'https://second.invalid', apiKey: 'sk-second-abc' });
+  const { readZcodeProviders } = require('../hooks/lib/config');
+  const p = readZcodeProviders(env)[0];
+  assert.strictEqual(p.baseURL, 'https://first.invalid/v1');
+  assert.strictEqual(p.apiKey, 'sk-first-abc');
+  assert.strictEqual(p.protocol, 'openai');
+  assert.strictEqual(p.source, 'config');
 });

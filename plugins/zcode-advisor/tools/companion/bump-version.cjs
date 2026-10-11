@@ -24,7 +24,12 @@
 const fs = require('fs');
 const path = require('path');
 
-const ROOT = path.resolve(__dirname, '..', '..');
+// ROOT 支持 env 覆盖：测试需要造一份「四处 manifest 里有一份不可替换」的完整 fixture 树，
+// 才能真正触发「整体校验 → 统一写入 / 回滚」分支（在真实仓库里改坏 manifest 会污染仓库）。
+// 与本仓库其他可覆盖项（ZCODE_ADVISOR_SYNC_ROOT / ZCODE_ADVISOR_USER_CONFIG）同一惯例。
+const ROOT = process.env.ZCODE_ADVISOR_BUMP_ROOT
+  ? path.resolve(process.env.ZCODE_ADVISOR_BUMP_ROOT)
+  : path.resolve(__dirname, '..', '..');
 const CANON = path.join(ROOT, '.zcode-plugin', 'plugin.json');   // 构建期 VERSION 的唯一来源
 const FILES = [
   '.zcode-plugin/plugin.json',
@@ -67,7 +72,11 @@ function nextVersion(cur, kind) {
 
 // 就地替换 version 字段，保留其余内容的格式（缩进/键序）与末尾换行。
 // 不用 JSON.parse→stringify 往返：那会重排/重格式化整个文件，diff 噪音淹没真实改动。
-function writeVersion(rel, version) {
+//
+// 只渲染、**不落盘**：调用方先把四处都渲染成功，再统一写入。旧实现在循环里边渲染边写，
+// 第二份 manifest 缺 version 字段（或不可替换）时前两份已经改成新值、后两份还是旧值——
+// 正是本脚本要消灭的「两个版本号并存」状态（宿主据此判断要不要重装，新代码永久进不了 cache）。
+function renderVersion(rel, version) {
   const p = path.join(ROOT, rel);
   const src = fs.readFileSync(p, 'utf8');
   // 只替换**第一处** "version"（这几份文件里 version 都在顶部且唯一）
@@ -75,7 +84,27 @@ function writeVersion(rel, version) {
   if (out === src && readVersion(rel) !== version) {
     throw new Error(`${rel} 中未找到可替换的 version 字段`);
   }
-  fs.writeFileSync(p, out, 'utf8');
+  return { rel, p, before: src, after: out };
+}
+
+// 统一写入；中途失败则把已写的文件回滚到写入前的内容（「全有或全无」）。
+// 返回 null 表示成功，否则返回失败信息供调用方报出并退非零。
+function applyVersions(rendered) {
+  const done = [];
+  try {
+    for (const r of rendered) {
+      fs.writeFileSync(r.p, r.after, 'utf8');
+      done.push(r);
+    }
+    return null;
+  } catch (err) {
+    const rollbackFailed = [];
+    for (const r of done.reverse()) {
+      try { fs.writeFileSync(r.p, r.before, 'utf8'); }
+      catch (err2) { rollbackFailed.push(`${r.rel}（${(err2 && err2.code) || err2}）`); }
+    }
+    return { err, rollbackFailed };
+  }
 }
 
 function main() {
@@ -93,7 +122,27 @@ function main() {
     return 1;
   }
 
-  for (const f of FILES) writeVersion(f, target);
+  let rendered;
+  try {
+    rendered = FILES.map((f) => renderVersion(f, target));
+  } catch (err) {
+    process.stderr.write(`[bump-version] ✗ 未写入任何文件：${(err && err.message) || err}\n`);
+    process.stderr.write('  四处版本号必须同源，因此先整体校验、再统一写入（半途失败会留下两种版本号）\n');
+    return 1;
+  }
+
+  const failure = applyVersions(rendered);
+  if (failure) {
+    process.stderr.write(`[bump-version] ✗ 写入失败：${(failure.err && failure.err.message) || failure.err}\n`);
+    if (failure.rollbackFailed.length > 0) {
+      process.stderr.write(`[bump-version] ✗ ${failure.rollbackFailed.length} 个文件回滚失败，版本号可能不一致，请手工核对：\n`);
+      for (const f of failure.rollbackFailed) process.stderr.write(`  - ${f}\n`);
+    } else {
+      process.stderr.write('[bump-version] 已回滚到写入前的版本号，四处仍保持一致\n');
+    }
+    return 1;
+  }
+
   const rc = check();
   if (rc !== 0) return rc;
   process.stdout.write(`[bump-version] ${cur} → ${target}（四处已同步）\n`);

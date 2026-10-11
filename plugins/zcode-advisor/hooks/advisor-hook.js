@@ -18,6 +18,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const { randomUUID } = require('crypto');
 const { spawn } = require('child_process');
 const {
   loadConfig, resolveApiKey, gate, configWarnings, userConfigPath, maskKey, isPlaceholderKey,
@@ -25,7 +26,7 @@ const {
 } = require('./lib/config');
 const {
   ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, bumpPrimaryFailStreak, loadState, mutateStateExclusive,
-  createLock, clearLock, clearLockIfOwner, lockPathFor, countLocks, sanitizeSessionId
+  clearLock, clearLockIfOwner, lockPathFor, sanitizeSessionId, admitGlobalWorker
 } = require('./lib/state');
 const {
   readDelta, renderDelta
@@ -137,7 +138,10 @@ function resolveTarget(cfg, state, env) {
   const modelWant = sessionModel || String(cfg.model || '').trim();
 
   // 1) 服务商解析（端点/key/模型一次定稿）
-  const t = resolveProviderTarget(readZcodeProviders(e), providerWant, modelWant);
+  const providers = readZcodeProviders(e);
+  const t = resolveProviderTarget(providers, providerWant, modelWant);
+  const globalTarget = sessionProvider || sessionModel
+    ? resolveProviderTarget(providers, String(cfg.zcodeProvider || '').trim(), String(cfg.model || '').trim()) : t;
   const out = {
     baseUrl: t.ok ? t.baseUrl : '',
     apiKey: t.ok ? t.apiKey : '',
@@ -147,6 +151,7 @@ function resolveTarget(cfg, state, env) {
     protocol: t.ok ? (t.protocol || 'openai') : '',
     keySource: t.ok ? 'config' : '',
     providerId: t.ok ? t.provider.id : '',
+    globalProviderId: globalTarget.ok ? globalTarget.provider.id : '',
     providerName: t.ok ? (t.provider.name || t.provider.id) : '',
     providerSource: sessionProvider ? 'session-override' : (t.ok && t.auto ? 'auto' : 'global'),
     modelSource: sessionModel ? 'session-override' : 'global',
@@ -310,9 +315,10 @@ function fallbackEligibility(cfg, state, eff) {
   // sessionProvider 可以是 id 或名称（面板/命令都容忍写名称），而 cfg.providerId 恒为 id——
   // 因此不能只比 id。用 eff.providerId（会话生效值解析出的真实 id）与全局 id 比较。
   const sessProvider = String((state && state.sessionProvider) || '').trim();
-  if (sessProvider) {
-    const sessResolved = String((eff && eff.providerId) || '').trim();
-    const globalProvider = String((cfg && cfg.providerId) || '').trim();
+  const sessResolved = String((eff && eff.providerId) || '').trim();
+  const globalProvider = String((eff && eff.globalProviderId != null ? eff.globalProviderId : (cfg && cfg.providerId)) || '').trim();
+  // 只改模型也可能自动选到另一个 provider；同一 env 通道的两个空 ID 不算切换。
+  if (sessProvider || sessResolved !== globalProvider) {
     // 会话解析不出（无效服务商）→ 保守跳过。
     // 会话解析出了 + 全局也解析出了 → 只有真的不同才跳过。
     // 会话解析出了但**全局没解析出**（全局未配/解析失败）→ 这也是"换了服务商"
@@ -361,11 +367,28 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
     timeoutMs: cfg.reviewTimeoutMs
   };
 
+  // usage 累加（R06）：Token 计数必须覆盖本轮的**每一次物理调用**，而不是只留最后一次。
+  // 漏计场景（冻结报告 R06）：runAttempt 内的空响应重试、以及主模型失败后改走备用模型
+  // 时 `attempt = fbAttempt` 把主模型那次**已消耗**的 usage 整段丢掉 → 累计值系统性偏低。
+  const usageTotals = { promptTokens: 0, completionTokens: 0 };
+  let usageSeen = false;
+  const addUsage = (res) => {
+    const u = res && res.usage;
+    if (!u) return;
+    usageSeen = true;
+    usageTotals.promptTokens += Number(u.promptTokens) || 0;
+    usageTotals.completionTokens += Number(u.completionTokens) || 0;
+  };
+  // 一次都没拿到 usage 才返回 undefined（不凭空造 0/0）；拿到过就返回累加值，
+  // 哪怕累加结果是 {0,0}——不能因为「总和为 0」就退回取最后一次调用的 usage。
+  const totalUsage = () => (usageSeen ? usageTotals : undefined);
+
   // 单次尝试的收尾器：跑首调 + 最多 2 次空响应重试（全共享传入 deadline，不重新起算），
   // **并把「解析成帧」纳入结果**——unparsed 是白名单触发原因之一，只有在解析后才知道，
   // 所以判定与降级决策必须在同一次尝试的结果上做，不能先看 res.error 再解析。
   const runAttempt = async (deadline, model, temperature) => {
     let res = await call(Object.assign({}, baseParams, { model, deadline, temperature }));
+    addUsage(res);
     for (let attempt = 0; attempt < 2 && res.error === 'llm_empty_response'; attempt++) {
       if (deadline - Date.now() < 10000) break; // 剩余预算不足一次重试：放弃
       const carry = res.reasoningText
@@ -374,6 +397,7 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
       res = await call(Object.assign({}, baseParams, {
         model, deadline, temperature: 0, userContent: `${userContent}${carry}`
       }));
+      addUsage(res);
     }
     if (res.error) return { res, error: res.error, frame: null };
     const frame = parseFrame(res.text, cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
@@ -421,7 +445,7 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
   }
 
   const meta = { model: usedFallback ? fallbackModel : target.model, ms: Date.now() - t0, requestId: hashId(userContent) };
-  const usage = attempt.res && attempt.res.usage;
+  const usage = totalUsage();
   if (attempt.error) {
     logReview(cfg, Object.assign({ kind: attempt.error === 'unparsed' ? 'unparsed' : 'error', error: attempt.error, hint: remainingHint || '' }, meta));
     return {
@@ -515,6 +539,7 @@ function onUserPromptSubmit(ctx) {
   let deliver = '';
   let deliveredNoteCount = 0;
   let deliveredNotes = [];   // 本次送达的意见正文（写进 delivered 事件，供面板回看内容）
+  let deliveryToken = '';
   mutateStateExclusive(file, (s) => {
     s.consecutiveSteers = 0;
     s.lastActivity = new Date().toISOString();
@@ -531,6 +556,8 @@ function onUserPromptSubmit(ctx) {
       // 记录正文的原因：delivered 事件此前只有 count，面板只能显示"已送达 N 条"，
       // 用户无法回看顾问到底说了什么——正是 issue #102 要解决的"看不见意见"。
       deliveredNotes = s.pendingNotes.slice(0, deliveredNoteCount).map((n) => String(n));
+      deliveryToken = randomUUID();
+      s.pendingNotesDeliveryToken = deliveryToken;
     }
     if (s.pendingRegistration) {
       parts.push(controlLines(cfg, stateDir, file, s).join('\n'));
@@ -611,10 +638,13 @@ function onUserPromptSubmit(ctx) {
     sessionId,
     mode: 'async'
   });
-  // 只清除自己已投递的前 deliveredNoteCount 条——临界区间隙里 worker 新入队的意见不受影响。
+  // 后来的 UPS 会更换令牌；只允许仍拥有本次快照的投递者清理，避免同正文 ABA。
+  // 不匹配时宁可下轮重复投递，不能按旧数量吞掉别人的新意见。
   mutateStateExclusive(file, (s) => {
-    if (deliveredNoteCount > 0 && Array.isArray(s.pendingNotes)) {
+    if (deliveredNoteCount > 0 && s.pendingNotesDeliveryToken === deliveryToken && Array.isArray(s.pendingNotes)
+        && deliveredNotes.every((note, i) => String(s.pendingNotes[i]) === note)) {
       s.pendingNotes = s.pendingNotes.slice(deliveredNoteCount);
+      delete s.pendingNotesDeliveryToken;
     }
     s.pendingRegistration = false;
   });
@@ -650,21 +680,14 @@ function onStopAsync(ctx) {
     return;
   }
 
-  // 全局在飞 worker 上限（跨会话），超限丢弃——这是有界积压纪律的跨会话延伸。
-  // 只统计新鲜锁：崩溃残留的尸锁不得占用全局额度。
+  // 全局在飞 worker 上限（跨会话）与同会话互斥。只统计新鲜锁：崩溃残留的尸锁不得占用全局额度。
+  // 名额门禁必须「数 + 取」原子（R04）：原先 countLocks 通过后再 createLock 是两段式，
+  // 并发 Stop 各自看到 limit-1 把锁而全部放行（实测 limit=1、8 进程可 8/8 同时开工）。
   const staleMs = cfg.reviewTimeoutMs * 2 + 60000;
-  if (countLocks(stateDir, staleMs) >= (cfg.maxGlobalWorkers || 4)) {
+  const admission = admitGlobalWorker(file, stateDir, staleMs, cfg.maxGlobalWorkers || 4);
+  if (admission !== 'ok') {
     mutateStateExclusive(file, (s) => {
-      bumpDrop(s, 'global_busy');
-      s.lastActivity = new Date().toISOString();
-    });
-    return;
-  }
-
-  // 互斥：同一会话同时在审就不再叠加。
-  if (!createLock(file, staleMs)) {
-    mutateStateExclusive(file, (s) => {
-      bumpDrop(s, 'busy');
+      bumpDrop(s, admission === 'global_busy' ? 'global_busy' : 'busy');
       s.lastActivity = new Date().toISOString();
     });
     return;
@@ -1123,6 +1146,31 @@ async function handleCtl(args) {
     return ctlDoctor(cfg, args, stateForDoctor);
   }
 
+  // 查看/管理可用服务商（端点/key 不在本插件维护，这里只读 ZCode 配置）。
+  // 用法：providers [--all] —— 默认只列可用的第三方服务商；--all 含被排除项与原因。
+  if (sub === 'providers') {
+    const all = args.includes('--all');
+    const list = readZcodeProviders(process.env);
+    const lines = ['advisor 服务商（来自 ZCode 配置）'];
+    if (list.length === 0) {
+      lines.push('  （ZCode 里暂无服务商——请在 ZCode 设置中添加 OpenAI 兼容或 Anthropic 服务商）');
+    }
+    for (const p of list) {
+      const reasons = [];
+      if (p.official) reasons.push('ZCode 官方内置通道，审查通道不使用');
+      if (!p.eligible) reasons.push(`协议 ${p.kind || '未知'} 不受支持`);
+      if (!p.baseURL) reasons.push('缺端点');
+      if (!p.apiKey) reasons.push('缺 key');
+      const usable = reasons.length === 0;
+      if (!usable && !all) continue;
+      lines.push(`  ${usable ? '✓' : '✗'} ${p.name || p.id}（${p.models.length} 模型）${usable ? '' : ' —— ' + reasons.join('；')}`);
+      if (p.models.length > 0) lines.push(`      模型: ${p.models.join(', ')}`);
+    }
+    if (!all) lines.push('  （只列可用项；看全部用 providers --all）');
+    process.stdout.write(lines.join('\n') + '\n');
+    return;
+  }
+
   const idxState = args.indexOf('--state');
   const explicit = idxState !== -1 && args[idxState + 1];
   let file;
@@ -1230,18 +1278,25 @@ async function handleCtl(args) {
     return;
   }
 
+  // CLI 必须以实际写回为准；锁超时/属主丢失不能伪报设置成功。
+  const mutateCtlState = (fn) => {
+    const updated = mutateStateExclusive(file, fn);
+    if (!updated) process.stdout.write('advisor: 会话状态未更新（写锁忙或状态暂不可用），请稍后重试。\n');
+    return updated;
+  };
+
   if (sub === 'on') {
     // 门禁在临界区内按重读后的状态重算：锁外用旧快照算好再写回，并发
     // /advisor-model set 改了会话覆盖时会用过期结果覆盖 disabledReason。
     let reasons = [];
     let enabledModel = '';
-    mutateStateExclusive(file, (s) => {
+    if (!mutateCtlState((s) => {
       s.enabled = true;
       const r = gateWithSession(cfg, resolveApiKey(cfg, process.env), s);
       reasons = r.reasons;
       enabledModel = r.eff.model;
       s.disabledReason = reasons.length > 0 ? reasons.join(',') : '';
-    });
+    })) return;
     if (reasons.length > 0) {
       process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 ZCode 里的第三方服务商配置，或用 /advisor-model set 为本会话单独指定。\n`);
     } else {
@@ -1251,9 +1306,9 @@ async function handleCtl(args) {
   }
 
   if (sub === 'off') {
-    mutateStateExclusive(file, (s) => {
+    if (!mutateCtlState((s) => {
       s.enabled = false;
-    });
+    })) return;
     process.stdout.write('advisor: 本会话已停用（不影响其他会话）。\n');
     return;
   }
@@ -1279,10 +1334,10 @@ async function handleCtl(args) {
         process.stdout.write('advisor: 用法 model set <model-id> [provider:<服务商id或名称>]；或 model provider <id|名称> 只换服务商\n');
         return;
       }
-      mutateStateExclusive(file, (s) => {
+      if (!mutateCtlState((s) => {
         if (model) s.sessionModel = model;
         if (provider) s.sessionProvider = provider;
-      });
+      })) return;
       const parts = [];
       if (provider) parts.push(`服务商=${provider}`);
       if (model) parts.push(`模型=${model}`);
@@ -1295,18 +1350,18 @@ async function handleCtl(args) {
         process.stdout.write('advisor: 用法 model provider <服务商id或名称>\n');
         return;
       }
-      mutateStateExclusive(file, (s) => {
+      if (!mutateCtlState((s) => {
         s.sessionProvider = provider;
         s.sessionModel = ''; // 换服务商后旧模型多半不属于它：一并清掉，回落新服务商清单
-      });
+      })) return;
       process.stdout.write(`advisor: 本会话服务商已固定为 ${provider}（模型已回落该服务商默认；用 model set <模型> 再指定）。恢复全局用 model reset。\n`);
       return;
     }
     if (action === 'reset') {
-      mutateStateExclusive(file, (s) => {
+      if (!mutateCtlState((s) => {
         s.sessionModel = '';
         s.sessionProvider = '';
-      });
+      })) return;
       const eff = resolveTarget(cfg, null, process.env);
       process.stdout.write(`advisor: 已清除本会话覆盖，回到全局默认（${eff.providerName || '（未解析出服务商）'} / ${eff.model || '（未定模型）'}）。\n`);
       return;
@@ -1315,31 +1370,6 @@ async function handleCtl(args) {
     const eff = resolveTarget(cfg, state, process.env);
     const src = eff.hasOverride ? `本会话覆盖（${eff.overrides.join(' + ')}）` : '全局默认';
     process.stdout.write(`advisor: 当前审查目标 ${eff.providerName || '（未解析出服务商）'} / ${eff.model || '（未定模型）'}（${src}）。修改：model set <model-id> [provider:<id|名称>] | model provider <id|名称> | model reset\n`);
-    return;
-  }
-
-  // 查看/管理可用服务商（端点/key 不在本插件维护，这里只读 ZCode 配置）。
-  // 用法：providers [--all] —— 默认只列可用的第三方服务商；--all 含被排除项与原因。
-  if (sub === 'providers') {
-    const all = args.includes('--all');
-    const list = readZcodeProviders(process.env);
-    const lines = ['advisor 服务商（来自 ZCode 配置）'];
-    if (list.length === 0) {
-      lines.push('  （ZCode 里暂无服务商——请在 ZCode 设置中添加 OpenAI 兼容或 Anthropic 服务商）');
-    }
-    for (const p of list) {
-      const reasons = [];
-      if (p.official) reasons.push('ZCode 官方内置通道，审查通道不使用');
-      if (!p.eligible) reasons.push(`协议 ${p.kind || '未知'} 不受支持`);
-      if (!p.baseURL) reasons.push('缺端点');
-      if (!p.apiKey) reasons.push('缺 key');
-      const usable = reasons.length === 0;
-      if (!usable && !all) continue;
-      lines.push(`  ${usable ? '✓' : '✗'} ${p.name || p.id}（${p.models.length} 模型）${usable ? '' : ' —— ' + reasons.join('；')}`);
-      if (p.models.length > 0) lines.push(`      模型: ${p.models.join(', ')}`);
-    }
-    if (!all) lines.push('  （只列可用项；看全部用 providers --all）');
-    process.stdout.write(lines.join('\n') + '\n');
     return;
   }
 
@@ -1478,4 +1508,4 @@ if (require.main === module) {
 }
 
 // 仅供测试导出（test/log-review.test.js）；生产调用方全部走 CLI 入口。
-module.exports = { reviewTurn, logReview, reviewBudgetMs, fallbackEligibility, fallbackReserveMs, resolveFallbackModel, applyReviewOutcome, degradeAlertLine, FALLBACK_TRIGGER_REASONS };
+module.exports = { resolveTarget, reviewTurn, logReview, reviewBudgetMs, fallbackEligibility, fallbackReserveMs, resolveFallbackModel, applyReviewOutcome, degradeAlertLine, FALLBACK_TRIGGER_REASONS };

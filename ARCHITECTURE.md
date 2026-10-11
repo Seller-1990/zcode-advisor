@@ -105,6 +105,12 @@ review-worker（detached）
 
 **hook 每轮重读配置** → 保存后无需重启会话即生效。
 
+以上分层用于开关、审查参数和服务商/模型选择等行为配置，**不用于保存 API key**。
+端点、key、模型从 ZCode 的第三方服务商配置（`~/.zcode/v2/config.json` 与
+`~/.zcode/v2/provider_config.json`）解析；旧版插件/用户级配置中的 key 与端点字段不再作为凭据来源。
+命令行隔离测试如需覆盖凭据，必须成对提供 `ZCODE_ADVISOR_BASE_URL` 和
+`ZCODE_ADVISOR_API_KEY`，不能把一个服务商的 key 与另一个服务商的端点拼接。
+
 ### 门禁（gate）
 
 ```js
@@ -118,7 +124,7 @@ if (!apiKeyInfo.key) reasons.push('missing:apiKey');
 
 | 面 | 措施 |
 | --- | --- |
-| 配置文件（含 API key） | 仅 `~/.zcode/`，`advisor.config.json` 在 .gitignore |
+| 服务商凭据 | 由 ZCode 第三方服务商配置维护；插件的 `advisor.config.json` 只保存行为与选择，不保存 API key |
 | 转录快照 | 目录 `0o700`、文件 `0o600`；文件名经 `sanitizeSessionId`（防路径穿越）；保留窗口 ≥ 并发上限 |
 | 意见历史 | 目录 `0o700`、文件 `0o600` |
 | 角标面板 API | 仅 127.0.0.1 + 共享令牌（`X-Advisor-Token`，每次启动随机生成） |
@@ -144,7 +150,7 @@ plugins/zcode-advisor/                  ← 市场 source 指向它
 **三层任何一层不刷新，都装出旧代码**（实测三次踩过）。
 `enable.sh` 与 `auto-enable.cjs` 已按 ①②③ 顺序自动化；`test/plugin-dir.test.js` 守卫 ① 的一致性。
 
-## 测试结构（191 项）
+## 测试结构（按职责分组；用例数量以当前测试输出为准）
 
 | 文件 | 覆盖 |
 | --- | --- |

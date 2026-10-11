@@ -74,30 +74,37 @@ function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
   // 历史遗留的宽权限目录在此收紧（失败不阻断——只读文件系统下尽力而为）。
   try { fs.chmodSync(stateDir, 0o700); } catch (_) {}
   const file = stateFilePath(stateDir, sessionId);
-  if (fs.existsSync(file)) {
-    const current = loadStateDetailed(file);
-    if (current.status === 'ok') {
-      const state = current.state;
-      if (transcriptPath && state.transcriptPath !== transcriptPath) {
-        // resume/compact 后宿主会换新的临时转录文件，旧 offset 不再有意义。
-        // 必须落盘（临界区内），否则后续 loadState 读到的仍是旧路径/旧 offset。
-        const updated = mutateStateExclusive(file, (s) => {
-          s.transcriptPath = transcriptPath;
-          s.byteOffset = 0;
-          s.lastHeadHash = '';
-        });
-        return { state: updated || state, file, created: false };
-      }
-      return { state, file, created: false };
-    }
-    if (current.status === 'corrupt') {
-      // 损坏的 state：先留尸（保留排查线索），再重建。
-      try {
-        fs.renameSync(file, `${file}.corrupt-${Date.now()}`);
-      } catch (_) {}
-    }
-    // status === 'error'（读错误等）：尝试重建，失败则由 saveState 抛出由调用方降级。
+  if (!fs.existsSync(file)) {
+    const created = freshState(sessionId, transcriptPath, startEnabled);
+    // 排他创建：existsSync 与落盘之间有窗口，对手（并发会话 / ctl / Stop / worker）
+    // 可能已在此刻建好并写入了自己的状态（含"关闭"与待处理笔记）。
+    // 用 link 而非 rename 落盘：目标已存在即 EEXIST，绝不覆盖 —— 窗口内让位给对手。
+    if (createStateExclusive(file, created)) return { state: created, file, created: true };
+    // 落到这里 = 对手先创建：继续往下读，采纳对手的状态（不写自己的 freshState）。
   }
+  const current = loadStateDetailed(file);
+  if (current.status === 'ok') {
+    const state = current.state;
+    if (transcriptPath && state.transcriptPath !== transcriptPath) {
+      // resume/compact 后宿主会换新的临时转录文件，旧 offset 不再有意义。
+      // 必须落盘（临界区内），否则后续 loadState 读到的仍是旧路径/旧 offset。
+      const updated = mutateStateExclusive(file, (s) => {
+        s.transcriptPath = transcriptPath;
+        s.byteOffset = 0;
+        s.lastHeadHash = '';
+      });
+      return { state: updated || state, file, created: false };
+    }
+    return { state, file, created: false };
+  }
+  if (current.status === 'corrupt') {
+    // 损坏的 state：先留尸（保留排查线索），再重建。
+    try {
+      fs.renameSync(file, `${file}.corrupt-${Date.now()}`);
+    } catch (_) {}
+  }
+  // status === 'missing'（existsSync 之后被对手删掉）或 'error'（读错误）：重建，
+  // 失败则由 saveState 抛出，由调用方降级。
   const state = freshState(sessionId, transcriptPath, startEnabled);
   saveState(file, state);
   return { state, file, created: true };
@@ -158,28 +165,67 @@ function saveState(file, state) {
   throw lastErr || new Error('saveState failed');
 }
 
-// —— 跨进程短临界区写（修复多写者 read-modify-write 丢更新）——
-// 所有状态写路径（UPS/ctl/Stop 父进程/worker 落盘）都必须经由本函数：
-// 取 .wrlock → 重读最新 state → fn(state) 原地修改 → 校验锁仍属于自己 → 原子写回 → 释放。
-// 写前后都校验锁属主：慢持有者（杀毒/索引器拖慢 IO）被对手按陈旧抢锁后，
-// 原持有者不得再写回（否则双写者复活，丢更新回归）。
-// 拿不到锁/属主丢失返回 null，由调用方决定降级（意见保留到下一轮）。
-function mutateStateExclusive(file, fn, opts) {
+// 排他创建（"只建不改"）：写唯一 tmp → link 到目标。目标已存在则 EEXIST，绝不覆盖。
+// 存在的意义：rename 会静默覆盖目标，而「先 existsSync 再 saveState」在并发会话/ctl/worker
+// 之间会丢掉对手刚写入的决定（enabled 复活、笔记清零）。创建方必须走本函数，修改方走
+// mutateStateExclusive。成功返回 true，目标已存在返回 false；不支持硬链接的文件系统退回
+// 'wx' 独占打开（同样不覆盖已存在文件）。写失败不吞异常，交由调用方降级。
+function createStateExclusive(file, state) {
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}-excl`;
+  let created = false;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
+    try {
+      fs.linkSync(tmp, file);
+      created = true;
+    } catch (err) {
+      if (err && err.code === 'EEXIST') return false;
+      // 目标文件系统不支持硬链接（少数挂载/网络盘）：退回独占打开，语义相同。
+      let fd = null;
+      try {
+        fd = fs.openSync(file, 'wx');
+        fs.writeSync(fd, JSON.stringify(state, null, 2));
+        created = true;
+      } catch (err2) {
+        if (fd !== null) {
+          try { fs.closeSync(fd); } catch (_) {}
+          fd = null;
+          // 半写文件不留盘：读取方会把它当损坏并留尸，反而多一份垃圾。
+          try { fs.unlinkSync(file); } catch (_) {}
+        }
+        if (err2 && err2.code === 'EEXIST') return false;
+        throw err2;
+      } finally {
+        if (fd !== null) { try { fs.closeSync(fd); } catch (_) {} }
+      }
+    }
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
+  if (created) { try { fs.chmodSync(file, 0o600); } catch (_) {} }
+  return created;
+}
+
+// —— 通用跨进程短临界区 ——
+// 取 lockFile 的排他短租约（'wx' 创建 → 陈旧按 mtime 接管 → 归属校验），临界区内只做
+// 同步文件操作。fn(ownLock) 的返回值即本函数返回值；拿不到锁返回 null，由调用方降级。
+// 是否在临界区中途失去锁由调用方用 ownLock() 判定：慢持有者（杀毒/索引器拖慢 IO）被
+// 对手按陈旧抢锁后必须能自己发现并放弃写入。
+function withExclusiveLock(lockFile, fn, opts) {
   const retries = (opts && opts.retries) || 40;
   const staleMs = (opts && opts.staleMs) || 10000;
-  const lock = `${file}.wrlock`;
   const myPid = String(process.pid);
   let got = false;
   for (let i = 0; i < retries; i++) {
     try {
-      fs.writeFileSync(lock, myPid, { flag: 'wx' });
+      fs.writeFileSync(lockFile, myPid, { flag: 'wx' });
       got = true;
       break;
     } catch (_) {
       try {
-        const st = fs.statSync(lock);
+        const st = fs.statSync(lockFile);
         if (Date.now() - st.mtimeMs > staleMs) {
-          try { fs.unlinkSync(lock); } catch (_) {}
+          try { fs.unlinkSync(lockFile); } catch (_) {}
         }
       } catch (_) {}
       sleepSync(25);
@@ -188,13 +234,30 @@ function mutateStateExclusive(file, fn, opts) {
   if (!got) return null;
   const ownLock = () => {
     try {
-      return fs.readFileSync(lock, 'utf8').trim() === myPid;
+      return fs.readFileSync(lockFile, 'utf8').trim() === myPid;
     } catch (_) {
       return false; // 锁消失 = 已被对手接管
     }
   };
   try {
     if (!ownLock()) return null;
+    return fn(ownLock);
+  } finally {
+    // 仅当锁仍属于自己时才清除（对手接管后不得误删其锁）。
+    try {
+      if (fs.readFileSync(lockFile, 'utf8').trim() === myPid) fs.unlinkSync(lockFile);
+    } catch (_) {}
+  }
+}
+
+// —— 跨进程短临界区写（修复多写者 read-modify-write 丢更新）——
+// 所有状态写路径（UPS/ctl/Stop 父进程/worker 落盘）都必须经由本函数：
+// 取 .wrlock → 重读最新 state → fn(state) 原地修改 → 校验锁仍属于自己 → 原子写回 → 释放。
+// 写前后都校验锁属主：慢持有者（杀毒/索引器拖慢 IO）被对手按陈旧抢锁后，
+// 原持有者不得再写回（否则双写者复活，丢更新回归）。
+// 拿不到锁/属主丢失返回 null，由调用方决定降级（意见保留到下一轮）。
+function mutateStateExclusive(file, fn, opts) {
+  return withExclusiveLock(`${file}.wrlock`, (ownLock) => {
     const r = loadStateDetailed(file);
     let state;
     if (r.status === 'ok') state = r.state;
@@ -210,12 +273,26 @@ function mutateStateExclusive(file, fn, opts) {
     if (!ownLock()) return null; // 临界区期间被抢：放弃本次写入
     saveState(file, state);
     return state;
-  } finally {
-    // 仅当锁仍属于自己时才清除（对手接管后不得误删其锁）。
-    try {
-      if (fs.readFileSync(lock, 'utf8').trim() === myPid) fs.unlinkSync(lock);
-    } catch (_) {}
-  }
+  }, opts);
+}
+
+// —— 全局在飞 worker 名额（R04）——
+// 「先数后取」（countLocks → createLock）在跨进程并发下会各自看到 limit-1 把锁而同时放行：
+// 每个会话的锁文件不同，createLock 都会成功，于是 N 个进程一起开工，全局上限形同虚设
+// （实测 limit=1、8 进程：自然窗口 4 轮里 3 轮超限、最多 6/8；放大 readdir 窗口后 8/8）。
+// 这里把「数 + 取」放进 stateDir 级临界区（复用 .wrlock 短租约协议）——临界区只做一次
+// readdir 加一次排他创建，耗时可忽略，且不产生 sess-* 命名的文件（不干扰 countLocks/
+// listStatePaths/pruneStates 的匹配口径）。
+// 拿不到临界区（目录不可写、竞争超时）→ 退回先数后取：宁可偶发超限，也不让审查停摆。
+function admitGlobalWorker(file, stateDir, staleMs, limit) {
+  const max = limit || 4;
+  const gated = withExclusiveLock(path.join(stateDir, '.global-workers.lock'), () => {
+    if (countLocks(stateDir, staleMs) >= max) return 'global_busy';
+    return createLock(file, staleMs) ? 'ok' : 'busy';
+  });
+  if (gated) return gated;
+  if (countLocks(stateDir, staleMs) >= max) return 'global_busy';
+  return createLock(file, staleMs) ? 'ok' : 'busy';
 }
 
 function latestStatePath(stateDir) {
@@ -247,7 +324,7 @@ function pruneStates(stateDir, maxAgeDays, keep) {
   let entries = [];
   try {
     entries = fs.readdirSync(stateDir)
-      .filter((f) => /^sess-.*\.json/.test(f))
+      .filter((f) => /^sess-.*\.json$/.test(f))
       .map((f) => {
         const full = path.join(stateDir, f);
         let mtime = 0;
@@ -389,7 +466,7 @@ function countLocks(stateDir, staleMs) {
 }
 
 module.exports = {
-  ensureState, loadState, loadStateDetailed, saveState, mutateStateExclusive, latestStatePath, listStatePaths, stateFilePath,
+  ensureState, loadState, loadStateDetailed, saveState, mutateStateExclusive, withExclusiveLock, latestStatePath, listStatePaths, stateFilePath,
   sanitizeSessionId, pruneStates, bumpDrop, bumpPrimaryFailStreak, isFailStreakReason, freshState, createLock, clearLock, clearLockIfOwner,
-  lockPathFor, countLocks, sleepSync
+  lockPathFor, countLocks, admitGlobalWorker, sleepSync
 };

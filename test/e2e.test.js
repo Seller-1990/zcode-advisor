@@ -85,6 +85,74 @@ function waitUntil(fn, timeoutMs) {
   return fn();
 }
 
+test('core regression: providers 在零会话及多会话时均不触发状态门禁', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const env = makeEnv(stateDir);
+  for (const count of [0, 2]) {
+    for (let i = 0; i < count; i++) runHook(['session-start'], { session_id: `providers-${i}`, transcript_path: transcript }, env);
+    const r = runHook(['ctl', 'providers'], null, env);
+    assert.strictEqual(r.status, 0);
+    assert.match(r.stdout, /E2E 网关/);
+    assert.doesNotMatch(r.stdout, /未找到会话状态|为避免误伤其他会话/);
+  }
+});
+
+for (const args of [['on'], ['off'], ['model', 'set', 'other-model'], ['model', 'provider', 'other-provider'], ['model', 'reset']]) {
+  test(`core regression: ctl ${args.join(' ')} 写锁超时不能声称成功`, (t) => {
+    const { transcript, stateDir } = setup(t);
+    const env = makeEnv(stateDir);
+    runHook(['session-start'], { session_id: 'locked', transcript_path: transcript }, env);
+    const file = path.join(stateDir, 'sess-locked.json');
+    const before = fs.readFileSync(file, 'utf8');
+    fs.writeFileSync(`${file}.wrlock`, String(process.pid));
+    const r = runHook(['ctl', ...args, '--state', file], null, env);
+    assert.strictEqual(r.status, 0, '命令继续fail-open，不改变宿主退出契约');
+    assert.strictEqual(fs.readFileSync(file, 'utf8'), before);
+    assert.match(r.stdout, /未更新/);
+    assert.doesNotMatch(r.stdout, /已启用|已停用|已固定|已清除|已置为启用/);
+  });
+}
+
+for (const newNote of ['[advisor:concern] 新意见', '[advisor:concern] 旧意见']) {
+test(`core regression: 重叠UPS不能按旧数量删除新加入的意见（${newNote}）`, (t) => {
+  const { dir, transcript, stateDir } = setup(t);
+  const env = makeEnv(stateDir);
+  const input = { session_id: 'overlap', transcript_path: transcript, prompt: '继续' };
+  runHook(['session-start'], input, env);
+  const file = path.join(stateDir, 'sess-overlap.json');
+  const s = readState(stateDir, 'overlap');
+  s.pendingRegistration = false;
+  s.pendingNotes = ['[advisor:concern] 旧意见'];
+  fs.writeFileSync(file, JSON.stringify(s));
+  const preload = path.join(dir, 'interleave.cjs');
+  fs.writeFileSync(preload, `
+    const fs = require('fs');
+    const { spawnSync } = require('child_process');
+    const { mutateStateExclusive } = require(${JSON.stringify(path.join(PLUGIN_ROOT, 'hooks/lib/state.js'))});
+    const file = ${JSON.stringify(file)};
+    const write = process.stdout.write.bind(process.stdout);
+    let intercepted = false;
+    process.stdout.write = function(chunk, ...rest) {
+      if (!intercepted && String(chunk).includes('additionalContext')) {
+        intercepted = true;
+        const other = spawnSync(process.execPath, [${JSON.stringify(HOOK)}, 'user-prompt-submit'], {
+          input: ${JSON.stringify(JSON.stringify(input))}, encoding: 'utf8', env: process.env, timeout: 5000
+        });
+        if (other.status !== 0 || !other.stdout.includes('旧意见')) throw new Error('second UPS did not deliver');
+        mutateStateExclusive(file, (s) => { s.pendingNotes.push(${JSON.stringify(newNote)}); });
+      }
+      return write(chunk, ...rest);
+    };
+  `);
+  const r = spawnSync(process.execPath, ['--require', preload, HOOK, 'user-prompt-submit'], {
+    input: JSON.stringify(input), env, encoding: 'utf8', timeout: 10000
+  });
+  assert.strictEqual(r.status, 0);
+  assert.match(r.stdout, /旧意见/);
+  assert.deepStrictEqual(readState(stateDir, 'overlap').pendingNotes, [newNote]);
+});
+}
+
 test('session-start 创建状态且无输出；resume 后注册标记重置', (t) => {
   const { transcript, stateDir } = setup(t);
   const env = makeEnv(stateDir);

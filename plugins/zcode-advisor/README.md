@@ -277,18 +277,24 @@ npm test          # 全量测试（用例数随开发增长，不在此写死；
 npm run build     # 构建发行包（构建后自动做三层产物校验）
 ```
 
-mock 链路验证（以下命令需 **Git Bash**；PowerShell 用户请用等价写法，注意 JSON 内路径需用正斜杠或双反斜杠）：
+mock 链路验证（以下命令需 **Git Bash** 和含 `test/fixtures` 的源码仓库；安装缓存不含测试 fixture。PowerShell 用户请用等价写法，注意 JSON 内路径需用正斜杠或双反斜杠）：
 
 ```bash
-cd "<插件目录>"                                     # state/ 默认建在当前目录下
-mkdir -p state && touch state/.mock-allowed        # mock 双要素之二（必须，否则会发起真实调用）
-ZCODE_ADVISOR_MOCK=1 \
-ZCODE_ADVISOR_MOCK_FRAME='{"severity":"blocker","note":"演示"}' \
-ZCODE_ADVISOR_API_KEY=e2e-key \
-ZCODE_ADVISOR_REVIEW_MODE=sync \
+cd "<仓库根目录>"
+mock_home="$(mktemp -d)"
+mkdir -p "$mock_home/state" "$mock_home/.zcode"
+touch "$mock_home/state/.mock-allowed"
+printf '{"enabled":true}\n' > "$mock_home/.zcode/advisor.config.json"
+HOME="$mock_home" USERPROFILE="$mock_home" ZCODE_ADVISOR_STATE_DIR="$mock_home/state" \
+ZCODE_ADVISOR_MOCK=1 ZCODE_ADVISOR_MOCK_FRAME='{"severity":"blocker","note":"演示"}' \
+ZCODE_ADVISOR_BASE_URL=http://127.0.0.1:9/v1/chat/completions \
+ZCODE_ADVISOR_API_KEY=e2e-key ZCODE_ADVISOR_MODEL=mock-model ZCODE_ADVISOR_REVIEW_MODE=sync \
   node hooks/advisor-hook.js stop <<< '{"session_id":"demo","transcript_path":"test/fixtures/transcript-basic.jsonl","stop_hook_active":false}'
 # 期望 stdout：{"decision":"block","reason":"[advisor:blocker] 演示（以上来自审查副模型……）"}
+printf '隔离目录（验证后可手动删除）：%s\n' "$mock_home"
 ```
+
+端点和 key 必须成对覆盖；上例回环端点仅用于安全 mock，不是真实服务。`.mock-allowed` 与 `ZCODE_ADVISOR_STATE_DIR` 必须指向同一状态目录。
 
 接真实模型：在 ZCode 设置里配好一个 OpenAI 兼容（或 Anthropic 协议）的第三方服务商 → 🛡️ 角标「完整配置」里选中它并 Ping OK（或 `/advisor-setup` 引导选择）→ 新开会话 → 首条消息出现 `[advisor]` 注册行 → 几轮后 `/advisor-status` 看 `审查次数` 与 `Token 累计` 增长。
 

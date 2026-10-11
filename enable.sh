@@ -10,7 +10,7 @@
 # 官方支持的全自动启用，不修改宿主私有数据文件。
 #
 # 启用后：新开 ZCode 会话即自动挂载审查（SessionStart hook 注入注册行），
-# API/开关等设置在「🛡 顾问」面板或本地网页面板随时调整。
+# 开关、服务商/模型选择与审查参数可在「🛡 顾问」面板或本地网页面板调整。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,20 +52,36 @@ run_cli() {
 }
 
 echo "✓ ZCode CLI: $ZC"
-echo "✓ Node:      $($NODE_BIN -v)（$NODE_BIN）"
+echo "✓ Node:      $("${NODE_BIN}" -v)（${NODE_BIN}）"
+
+# 失败累积器：占位注册/刷新/启用任一步失败都不得再报「完成」（R13——旧版只检查
+# install，update/enable 失败仍 exit 0，用户看到成功而插件其实没启用）。
+FAIL=0
+fail_step() {
+  FAIL=1
+  echo "错误：$1 失败（见上方输出）" >&2
+}
 
 # 同步 plugins/<name>/（宿主市场布局要求的子目录）——避免"改了根目录却装出旧代码"
-"$NODE_BIN" "$ROOT/tools/sync-plugin-dir.cjs" 2>&1 | sed 's/^/  /'
+if ! "$NODE_BIN" "$ROOT/tools/sync-plugin-dir.cjs" 2>&1 | sed 's/^/  /'; then
+  fail_step "同步 plugins/<name>/"
+fi
 
 # 3) 注册本地市场（幂等：重复 add 会被 CLI 以同名提示）
 echo "── 注册本地插件市场 ──"
-run_cli plugins marketplace add "$ROOT" 2>&1 | grep -vE "^$" | head -3
+ADD_OUT="$(run_cli plugins marketplace add "$ROOT" 2>&1)"; ADD_RC=$?
+printf '%s\n' "$ADD_OUT" | grep -vE "^$" | head -3
+# add 不设硬失败：既可能"已注册"而返回非零，也可能输出为空（空输出会让 grep 返回 1），
+# 无法与真失败区分；真正决定"装的是不是当前代码"的是下一步 update。
+[ "$ADD_RC" -eq 0 ] || echo "提示：marketplace add 返回 $ADD_RC（重复注册属正常；首次注册请核对上方输出）" >&2
 
 # 4) 刷新市场缓存（**必须**）——宿主会把市场内容快照到自己的缓存目录，
 #    install 从该快照拷贝，因此不 update 就会装出旧代码（实测踩过：
 #    no_transcript 修复未进入宿主 cache，顾问仍空转）。
 echo "── 刷新市场缓存 ──"
-run_cli plugins marketplace update zcode-advisor-local 2>&1 | tail -1
+UPDATE_OUT="$(run_cli plugins marketplace update zcode-advisor-local 2>&1)"; UPDATE_RC=$?
+printf '%s\n' "$UPDATE_OUT" | tail -1
+[ "$UPDATE_RC" -eq 0 ] || fail_step "刷新市场缓存（marketplace update）"
 
 # 5) 安装插件（从刷新后的市场缓存安装）
 echo "── 安装插件 ──"
@@ -76,7 +92,9 @@ fi
 
 # 5) 启用（写入宿主 config.json 的 plugins 段）
 echo "── 启用插件 ──"
-run_cli plugins enable zcode-advisor 2>&1 | tail -1
+ENABLE_OUT="$(run_cli plugins enable zcode-advisor 2>&1)"; ENABLE_RC=$?
+printf '%s\n' "$ENABLE_OUT" | tail -1
+[ "$ENABLE_RC" -eq 0 ] || fail_step "启用插件（plugins enable）"
 
 # 6) 验证：宿主应报告 hooks(3)/mcp(config-bridge)/commands 已加载
 #    （若 cache 与源目录 md5 不一致，说明市场缓存未刷新成功）
@@ -84,23 +102,23 @@ echo "── 验证 ──"
 run_cli plugins list 2>&1 | grep -A2 "zcode-advisor@" | head -3 || \
   echo "警告：未能从 plugins list 确认（请手动运行 plugins list 核对）" >&2
 
-# 7) 用户级配置模板（若尚无）——审查的 API key/model/端点都在这里
+# 7) 用户级行为配置模板（若尚无）；凭据由 ZCode 第三方服务商配置维护。
 CFG="$HOME/.zcode/advisor.config.json"
 if [ ! -f "$CFG" ]; then
   mkdir -p "$(dirname "$CFG")"
   cat > "$CFG" <<'JSON'
 {
-  "baseUrl": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-  "model": "glm-5.3-flash",
-  "apiKey": ""
+  "enabled": true,
+  "reviewMode": "async"
 }
 JSON
-  echo "✓ 已生成用户级配置：$CFG"
+  echo "✓ 已生成用户级行为配置：$CFG"
 else
-  echo "✓ 用户级配置已存在（API key / 模型 / 端点均在其中，不覆盖）"
+  echo "✓ 用户级行为配置已存在（不覆盖）"
 fi
+echo "  请先在 ZCode 第三方服务商设置中配置端点、API key 与模型，再用 /advisor-setup 选择。"
 
-# 8) 角标外挂（可选）：顶栏图标 + 设置面板（开关/API 均在此面板调整）
+# 8) 角标外挂（可选）：顶栏图标 + 设置面板（开关、服务商/模型选择与审查参数）
 if [ "$NO_COMPANION" = "1" ]; then
   echo
   echo "（按 --no-companion 跳过角标外挂）"
@@ -108,7 +126,15 @@ else
   echo
   echo "── 角标外挂（可选：顶栏图标 + 设置面板）──"
   echo "  运行：node \"$ROOT/tools/companion/controller.cjs\""
-  echo "  面板内可调：顾问开关（/advisor-on|off 亦可）、API 端点 / key / 模型 / 模式 / max_tokens。"
+  echo "  面板内可调：顾问开关（/advisor-on|off 亦可）、服务商 / 模型 / 模式 / max_tokens；端点和 key 在 ZCode 设置中维护。"
+fi
+
+if [ "$FAIL" -ne 0 ]; then
+  echo
+  echo "────────────────────────────────────────────────" >&2
+  echo "失败：上述步骤存在未成功的项，插件未完成启用（不要以「完成」为准）。" >&2
+  echo "      修好后可重复运行本脚本（幂等）。" >&2
+  exit 1
 fi
 
 echo

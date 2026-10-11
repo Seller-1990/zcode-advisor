@@ -27,6 +27,9 @@
   }
   window.__zcodeAdvisorInjected = true;
   window.__zcodeAdvisorToken = TOKEN;
+  const generation = {};
+  window.__zcaGeneration = generation;
+  const isCurrent = () => window.__zcaGeneration === generation;
 
   const css = `
 /* 角标：锚定在输入框工具栏右侧，与 zcode+ 的 ✨ 并列，而非悬浮遮挡内容。
@@ -224,6 +227,7 @@
   }
 
   function msg(text, ok) {
+    if (!isCurrent()) return;
     const m = document.getElementById('zca-msg');
     if (!m) return;
     m.textContent = text;
@@ -271,6 +275,7 @@
     if (!box) return;
     try {
       const r = await api('/api/history');
+      if (!isCurrent()) return;
       const items = (r && r.ok && Array.isArray(r.history)) ? r.history.slice(0, 10) : []; // 0.2.15 精简：只看最近 10 条
       historyItems = items;
       if (items.length === 0) {
@@ -340,7 +345,8 @@
         bind(`zca-hact-dismiss-${i}`, 'dismiss');
       });
     } catch (e) {
-      box.innerHTML = `<div class="zca-history-empty">读取失败：${String(e).slice(0, 80)}</div>`;
+      if (!isCurrent()) return;
+      box.textContent = `读取失败：${String(e).slice(0, 80)}`;
     }
   }
 
@@ -398,6 +404,7 @@
   }
 
   function paintHealth(state, detail) {
+    if (!isCurrent()) return;
     const b = document.getElementById('zca-badge');
     if (!b) return;
     const s = HEALTH_STATES[state] ? state : 'unknown';
@@ -460,8 +467,10 @@
   async function loadProviders() {
     try {
       const r = await api('/api/zcode-providers');
+      if (!isCurrent()) return;
       providers = (r && r.ok && Array.isArray(r.providers)) ? r.providers : [];
     } catch (_) { providers = []; }
+    if (!isCurrent()) return;
     const sel = document.getElementById('zca-provider-sel');
     if (!sel) return;
     const usable = (providers || []).filter((p) => !p.official && p.eligible && p.baseURL && p.hasApiKey);
@@ -540,8 +549,10 @@
   }
 
   async function refreshStatus() {
+    if (!isCurrent()) return;
     try {
       const r = await api('/api/config');
+      if (!isCurrent()) return;
       if (!r.ok) {
         // 403/bad_token 的典型成因：controller 重启过（新令牌），而本页脚本还是旧令牌。
         // 早期实现对此**静默 return**，面板永久停在"读取中…"，用户看不到任何线索。
@@ -561,9 +572,11 @@
         const s = await api('/api/session');
         session = (s && s.ok) ? s : null;
       } catch (_) { session = null; }
+      if (!isCurrent()) return;
       // 服务商清单每次打开面板都重读：用户在 ZCode 设置里改过服务商后，
       // 不重开会话也能在下拉里看到新列表（此前只加载一次，列表会被缓存到面板生命周期结束）。
       await loadProviders();
+      if (!isCurrent()) return;
       const c = curCfg;
       const st = document.getElementById('zca-status');
       // 状态行只读展示：当前生效目标 + 来源 + 会话标注。
@@ -635,17 +648,20 @@
   async function toggleSession(checked) {
     try {
       const r = await api('/api/session-toggle', { enabled: checked });
+      if (!isCurrent()) return;
       if (r && r.ok) {
         msg(checked
           ? '本会话已启用（自下一轮审查起生效）'
           : '本会话已停用（不影响其他会话；重新开启用本开关或 /advisor-on）', true);
       } else {
+        if (!isCurrent()) return;
         msg('切换失败：' + (r && (r.hint || r.error) || '未知'), false);
         // 失败回滚开关到真实状态
         const en = document.getElementById('zca-session-enabled');
         if (en) en.checked = !checked;
       }
     } catch (e) {
+      if (!isCurrent()) return;
       msg('切换失败：' + (e && e.message ? e.message : e), false);
       const en = document.getElementById('zca-session-enabled');
       if (en) en.checked = !checked;
@@ -825,7 +841,7 @@
 
     let panel = null;
     const toggle = () => {
-      if (!panel || !document.getElementById('zca-panel')) panel = buildPanel();
+      panel = document.getElementById('zca-panel') || buildPanel();
       const show = panel.style.display === 'none';
       panel.style.display = show ? 'block' : 'none';
       if (show) {

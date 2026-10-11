@@ -17,6 +17,21 @@ function tmpDir(t) {
   return dir;
 }
 
+test('core regression: pruneStates 只统计状态主体，不删除锁与旁文件', (t) => {
+  const dir = tmpDir(t);
+  const sidecars = ['sess-live.json.lock', 'sess-live.json.wrlock', 'sess-old.json.corrupt-1', 'sess-old.json.tmp-1'];
+  for (const name of sidecars) {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, 'fixture');
+    const old = new Date(Date.now() - 10000);
+    fs.utimesSync(file, old, old);
+  }
+  for (let i = 0; i < 51; i++) saveState(path.join(dir, `sess-${i}.json`), freshState(String(i), '', true));
+  require('../hooks/lib/state').pruneStates(dir, 7, 50);
+  for (const name of sidecars) assert.ok(fs.existsSync(path.join(dir, name)), `${name} 不属于状态清理范围`);
+  assert.strictEqual(fs.readdirSync(dir).filter((f) => /^sess-.*\.json$/.test(f)).length, 50);
+});
+
 test('mutateStateExclusive：顺序合并，后写保留先写的字段', (t) => {
   const dir = tmpDir(t);
   const file = path.join(dir, 'sess-x.json');

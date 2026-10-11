@@ -46,6 +46,56 @@ const OK_FRAME = { text: '{"severity":"none","note":""}' };
 
 // ---------------- 资格判定（fallbackEligibility） ----------------
 
+test('core regression: 仅sessionModel自动切换provider也必须禁用全局fallback', () => {
+  const { resolveProviderTarget } = require('../hooks/lib/config');
+  const { fallbackEligibility } = require('../hooks/advisor-hook');
+  const providers = [
+    { id: 'prov-a', name: 'A', eligible: true, baseURL: 'https://a.invalid', apiKey: 'a', models: ['primary-model', 'fb'] },
+    { id: 'prov-b', name: 'B', eligible: true, baseURL: 'https://b.invalid', apiKey: 'b', models: ['model-b'] }
+  ];
+  const resolved = resolveProviderTarget(providers, '', 'model-b');
+  assert.strictEqual(resolved.provider.id, 'prov-b');
+  const r = fallbackEligibility(mkCfg({ fallbackModel: 'fb', providerId: 'prov-a' }),
+    { sessionProvider: '', sessionModel: 'model-b' },
+    { model: 'model-b', providerId: resolved.provider.id, hasOverride: true });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, 'fallback_skipped:session_provider');
+});
+
+test('core regression: 同一env凭据且无provider ID的模型覆盖仍可fallback', () => {
+  const { fallbackEligibility } = require('../hooks/advisor-hook');
+  const r = fallbackEligibility(mkCfg({ fallbackModel: 'fb', providerId: '' }),
+    { sessionProvider: '', sessionModel: 'model-x' },
+    { model: 'model-x', providerId: '', hasOverride: true });
+  assert.deepStrictEqual(r, { ok: true, model: 'fb' });
+});
+
+test('core regression: env模型导致全局ID漂移时无会话覆盖不误禁fallback', (t) => {
+  const fs = require('fs'); const path = require('path'); const os = require('os');
+  const { loadConfig } = require('../hooks/lib/config');
+  const { resolveTarget, fallbackEligibility } = require('../hooks/advisor-hook');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-fb-env-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const configFile = path.join(dir, 'config.json');
+  fs.writeFileSync(configFile, JSON.stringify({ provider: {
+    a: { kind: 'openai', options: { baseURL: 'https://a.invalid', apiKey: 'sk-a-abc' }, models: { ma: {} } },
+    b: { kind: 'openai', options: { baseURL: 'https://b.invalid', apiKey: 'sk-b-abc' }, models: { mb: {} } }
+  } }));
+  const env = { ZCODE_ADVISOR_USER_CONFIG: path.join(dir, 'none.json'),
+    ZCODE_ADVISOR_ZCODE_CONFIG: configFile, ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(dir, 'none2.json'),
+    ZCODE_ADVISOR_MODEL: 'mb', ZCODE_ADVISOR_BASE_URL: 'https://env.invalid',
+    ZCODE_ADVISOR_API_KEY: 'sk-env-abc', ZCODE_ADVISOR_FALLBACK_MODEL: 'fb' };
+  const cfg = loadConfig(dir, env);
+  assert.strictEqual(cfg.providerId, 'a', '确认全局ID来自模型env覆盖之前');
+  for (const state of [{}, { sessionModel: 'mb' }]) {
+    const eff = resolveTarget(cfg, state, env);
+    assert.strictEqual(eff.providerId, 'b');
+    assert.strictEqual(eff.baseUrl, cfg.baseUrl);
+    assert.strictEqual(eff.apiKey, cfg.apiKey);
+    assert.deepStrictEqual(fallbackEligibility(cfg, state, eff), { ok: true, model: 'fb' });
+  }
+});
+
 test('eligibility：未配备用模型 → 不可用', () => {
   const H = require('../hooks/advisor-hook');
   assert.deepStrictEqual(H.fallbackEligibility(mkCfg(), {}, { model: 'primary-model' }), { ok: false, reason: 'no_fallback_model' });

@@ -11,4 +11,4 @@ description: 在当前会话启用 advisor 审查副模型
    node "<脚本绝对路径>" ctl on --state "<状态文件绝对路径>"
    ```
 
-3. 如实报告输出。若提示门禁未满足（缺 apiKey/model/baseUrl），告诉用户：编辑本插件安装目录下的 advisor.config.json 填入 apiKey，或在 Windows 用 `setx ZCODE_ADVISOR_API_KEY <key>` 设置后**重启 ZCode**（GUI 启动的进程读不到 shell 里临时 export 的变量）。此开关只影响当前会话。
+3. 如实报告输出。若提示门禁未满足，告诉用户：在 **ZCode 设置 → 第三方服务商** 中确认端点、API key 和模型，或运行 `/advisor-setup` 检查解析结果；需要单独选择本会话的服务商/模型时使用 `/advisor-model`。不要把 key 写进插件安装目录的 `advisor.config.json`（该字段已废弃且不会生效），不要让用户把 key 发到聊天里。此开关只影响当前会话。

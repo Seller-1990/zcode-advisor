@@ -156,16 +156,22 @@ async function download(url) {
 
 // 已解压内容的缓存目录（避免每次构建重复下载 ~30MB）
 const CACHE_DIR = path.join(DIST, '.cache');
+let resolvedNodeVersion;
 
 async function fetchEmbeddedNodeBinary(platform, arch) {
-  const key = `${platform}-${arch}`;
+  // 同一次构建固定一个版本；旧的无版本缓存不能满足显式版本约束。
+  const version = NODE_EMBED_VERSION || await (resolvedNodeVersion ||= resolveLatestLtsVersion());
+  if (!/^v\d+\.\d+\.\d+$/.test(version)) throw new Error(`无效的 Node 版本：${version}`);
+  const key = `${version}-${platform}-${arch}`;
   const cachePath = path.join(CACHE_DIR, `node-${key}`);
   if (fs.existsSync(cachePath)) {
-    log(`复用缓存的 Node 运行时（${key}）`);
-    return fs.readFileSync(cachePath);
+    const binary = fs.readFileSync(cachePath);
+    if (binary.length > 0) {
+      log(`复用缓存的 Node 运行时（${key}）`);
+      return binary;
+    }
   }
 
-  const version = NODE_EMBED_VERSION || await resolveLatestLtsVersion();
   const fileName = platform === 'win'
     ? `node-${version}-win-${arch}.zip`
     : `node-${version}-darwin-${arch}.tar.gz`;
@@ -304,7 +310,8 @@ async function buildMac(arch, opts) {
   // install.sh 的 cp 清单由依赖闭包注入，并做版本号占位替换
   const installSh = T.MAC_INSTALL_SH(COMPANION_FILES).replace(/__VERSION__/g, VERSION);
   entries.push({ path: 'install.sh', data: Buffer.from(installSh, 'utf8'), mode: 0o755 });
-  entries.push({ path: 'advisor.icns', data: makeIcns(), mode });
+  const icnsBuf = makeIcns();
+  entries.push({ path: 'advisor.icns', data: icnsBuf, mode });
 
   let embedded = false;
   if (opts.embedNode) {
@@ -359,7 +366,7 @@ async function buildMac(arch, opts) {
           runtimeFiles,
           companionDir: COMPANION_DIR,
           nodeBinPath,
-          icnsBuf: makeIcns(),
+          icnsBuf,
           // 必须跟随当前 arch——硬编码 x64 会让 arm64 DMG 缺插件（且 verifyDmg 不校验）。
           // 语义：stageMacApp 执行 cpSync(pluginDir, Resources/app/plugin)，
           // 即把 pluginDir **整体拷为** plugin/。因此必须传 pluginRoot
@@ -598,7 +605,7 @@ function verifyRequireClosure(name, entries) {
 
 // ---------------- 入口 ----------------
 
-(async () => {
+async function main() {
   const opts = parseArgs(process.argv.slice(2));
   log(`构建 ZCode Advisor 发行包 v${VERSION}（平台参数 mac-arch=${opts.macArch}）`);
 
@@ -650,7 +657,11 @@ function verifyRequireClosure(name, entries) {
   }
 
   log(`构建完成：${artifacts.length} 个产物位于 dist/`);
-})().catch((err) => {
+}
+
+if (require.main === module) main().catch((err) => {
   console.error('[build] 失败：', err && err.stack ? err.stack : err);
   process.exit(1);
 });
+
+module.exports = { fetchEmbeddedNodeBinary };

@@ -279,19 +279,26 @@ const server = http.createServer((req, res) => {
     res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(obj));
   };
+  // 页面内嵌私有配置，history 含会话内容：读与写统一守住本机来源边界。
+  if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
   if (req.method === 'GET' && (req.url === '/' || req.url.startsWith('/?'))) {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(page());
     return;
   }
   if (req.method === 'POST' && req.url === '/api/save') {
-    if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
       try {
-        const patch = JSON.parse(body || '{}');
+        let patch;
+        try { patch = JSON.parse(body || '{}'); }
+        catch (_) { send(400, { ok: false, error: '请求体不是合法 JSON' }); return; }
+        if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+          send(400, { ok: false, error: '请求体必须是 JSON 对象' }); return;
+        }
         const r = saveUserConfig(patch);
+        if (r.error) { send(400, { ok: false, error: r.error }); return; }
         // 锁超时必须以失败态呈现：fillMissingOnly/覆盖语义都不会「下次再补」，
         // 静默 ok:true 会让用户以为存上了（配置 panel 前端按 ok 分红绿条）。
         if (r.lockTimeout) {
@@ -309,7 +316,6 @@ const server = http.createServer((req, res) => {
   // 注意：页面上**没有**对应按钮（0.2.17 已移除「清除 key」UI），这是有意保留的无 UI 端点——
   // 升级用户盘上可能还有 0.2.16 写入的明文 key，脚本/curl 可一键清掉；幂等、且只删这一个键。
   if (req.method === 'POST' && req.url === '/api/clear-key') {
-    if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
@@ -344,7 +350,6 @@ const server = http.createServer((req, res) => {
   }
   // 指定服务商的模型清单与端点（页面切换服务商时用；只回传模型 id/baseURL，不含 apiKey）
   if (req.method === 'POST' && req.url === '/api/zcode-models') {
-    if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
@@ -360,7 +365,6 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === 'POST' && req.url === '/api/ping') {
-    if (!isLocalRequest(req)) { send(403, { ok: false, error: '非本机来源，已拒绝' }); return; }
     let body = '';
     req.on('data', (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on('end', () => {
@@ -373,15 +377,13 @@ const server = http.createServer((req, res) => {
   res.end('not found');
 });
 
+let candidatePort = PORT;
 server.on('error', (err) => {
-  if (err && err.code === 'EADDRINUSE') {
-    const next = PORT + 1;
-    if (next <= PORT + 10) {
-      process.env.__RETRY__ = '1';
-      process.stdout.write(`端口 ${PORT} 被占用，改用 ${next}…\n`);
-      server.listen(next, '127.0.0.1');
-      return;
-    }
+  if (err && err.code === 'EADDRINUSE' && candidatePort < Math.min(PORT + 10, 65535)) {
+    const occupied = candidatePort++;
+    process.stdout.write(`端口 ${occupied} 被占用，改用 ${candidatePort}…\n`);
+    server.listen(candidatePort, '127.0.0.1');
+    return;
   }
   process.stderr.write(`[advisor-panel] ${err && err.message}\n`);
   process.exit(1);

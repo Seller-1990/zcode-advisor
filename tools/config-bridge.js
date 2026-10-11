@@ -185,7 +185,7 @@ function writeUserConfig(guiValues, file, opts) {
     try {
       existing = JSON.parse(fs.readFileSync(target, 'utf8'));
     } catch (err) {
-      if (err && err.code === 'ENOENT') existing = null; // 首次写入，正常路径
+      if (err && err.code === 'ENOENT') existing = {}; // 首次写入，正常路径
       else {
         // 损坏/不可读 → 拒绝写入：静默拿空 base 重建会把盘上的 apiKey/maxTokens
         // 等全部蒸发（401 同构事故）。对齐 removeUserConfigKeys 的红线：损坏必须报失败。
@@ -195,7 +195,7 @@ function writeUserConfig(guiValues, file, opts) {
         };
       }
     }
-    if (existing !== null && (typeof existing !== 'object' || Array.isArray(existing))) {
+    if (!existing || typeof existing !== 'object' || Array.isArray(existing)) {
       // 合法 JSON 但不是对象（如数组/数字）：同样拒绝——mergeUserConfig 会把非对象
       // base 当空处理，写盘等于清空重建。
       return {

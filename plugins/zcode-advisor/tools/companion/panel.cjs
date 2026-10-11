@@ -118,13 +118,16 @@ details summary:hover{color:#e6e8ec}
   const msg = (text, ok) => { const m = $('msg'); m.textContent = text; m.style.display = 'block'; m.className = 'msg ' + (ok ? 'ok' : 'bad'); };
   const esc = (v) => String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   let curCfg = null, providers = null;
+  let modelEpoch = 0;
 
   // 服务商列表：每次都从 controller 现读（不像角标面板做缓存）——用户在 ZCode 里
   // 改过服务商后，打开/刷新本页面即是新列表；另有「刷新」按钮强制重拉。
   // 只列可用项（非官方 + 协议受支持 + 端点/key 齐备）：看得见的都能用。
   async function loadProviders(force) {
+    const epoch = ++modelEpoch;
     try {
       const r = await api('/api/zcode-providers');
+      if (epoch !== modelEpoch) return;
       const all = (r && r.ok && Array.isArray(r.providers)) ? r.providers : [];
       providers = all.filter(p => !p.official && p.eligible && p.baseURL && p.hasApiKey);
       const sel = $('zprovider');
@@ -143,8 +146,8 @@ details summary:hover{color:#e6e8ec}
       if (want && providers.some(p => p.id === want)) sel.value = want;
       else sel.value = providers.length ? providers[0].id : '';
       if (force) msg('已刷新：ZCode 里可用第三方服务商 ' + providers.length + ' 个' + (all.length !== providers.length ? '（另有 ' + (all.length - providers.length) + ' 个官方/不兼容项未列出）' : ''), true);
-      fillModels();
-    } catch (e) { msg('服务商列表载入失败：' + (e && e.message || e), false); }
+      fillModels(undefined, true);
+    } catch (e) { if (epoch === modelEpoch) msg('服务商列表载入失败：' + (e && e.message || e), false); }
   }
 
   function selectedProvider() {
@@ -152,7 +155,7 @@ details summary:hover{color:#e6e8ec}
     return (providers || []).find(p => p.id === id) || null;
   }
 
-  function fillModels(models) {
+  function fillModels(models, restoreSaved) {
     const p = selectedProvider();
     const sel = $('zmodel');
     const list = Array.isArray(models) && models.length ? models : ((p && p.models) || []);
@@ -162,23 +165,25 @@ details summary:hover{color:#e6e8ec}
     const want = curCfg && curCfg.model;
     if (want && list.includes(want)) sel.value = want;
     else if (list.length) sel.value = list[0];
-    // 模型清单刚被换过（切服务商 / 拉取实时清单）：手填框里的旧值不再代表用户意图，
-    // 不清空会盖住用户接下来在下拉里的选择（currentModelId 手填优先）。
+    // 仅配置回填恢复手填模型；用户切换仍清空上一服务商的意图。
     const manual = $('modelManual');
-    if (manual && manual.value && !list.includes(String(manual.value).trim())) manual.value = '';
+    if (restoreSaved && manual) manual.value = want && !list.includes(want) ? want : '';
+    else if (manual && manual.value && !list.includes(String(manual.value).trim())) manual.value = '';
     $('zendpoint').textContent = p ? ('端点：' + (p.baseURL || '（该服务商未配置 baseURL）')) : '先在 ZCode 设置里添加 OpenAI 兼容或 Anthropic 服务商';
   }
 
   async function fetchZcodeModels() {
     const p = selectedProvider();
     if (!p) { msg('先选择服务商', false); return; }
+    const epoch = ++modelEpoch;
     msg('向端点拉取模型…', true);
     try {
       const r = await api('/api/models', { zcodeProvider: p.id, zcodeFetch: true });
+      if (epoch !== modelEpoch) return;
       if (!r.ok) { msg('拉取失败 → ' + r.error + (r.hint ? '：' + r.hint : ''), false); return; }
       fillModels(r.models);
       msg('已拉取 ' + r.models.length + ' 个模型（实时清单，保存后生效）', true);
-    } catch (e) { msg('拉取失败：' + (e && e.message || e), false); }
+    } catch (e) { if (epoch === modelEpoch) msg('拉取失败：' + (e && e.message || e), false); }
   }
 
   // 当前选中的模型：手填框**优先于**下拉，因为手填是「清单里没有」时的显式意图。
@@ -197,6 +202,7 @@ details summary:hover{color:#e6e8ec}
   // 不会派发 change 事件（jsdom 实测：赋值 0 次、dispatchEvent 1 次），所以下面的
   // 处理器只会被真实用户交互触发，回填不会误清手填值。
   function clearManualIfPicked() {
+    ++modelEpoch;
     const m = $('modelManual');
     if (m && m.value) m.value = '';
   }

@@ -8,7 +8,16 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
+
+// Windows 的 Python 安装通常只提供 python；不可把应用商店别名当成可用解释器。
+const PYTHON = [process.env.PYTHON, 'python3', 'python'].filter(Boolean).find((candidate) => {
+  const probe = spawnSync(candidate, ['-c', 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)'], {
+    stdio: 'ignore', timeout: 5000,
+  });
+  return !probe.error && probe.status === 0;
+});
+if (!PYTHON) throw new Error('multi-review tests require Python 3 (set PYTHON to its executable)');
 
 const SCRIPT = path.join(__dirname, '..', 'tools', 'multi-review.py');
 
@@ -25,9 +34,9 @@ print(json.dumps(mr.merge(results), ensure_ascii=False))
   // 而 tools/ 属于 sync-plugin-dir 的同步范围 —— 残留会被判成"副本缺该文件"的漂移
   //（CI 上实测踩到：本机 Python 3.9 不生成、CI 的 3.12 生成，本地因此复现不出）。
   // 同步器与 .gitignore 另加两道防线兜底。
-  const out = execFileSync('python3', ['-B', '-c', py], {
-    input: JSON.stringify(results), encoding: 'utf8',
-    env: Object.assign({}, process.env, { PYTHONDONTWRITEBYTECODE: '1' }),
+  const out = execFileSync(PYTHON, ['-B', '-c', py], {
+    input: JSON.stringify(results), encoding: 'utf8', timeout: 15000,
+    env: Object.assign({}, process.env, { PYTHONDONTWRITEBYTECODE: '1', PYTHONUTF8: '1' }),
   });
   return JSON.parse(out);
 }
@@ -130,4 +139,98 @@ test('merge：同一问题、相邻行、措辞不同 → 仍应归并为高置�
   ]);
   assert.strictEqual(merged.length, 1, '内容相同应归并（不能因收紧规则而漏并）');
   assert.strictEqual(merged[0].confidence, 'high');
+});
+
+function runPython(body, input = {}) {
+  const py = `
+import json, importlib.util, sys, tempfile, os, subprocess, time
+from unittest import mock
+spec = importlib.util.spec_from_file_location('mr', ${JSON.stringify(SCRIPT)})
+mr = importlib.util.module_from_spec(spec); spec.loader.exec_module(mr)
+case = json.loads(sys.stdin.read())
+${body}
+`;
+  return JSON.parse(execFileSync(PYTHON, ['-B', '-c', py], {
+    input: JSON.stringify(input), encoding: 'utf8', timeout: 15000,
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1', PYTHONUTF8: '1' },
+  }));
+}
+
+function runSlot(payload, exit = 0) {
+  return runPython(`
+with tempfile.TemporaryDirectory() as tmp:
+    outfile = os.path.join(tmp, 'review.json')
+    with open(outfile, 'w', encoding='utf8') as fh:
+        json.dump(case['payload'], fh)
+    with mock.patch.object(mr.subprocess, 'run', return_value=subprocess.CompletedProcess([], case['exit'], '', 'diagnostic')) as run:
+        result = mr.run_one(1, 'mock-provider', 'mock-model', 'base', 'head', outfile)
+    print(json.dumps({'result': result, 'timeout': run.call_args[1].get('timeout')}))
+`, { payload, exit });
+}
+
+for (const payload of [null, [], [1], 'invalid', 7, true]) {
+  test(`run_one：非对象 JSON ${JSON.stringify(payload)} 是失败而不是异常`, () => {
+    const { result } = runSlot(payload);
+    assert.strictEqual(result.coverage_ok, false);
+    assert.deepStrictEqual(result.comments, []);
+  });
+}
+
+for (const payload of [
+  { status: 'complete' },
+  { status: 'complete', comments: {} },
+  { status: 'complete', comments: [null] },
+  { status: 'complete', comments: [{ content: 17 }] },
+  { status: 'complete', comments: [{ content: 'issue', start_line: '10' }] },
+]) {
+  test(`run_one：拒绝不能安全合并的输出 ${JSON.stringify(payload)}`, () => {
+    const { result } = runSlot(payload);
+    assert.strictEqual(result.coverage_ok, false);
+    assert.deepStrictEqual(result.comments, []);
+  });
+}
+
+test('run_one：非零退出码不能被 complete 输出伪装成成功', () => {
+  const { result } = runSlot({ status: 'complete', comments: [] }, 7);
+  assert.strictEqual(result.exit, 7);
+  assert.strictEqual(result.coverage_ok, false);
+});
+
+test('run_one：有效 complete/partial 保留意见，外部调用有有限正数超时', () => {
+  const comments = [{ path: 'x.js', start_line: 0, content: 'issue', severity: 'high' }];
+  for (const status of ['complete', 'partial']) {
+    const { result, timeout } = runSlot({ status, comments });
+    assert.strictEqual(result.coverage_ok, status === 'complete');
+    assert.deepStrictEqual(result.comments, comments);
+    assert.ok(Number.isFinite(timeout) && timeout > 0, `missing finite timeout: ${timeout}`);
+  }
+});
+
+test('run_one：本地挂起子进程按指定超时结束且返回结构化失败（无 OCR）', () => {
+  const { result, elapsed } = runPython(`
+real_run = subprocess.run
+with tempfile.TemporaryDirectory() as tmp:
+    outfile = os.path.join(tmp, 'review.json')
+    def local_sleep(_cmd, **kwargs):
+        return real_run([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+    start = time.monotonic()
+    with mock.patch.object(mr.subprocess, 'run', side_effect=local_sleep):
+        result = mr.run_one(1, 'mock', 'mock', 'base', 'head', outfile, timeout=0.1)
+    print(json.dumps({'result': result, 'elapsed': time.monotonic() - start}))
+`);
+  assert.strictEqual(result.status, 'timeout');
+  assert.strictEqual(result.coverage_ok, false);
+  assert.strictEqual(result.exit, 124);
+  assert.ok(elapsed < 5, `timeout did not bound execution: ${elapsed}s`);
+});
+
+test('run_one：命令无法启动时返回失败，不丢弃其它槽位', () => {
+  const result = runPython(`
+with mock.patch.object(mr.subprocess, 'run', side_effect=FileNotFoundError('mock missing executable')):
+    result = mr.run_one(1, 'mock', 'mock', 'base', 'head', 'unused.json')
+print(json.dumps(result))
+`);
+  assert.strictEqual(result.coverage_ok, false);
+  assert.strictEqual(result.status, 'error');
+  assert.match(result.stderr_tail, /mock missing executable/);
 });

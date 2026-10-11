@@ -1,4 +1,9 @@
 #!/bin/bash
+# ── 结构化能力标记（机器可读；改实现细节时不要改动这一行）────────────────────────
+# test/ocr-review.test.js 的能力探测读这一行，而不是匹配实现细节字符串——变量改名或
+# 重构不该让用例静默 skip、覆盖无声消失（R18）。缺行会被 test/ocr-review-caps.test.js
+# 判失败（是失败，不是退回字符串匹配）。
+# zca-caps: raw_out raw_out_hardened chain_file deadline total_budget usage_log lock_cleanup
 # ocr 评审包装脚本（zcode-advisor）
 #
 # 平台适配（Windows / Git Bash 与新机，2026-10-08）：
@@ -57,12 +62,24 @@ LOCK_INFO="$LOCK_DIR/info"
 # 若无条件删就会把另一个正在跑的评审的锁连根拔掉——而并行评审正是 FORCE 的用途，
 # 于是「强制并行」变成「两个进程互相拆锁」。清理由 cleanup() 按这个标记判断。
 LOCK_ACQUIRED=""
+# 释放锁：只有「info 里的 pid 仍是我自己」才删目录（R08）。
+# 原实现只判断 LOCK_ACQUIRED（"我取过锁"），不校验 pid：持锁者被接管后其 info 已被
+# 接管者改写，但它退出时照样 rm -rf，把接管者正在用的锁连根删掉——第三个进程随即
+# mkdir 成功，两个评审并行跑，正是这把锁要防的事。info 缺失时仍删（坏锁不该永久残留）。
+release_lock() {
+  [ -n "$LOCK_ACQUIRED" ] || return 0
+  LOCK_OWNER=""
+  [ -f "$LOCK_INFO" ] && LOCK_OWNER="$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)"
+  if [ -z "$LOCK_OWNER" ] || [ "$LOCK_OWNER" = "$$" ]; then
+    rm -rf "$LOCK_DIR"
+  fi
+}
 # OCR_REVIEW_FORCE=1 可绕过（需要并行评审时显式指定）
 if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     LOCK_ACQUIRED=1
     printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
-    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+    trap release_lock EXIT INT TERM
   else
     HOLD_PID=""
     [ -f "$LOCK_INFO" ] && HOLD_PID="$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)"
@@ -76,7 +93,7 @@ if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
     echo "[ocr-review] 发现陈旧锁（pid ${HOLD_PID:-未知} 已退出），接管"
     LOCK_ACQUIRED=1
     printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
-    trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+    trap release_lock EXIT INT TERM
   fi
 fi
 
@@ -308,8 +325,9 @@ cleanup() {
     fi
   fi
   rm -f "$OUT_JSON" ${ATTEMPT_LOG:+"$ATTEMPT_LOG"}
-  # 只在**自己持锁**时回收（见 LOCK_ACQUIRED 定义处）：无条件删会把并行评审的锁拆掉。
-  [ -n "$LOCK_ACQUIRED" ] && rm -rf "$LOCK_DIR"
+  # 只在**自己仍持有锁**时回收（见 release_lock）：无条件删会拆掉并行评审的锁，
+  # 只看 LOCK_ACQUIRED 则会在「已被接管」时误删接管者的锁。
+  release_lock
 }
 trap cleanup EXIT INT TERM
 
@@ -344,8 +362,15 @@ if not isinstance(data, dict):
 if str(data.get("status") or "").lower() != "complete":
     sys.exit(1)
 
-# comments 必须存在且为数组（0 条也是合法的"未发现问题"）
-if not isinstance(data.get("comments"), list):
+# comments 必须存在且为数组（0 条也是合法的"未发现问题"）。
+comments = data.get("comments")
+if not isinstance(comments, list):
+    sys.exit(1)
+
+# 数组 ≠ 元素合法：每个元素都必须是对象。混入 null / 字符串说明上游 LLM 输出已被截断或
+# 损坏，只是恰好还能被 json.loads 解析；渲染层会把这些元素过滤掉 → 0 条意见 → 打出
+# "评审完成 / 未发现问题" 并 exit 0，调用方拿到假绿灯。这里判无效，让它落到下一跳或整体失败。
+if any(not isinstance(c, dict) for c in comments):
     sys.exit(1)
 PYCHECK
 }
@@ -372,36 +397,65 @@ run_with_deadline() {
   #    命中它会把 `timeout 900 ocr review …` 当成非法参数静默跑偏。
   #    GNU 版有 --version，Windows 版没有（实测其退出码与输出均不同）。
   if timeout --version >/dev/null 2>&1; then
-    timeout "$secs" "$@"
+    timeout --kill-after=2s "$secs" "$@"
     return $?
   fi
+  local deadline_flag
+  deadline_flag="$(mktemp "${TMPDIR:-/tmp}/ocr-deadline.XXXXXX")" || return 1
   set -m
   "$@" &
   local cmd_pid=$!
   set +m
+  # 在 leader 仍活着时绑定本次创建的进程组；TERM 后不能再依赖 leader 存在。
+  local cmd_pgid
+  cmd_pgid="$(ps -o pgid= -p "$cmd_pid" 2>/dev/null | tr -d ' ')" || cmd_pgid=""
   (
-    sleep "$secs" 2>/dev/null
-    if [ "$(ps -o pgid= -p "$cmd_pid" 2>/dev/null | tr -d ' ')" = "$cmd_pid" ]; then
-      kill -TERM -- "-$cmd_pid" 2>/dev/null
+    # 复位可能继承来的信号处置：若 TERM 是继承的 SIG_IGN，bash 无法再 trap 它，下面的 trap
+    # 会静默失效（实测：TERM 打上去毫无反应，watcher 与它的计时器都还活着）。
+    trap - INT TERM
+    # 超时判定用「轮询」而不是 `sleep $secs &` + `wait`：wait 一个计时器子进程期间一旦 TERM
+    # 失效/被推迟，就再没有别的机会叫醒 watcher（实测量产现场：watcher 一直挂到计时器自然
+    # 结束，父进程那句 `wait "$watcher_pid"` 因此被拖住最多 secs 秒 —— 全量 OCR 套件连跑时
+    # 挂死 >6 分钟）。轮询不留计时器子进程，TERM 最多被推迟 0.2s，到期判定只晚 ≤0.2s。
+    trap 'exit 0' TERM
+    local started=$SECONDS
+    while [ $((SECONDS - started)) -lt "$secs" ]; do
+      sleep 0.2 2>/dev/null || sleep 1 2>/dev/null || true
+    done
+    printf 'expired\n' > "$deadline_flag"
+    if [ "$cmd_pgid" = "$cmd_pid" ]; then
+      kill -TERM -- "-$cmd_pid" 2>/dev/null || true
     else
-      pkill -TERM -P "$cmd_pid" 2>/dev/null
-      kill -TERM "$cmd_pid" 2>/dev/null
+      pkill -TERM -P "$cmd_pid" 2>/dev/null || true
+      kill -TERM "$cmd_pid" 2>/dev/null || true
     fi
     sleep 2 2>/dev/null
-    if [ "$(ps -o pgid= -p "$cmd_pid" 2>/dev/null | tr -d ' ')" = "$cmd_pid" ]; then
-      kill -KILL -- "-$cmd_pid" 2>/dev/null
+    if [ "$cmd_pgid" = "$cmd_pid" ]; then
+      kill -KILL -- "-$cmd_pid" 2>/dev/null || true
     else
-      pkill -KILL -P "$cmd_pid" 2>/dev/null
-      kill -KILL "$cmd_pid" 2>/dev/null
+      pkill -KILL -P "$cmd_pid" 2>/dev/null || true
+      kill -KILL "$cmd_pid" 2>/dev/null || true
     fi
   ) &
   local watcher_pid=$!
-  # 下面三行的 || rc=$? / || true 是给 set -e 型调用方兜底：超时后这一跳返回 143，
-  # 裸 wait 在 set -euo pipefail 的脚本里会直接把整个评审带走，链就不再降级了（实测踩过）。
+  # wait 失败仍须完成清理，不能让 set -e 型调用方提前中断降级链。
   local rc=0
   wait "$cmd_pid" 2>/dev/null || rc=$?
-  kill "$watcher_pid" 2>/dev/null || true
+  # 超时先标记再 TERM：即使 leader 已退出，watcher 也必须完成孙进程的最终 KILL。
+  if [ ! -s "$deadline_flag" ]; then
+    kill "$watcher_pid" 2>/dev/null || true
+    # TERM 可能被推迟甚至在 watcher 里失效：有界地等它收摊，最后 SIGKILL 兜底。
+    # 这里**绝不**无上限地 wait —— 否则一次评审会白等整段 secs（实测挂死 >6 分钟）。
+    local _i=0
+    while kill -0 "$watcher_pid" 2>/dev/null && [ "$_i" -lt 40 ]; do
+      _i=$((_i + 1))
+      sleep 0.05 2>/dev/null || sleep 1 2>/dev/null || true
+    done
+    # SIGKILL 无法被推迟也无法被忽略（watcher 尚未被 reap，pid 不会被回收；KILL 僵尸是 no-op）。
+    kill -KILL "$watcher_pid" 2>/dev/null || true
+  fi
   wait "$watcher_pid" 2>/dev/null || true
+  rm -f "$deadline_flag"
   return $rc
 }
 

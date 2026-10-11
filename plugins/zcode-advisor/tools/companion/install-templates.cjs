@@ -65,7 +65,7 @@ const winReadme = (embedded) => `ZCode Advisor（输入框角标外挂）— Win
 
 安装：解压后双击 install.cmd（全程明文脚本，可先审阅），完成后桌面出现「ZCode Advisor」图标。
 使用：双击桌面图标 → 以最小化窗口运行外挂（bin\\node.exe，原始官方签名副本）并注入 🛡️ 角标。
-配置：点击输入框旁 🛡️ 角标 → 设置面板：第三方 API 端点 / API key / 拉取模型列表 / Ping 测试 / 保存。
+配置：点击输入框旁 🛡️ 角标 → 设置面板：选择 ZCode 已配置的第三方服务商 / 模型 / Ping 测试 / 保存。
       保存写入 %USERPROFILE%\\.zcode\\advisor.config.json，下一轮审查即生效，无需重启。
 共存：与 zcode-plus 可同时使用（CDP 多客户端附着，✨ 与 🛡️ 共存；谁先启动都行）。
 日志：%USERPROFILE%\\.zcode\\advisor-companion.log
@@ -89,7 +89,7 @@ const macReadme = (embedded) => `ZCode Advisor（输入框角标外挂）— mac
         ? '本包已内嵌官方 Node 运行时，无需系统 Node。'
         : '⚠️ 本包【未内嵌】Node 运行时：需要系统已安装 Node ≥ 22（角标外挂依赖全局 WebSocket，Node 22 起默认提供）。'}
 使用：启动台/聚焦打开 ZCode Advisor → 自动以调试模式启动 ZCode 并注入 🛡️ 角标。
-配置：点击输入框旁 🛡️ 角标 → 设置面板：第三方 API 端点 / API key / 拉取模型列表 / Ping / 保存。
+配置：点击输入框旁 🛡️ 角标 → 设置面板：选择 ZCode 已配置的第三方服务商 / 模型 / Ping / 保存。
       macOS 上若自动探测不到 ZCode，编辑 ~/.zcode/advisor-companion.json 填 {"zcodePath":"/Applications/ZCode.app"}。
 日志：~/.zcode/advisor-companion.log
 卸载：删除 ~/Applications/ZCode Advisor.app 与 ~/Library/Application Support/ZCodeAdvisor。
@@ -110,15 +110,6 @@ ${runtimeFiles.map((f) => `cp -f "$SRC/${f}" "$SUPPORT/"`).join('\n')}
 # launchd 自启动模块：不被 controller require（独立 CLI），故不在闭包推导里，须显式复制。
 [ -f "$SRC/launchd.cjs" ] || { echo "[错误] 发行包缺少 launchd.cjs" >&2; exit 1; }
 cp -f "$SRC/launchd.cjs" "$SUPPORT/"
-
-# 安装插件本体（包内 payload → 调用 auto-enable 走 ZCode 官方 CLI 注册/安装/启用）。
-# 这是 tar.gz 路径的"自动启用"执行点：包内携带 plugin/ 与 auto-enable.cjs，
-# 缺此步骤则用户只装到角标外挂、审查插件本体没装。
-if [ -f "$SRC/plugin/.claude-plugin/marketplace.json" ] && [ -f "$SRC/auto-enable.cjs" ]; then
-  "$SUPPORT/bin/node" "$SRC/auto-enable.cjs" 2>/dev/null || echo "[提示] 插件自动启用未完成，可在 ZCode 内手动添加插件市场：$SRC/plugin"
-else
-  echo "[提示] 包内未找到插件 payload，审查功能需手动安装插件（见 README）"
-fi
 
 # 把 auto-enable.cjs 与 plugin payload 复制进 $SUPPORT：controller 每次启动都会从
 # __dirname 找 auto-enable.cjs 重新执行（0.2.13 起的既有设计），但本脚本此前没有把
@@ -147,6 +138,14 @@ else
   exit 1
 fi
 [ -x "$SUPPORT/bin/node" ] || { echo "[错误] Node 运行时就位校验失败：$SUPPORT/bin/node" >&2; exit 1; }
+
+# 从持久安装目录注册插件；首次安装时运行时和 payload 必须已就位。
+# 不使用解压目录，避免用户删除安装包后市场路径失效。
+if [ -f "$SUPPORT/plugin/.claude-plugin/marketplace.json" ] && [ -f "$SUPPORT/auto-enable.cjs" ]; then
+  "$SUPPORT/bin/node" "$SUPPORT/auto-enable.cjs" || echo "[提示] 插件自动启用未完成，可在 ZCode 内手动添加插件市场：$SUPPORT/plugin"
+else
+  echo "[提示] 包内未找到插件 payload，审查功能需手动安装插件（见 README）"
+fi
 
 cp -f "$SRC/advisor.icns" "$APP/Contents/Resources/" 2>/dev/null || true
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -207,7 +206,7 @@ if command -v xattr >/dev/null 2>&1; then
 fi
 
 echo "已安装：~/Applications/ZCode Advisor.app（启动台可见）"
-echo "已配置登录自启动（LaunchAgent: ~/Library/LaunchAgents/local.zcode.advisor.plist）"
+echo "首次打开应用时将配置登录自启动（LaunchAgent: ~/Library/LaunchAgents/local.zcode.advisor.plist）"
 echo "打开应用即以角标模式启动 ZCode；日志：~/.zcode/advisor-companion.log"
 `;
 

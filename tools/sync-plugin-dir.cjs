@@ -40,7 +40,7 @@ const IGNORED_DIRS = new Set(['__pycache__']);
 // 启动，缺它会导致 MCP 启动失败、插件设置表单的配置桥接失效（实测踩过）。
 const ITEMS = [
   '.zcode-plugin', 'hooks', 'commands', 'tools',
-  'package.json', 'README.md', 'advisor.config.example.json'
+  'package.json', 'README.md', 'ARCHITECTURE.md', 'advisor.config.example.json'
 ];
 
 // 递归比较两个目录，返回差异列表。
@@ -183,7 +183,14 @@ function quarantineOrphans() {
       //（杀毒/索引器/用户手动操作），未守卫会抛错并让整轮隔离中止。
       let isDir = false;
       try { isDir = fs.statSync(destPath).isDirectory(); } catch (_) { continue; }
-      if (isDir) walk(path.join(srcDir, name), destPath, relPath);
+      if (isDir) {
+        // 嵌套类型冲突（源是文件、副本是同名目录）同样必须先隔离，否则 copyIfChanged 会
+        // 在 renameSync 处 EISDIR/ENOTDIR 崩掉整轮同步（实测：hooks/a.js 曾从文件变目录）。
+        let srcIsDir2 = false;
+        try { srcIsDir2 = fs.statSync(path.join(srcDir, name)).isDirectory(); } catch (_) { continue; }
+        if (srcIsDir2) walk(path.join(srcDir, name), destPath, relPath);
+        else retire(destPath, relPath);
+      }
     }
   };
   for (const item of ITEMS) {
@@ -199,16 +206,18 @@ function quarantineOrphans() {
     let destIsDir = false;
     try { srcIsDir = fs.statSync(src).isDirectory(); } catch (_) { continue; }
     try { destIsDir = fs.existsSync(dest) && fs.statSync(dest).isDirectory(); } catch (_) {}
-    if (srcIsDir && destIsDir) walk(src, dest, item);
-    else if (!srcIsDir && fs.existsSync(dest)) {
-      // 单文件项：内容不同由 copyIfChanged 处理，这里只处理类型冲突（源是文件、目标是目录）。
-      // stat 失败（EBUSY/杀毒占用等）必须记进 failed——静默跳过会让"本该隔离的残留"
-      // 留在副本里，而调用方看到 failed 为空、以为已经干净（与 rename 同一类掩盖）。
-      let destIsDir2 = false;
-      try { destIsDir2 = fs.statSync(dest).isDirectory(); }
-      catch (err) { failed.push(`${item}（stat: ${(err && err.code) || err}）`); continue; }
-      if (destIsDir2) retire(dest, item);
-    }
+    if (srcIsDir && destIsDir) { walk(src, dest, item); continue; }
+    if (!fs.existsSync(dest)) continue;
+    // 类型冲突（源是目录/副本是文件，或源是文件/副本是目录）都必须**先隔离旧形态**：
+    // 否则 copyIfChanged 会 mkdirSync 撞同名文件抛 EEXIST、或 renameSync 撞同名目录抛
+    // EISDIR/ENOTDIR（都不是 EPERM/EACCES，重试循环直接 rethrow），整轮同步崩在半途。
+    // 同类型（文件 vs 文件）时内容差异交给 copyIfChanged，只写内容不同的文件。
+    // stat 失败（EBUSY/杀毒占用等）必须记进 failed——静默跳过会让"本该隔离的残留"
+    // 留在副本里，而调用方看到 failed 为空、以为已经干净（与 rename 同一类掩盖）。
+    let destIsDir2 = false;
+    try { destIsDir2 = fs.statSync(dest).isDirectory(); }
+    catch (err) { failed.push(`${item}（stat: ${(err && err.code) || err}）`); continue; }
+    if (destIsDir2 !== srcIsDir) retire(dest, item);
   }
   if (moved === 0 && failed.length === 0) { try { fs.rmdirSync(bin); } catch (_) {} }
   return { moved, failed };
@@ -216,12 +225,15 @@ function quarantineOrphans() {
 
 function sync() {
   fs.mkdirSync(DEST, { recursive: true });
+  // 隔离必须**先**跑：副本里同名但类型相反的旧形态会让 copyIfChanged 直接崩掉整轮同步
+  //（EEXIST/EISDIR/ENOTDIR，见其注释），而那时 .orphan-* 隔离目录还没机会建。
+  // 内容漂移与本函数无关，顺序对它们没有影响。
+  const { moved, failed } = quarantineOrphans();
   for (const item of ITEMS) {
     const src = path.join(ROOT, item);
     if (!fs.existsSync(src)) continue;
     copyIfChanged(src, path.join(DEST, item));
   }
-  const { moved, failed } = quarantineOrphans();
   if (moved > 0) {
     process.stdout.write(`[sync-plugin] 隔离 ${moved} 个源已删除的残留文件（副本内 .orphan-* 目录）\n`);
   }

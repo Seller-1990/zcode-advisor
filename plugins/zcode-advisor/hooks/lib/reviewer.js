@@ -11,32 +11,39 @@ const SEVERITIES = ['none', 'nit', 'concern', 'blocker'];
 function extractJsonObjects(text) {
   const s = String(text || '');
   const objs = [];
+  const len = s.length;
+  // 复杂度（R07）：原实现在失配时「从 start+1 重新扫到结尾」，遇到大量不平衡花括号
+  // （模型输出被截断的典型形态）就是 O(n²)——实测 16K→285ms、48K→2.45s。这里先做一次
+  // 线性预处理，为每个 '{' 预先算出配对的 '}' 下标，外层回退退化为 O(1) 查表。
+  //
+  // 与旧实现唯一的语义差异（**故意**，并已记为测试期望）：旧实现每个候选 '{' 都从
+  // 全新状态开始扫描，因此会把**字符串字面量内部**的 '{' 当成候选，可能从字符串中间
+  // 硬切出一段"合法 JSON"（例：`{bad "k":"x{ "a":1 }"` 旧实现返回 [{a:1}]）。预处理
+  // 遵循本函数既有口径「忽略字符串内的花括号」，这种切片不再发生（返回 []）。
+  const match = new Int32Array(len).fill(-1);
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < len; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') stack.push(i);
+    else if (ch === '}') {
+      const open = stack.pop();
+      if (open !== undefined) match[open] = i;
+    }
+  }
   let from = 0;
   while (true) {
     const start = s.indexOf('{', from);
     if (start === -1) break;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    let end = -1;
-    for (let i = start; i < s.length; i++) {
-      const ch = s[i];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (ch === '\\') escaped = true;
-        else if (ch === '"') inString = false;
-        continue;
-      }
-      if (ch === '"') inString = true;
-      else if (ch === '{') depth++;
-      else if (ch === '}') {
-        depth--;
-        if (depth === 0) {
-          end = i;
-          break;
-        }
-      }
-    }
+    const end = match[start];
     if (end === -1) {
       from = start + 1;
       continue;
@@ -425,9 +432,10 @@ async function callReviewer(params) {
       return { error: 'llm_error', detail: String(err).slice(0, 200) };
     }
     if ((resp.status === 429 || resp.status >= 500) && tries === 0) {
-      disarmGuard(); // 该响应被丢弃：不消费 body，拆掉守卫定时器
       const left = remaining() - RETRY_BACKOFF_MS;
-      if (left < 5000) break; // 剩余预算不足以完成第二次尝试：不重试
+      if (left < 5000) break; // 不重试时仍须保留守卫，直到错误 body 消费完成
+      bodyGuard.controller.abort(); // 不再读取的响应必须中止，释放底层连接/流
+      disarmGuard();
       await new Promise((r) => setTimeout(r, RETRY_BACKOFF_MS + Math.floor(Math.random() * 500)));
       continue;
     }
@@ -435,7 +443,7 @@ async function callReviewer(params) {
   }
 
   if (!resp.ok) {
-    const r = await consumeBody(resp.text().catch(() => ''));
+    const r = await consumeBody(resp.text()).catch(() => ({ ok: true, value: '' }));
     if (!r.ok) return { error: 'llm_timeout' }; // body 读取撞上 deadline
     return { error: `llm_http_${resp.status}`, detail: String(r.value).slice(0, 200) };
   }

@@ -69,7 +69,7 @@ test('resolveHealthDir：优先级 HEALTH_DIR > STATE_DIR > ~/.zcode', () => {
 });
 
 test('beaconPath：会话 id 被清洗（防路径穿越 / 非法文件名）', () => {
-  const dir = '/tmp/x';
+  const dir = path.join(os.tmpdir(), 'x');
   assert.strictEqual(HEALTH.beaconPath(dir, 'sess_abc-123'), path.join(dir, 'advisor-health-sess_abc-123.json'));
   const bad = HEALTH.beaconPath(dir, '../../etc/passwd');
   assert.ok(!bad.includes('..'), '不得保留路径穿越片段');
@@ -96,7 +96,9 @@ test('writeAttempt + writeResult：合并写，attempt 不被 result 覆盖', ()
   assert.strictEqual(got.reviews, 3);
   // 文件权限：含会话 id / 模型名，应收紧到 0600
   const f = path.join(dir, 'advisor-health-s1.json');
-  assert.strictEqual(fs.statSync(f).mode & 0o777, 0o600, '信标文件应为 0600');
+  if (process.platform !== 'win32') {
+    assert.strictEqual(fs.statSync(f).mode & 0o777, 0o600, '信标文件应为 0600');
+  }
 });
 
 test('writeResult(失败)：不更新 lastSuccessAt（判据：有尝试无新鲜成功 = down）', () => {

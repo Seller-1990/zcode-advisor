@@ -455,6 +455,52 @@ test('callReviewer(openai)：显式 protocol=openai 时仍走 chat/completions�
   }
 });
 
+// 错误响应也必须让 deadline 活到 body 消费结束；测试只用 fetch stub。
+for (const status of [400, 429, 500]) {
+  test(`core regression: HTTP ${status} 慢错误体按 deadline 中止`, async (t) => {
+    const { callReviewer } = require('../hooks/lib/reviewer');
+    let signal;
+    let rejectBody;
+    t.mock.method(globalThis, 'fetch', async (_url, options) => {
+      signal = options.signal;
+      return { ok: false, status, text: () => new Promise((_resolve, reject) => {
+        rejectBody = reject;
+        signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+      }) };
+    });
+    let watchdog;
+    try {
+      const result = await Promise.race([
+        callReviewer({ baseUrl: 'https://fixture.invalid/v1', apiKey: 'k', model: 'm', userContent: 'x', timeoutMs: 1100 }),
+        new Promise((resolve) => { watchdog = setTimeout(() => resolve({ error: 'test_watchdog' }), 1800); })
+      ]);
+      assert.strictEqual(result.error, 'llm_timeout');
+      assert.strictEqual(signal.aborted, true);
+    } finally {
+      clearTimeout(watchdog);
+      if (rejectBody) rejectBody(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    }
+  });
+}
+
+test('core regression: HTTP 重试前中止被丢弃响应', async (t) => {
+  const { callReviewer } = require('../hooks/lib/reviewer');
+  let firstSignal;
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    calls++;
+    if (calls === 1) {
+      firstSignal = options.signal;
+      return { ok: false, status: 500 };
+    }
+    assert.strictEqual(firstSignal.aborted, true, '重试不能遗留未中止的第一条响应流');
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{"severity":"none","note":""}' } }] }) };
+  });
+  const result = await callReviewer({ baseUrl: 'https://fixture.invalid/v1', apiKey: 'k', model: 'm', userContent: 'x', timeoutMs: 10000 });
+  assert.strictEqual(result.error, undefined);
+  assert.strictEqual(calls, 2);
+});
+
 // ---------------- 复审整改（protocol 优先级 / 尾斜杠 / 信封容错） ----------------
 // 复审实测：隐式 `/messages$` 判定若**覆盖**显式 protocol，会让「baseUrl 恰好以 /messages
 // 结尾的 OpenAI 兼容服务商」被误判成 anthropic —— key 以 x-api-key 发到 OpenAI 端点，

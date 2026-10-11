@@ -98,7 +98,9 @@ function readDelta(transcriptPath, byteOffset, opts) {
     if (stat.size - start > backfill) {
       start = stat.size - backfill;
       reset = true;
-      skipFirstLine = true; // 该点大概率落在行中间，丢弃首个残行
+      const previous = Buffer.alloc(1);
+      const previousRead = fs.readSync(fd, previous, 0, 1, start - 1);
+      skipFirstLine = previousRead !== 1 || previous[0] !== 10;
     }
 
     if (start < stat.size) {
@@ -192,8 +194,15 @@ function renderDelta(entries, opts) {
     const kept = [];
     let total = 0;
     for (let i = body.length - 1; i >= 0; i--) {
-      const len = body[i].length + 1;
-      if (total + len > maxContextChars) break;
+      const len = body[i].length + (kept.length > 0 ? 1 : 0);
+      if (total + len > maxContextChars) {
+        if (kept.length === 0) {
+          // 合法小预算也必须保留最新内容；按 UTF-16 帽裁切时不留下半个代理对。
+          const prefix = body[i].slice(0, Math.max(0, maxContextChars - 1)).replace(/[\uD800-\uDBFF]$/, '');
+          kept.push(`${prefix}…`);
+        }
+        break;
+      }
       kept.unshift(body[i]);
       total += len;
     }

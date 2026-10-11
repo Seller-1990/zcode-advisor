@@ -18,6 +18,33 @@ const L1 = '{"type":"user","message":{"role":"user","content":[{"type":"text","t
 const L2 = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"第一答"}]}}\n';
 const L3 = '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"第二问"}]}}\n';
 
+test('core regression: backfill 正好命中行首时保留完整首行', () => {
+  const file = tmpFile('aligned.jsonl', L1 + L2 + L3);
+  const r = readDelta(file, 0, { backfillLimitBytes: Buffer.byteLength(L2 + L3) });
+  assert.strictEqual(r.reset, true);
+  assert.strictEqual(r.entries.length, 2);
+  assert.strictEqual(r.entries[0].parts[0].text, '第一答');
+});
+
+test('core regression: maxContextChars 小于单行时仍保留最新内容', () => {
+  const entries = [extractEntry(JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: '😀'.repeat(300) } }))];
+  const opts = { maxDeltaMessages: 60, maxContextChars: 100, userChars: 4000, assistantChars: 4000, toolChars: 300 };
+  const r = renderDelta(entries, opts);
+  assert.strictEqual(r.count, 1);
+  assert.ok(r.text.startsWith('【主模型】'));
+  assert.ok(r.text.length <= 100);
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(r.text), '不能截断emoji代理对');
+});
+
+test('core regression: maxContextChars 等于单行长度时不得丢弃', () => {
+  const entries = [
+    extractEntry(JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: '较早内容' } })),
+    extractEntry(JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: '你好' } }))
+  ];
+  const r = renderDelta(entries, { maxDeltaMessages: 60, maxContextChars: '【主模型】你好'.length, assistantChars: 4000 });
+  assert.strictEqual(r.text, '【主模型】你好');
+});
+
 test('增量读取：第二次只读到追加内容，残行不消费', () => {
   const file = tmpFile('t.jsonl', L1 + L2);
   const first = readDelta(file, 0);

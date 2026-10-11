@@ -10,7 +10,9 @@
 //
 // 这些用例用一个隔离的临时 git 仓库 + 假 `ocr` 驱动真实脚本，不碰本仓库状态。
 
-const test = require('node:test');
+const nodeTest = require('node:test');
+// 此套件测 POSIX 运维脚本；Windows 明确列为 skip，不跳过任何 Windows 核心功能测试。
+const test = process.platform === 'win32' ? nodeTest.skip : nodeTest;
 const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
@@ -18,34 +20,156 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
-const REVIEWER_SRC = path.join(REPO_ROOT, 'scripts', 'ocr-review.sh');
+// 红灯取证用：允许把待测脚本换成一份 pre-fix 快照（快照与 WORKDIR 同源时行为等价）。
+const REVIEWER_SRC = process.env.ZCA_OCR_REVIEWER || path.join(REPO_ROOT, 'scripts', 'ocr-review.sh');
 const REVIEWER_SRC_TEXT = fs.readFileSync(REVIEWER_SRC, 'utf8');
 
-// 能力探测：RAW_OUT 支持是与另一处改动同文件落地的，若工作区/HEAD 的脚本还没有它，
-// 这些用例应当**跳过**而不是失败——否则一个尚未合入的特性会把整个测试套件染红。
-const SUPPORTS_RAW_OUT = REVIEWER_SRC_TEXT.includes('OCR_REVIEW_RAW_OUT');
+// 只调用被提取的 deadline 函数，timeout 由 shell 函数替身接管；不运行 OCR/git。
+test('run_with_deadline：GNU timeout 必须带最终 KILL 上限并透传退出码', () => {
+  const start = REVIEWER_SRC_TEXT.indexOf('run_with_deadline() {');
+  const end = REVIEWER_SRC_TEXT.indexOf('\n}\n', start);
+  assert.ok(start >= 0 && end > start, 'deadline 函数应存在');
+  const definition = REVIEWER_SRC_TEXT.slice(start, end + 3);
+  const probe = `${definition}\ntimeout() {\n  if [ "$1" = "--version" ]; then return 0; fi\n  printf '%s\\n' "$@"\n  return 124\n}\nrun_with_deadline 1 mock-command\n`;
+  const result = spawnSync('bash', ['-c', probe], { encoding: 'utf8', timeout: 5000 });
+  assert.ifError(result.error);
+  assert.strictEqual(result.status, 124, 'GNU 超时码应原样透传');
+  assert.deepStrictEqual(result.stdout.trim().split(/\r?\n/), ['--kill-after=2s', '1', 'mock-command']);
+});
+
+test('run_with_deadline：fallback 在 leader 先退出后仍 KILL 忽略 TERM 的孙进程', () => {
+  const start = REVIEWER_SRC_TEXT.indexOf('run_with_deadline() {');
+  const end = REVIEWER_SRC_TEXT.indexOf('\n}\n', start);
+  assert.ok(start >= 0 && end > start);
+  const definition = REVIEWER_SRC_TEXT.slice(start, end + 3);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'deadline-child-'));
+  const childPidFile = path.join(dir, 'child.pid');
+  const leaderPidFile = path.join(dir, 'leader.pid');
+  const helper = path.join(dir, 'helper.cjs');
+  const childCode = `process.on('SIGTERM', () => {}); require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);`;
+  fs.writeFileSync(helper, `require('fs').writeFileSync(process.argv[3], String(process.pid)); require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childCode)}, process.argv[2]], { stdio: 'ignore' }); setInterval(() => {}, 1000);`);
+  try {
+    // 预算给 3s 而不是 1s（R23）：并行跑整个套件时，leader 启动 node + spawn 孙进程可能被拖到
+    // 1s 之外，孙进程还没登记 pid 就被计时器打断（实测 ENOENT child.pid）。本用例检查的是
+    // 「到期后的 TERM→KILL 收尾」，与预算具体几秒无关，故留足余量换确定性。
+    const probe = `${definition}\ntimeout() { return 1; }\nrun_with_deadline 3 "$NODE_BIN" "$HELPER" "$CHILD_PID_FILE" "$LEADER_PID_FILE"\n`;
+    const result = spawnSync('bash', ['-c', probe], {
+      encoding: 'utf8', timeout: 10000,
+      env: { ...process.env, NODE_BIN: process.execPath, HELPER: helper, CHILD_PID_FILE: childPidFile, LEADER_PID_FILE: leaderPidFile },
+    });
+    assert.ifError(result.error);
+    assert.ok([137, 143].includes(result.status), `expected timeout, got ${result.status}: ${result.stderr}`);
+    assert.ok(
+      fs.existsSync(childPidFile),
+      `夹具未就绪：孙进程没有在预算内登记 pid（stderr=${JSON.stringify(result.stderr)}）`
+    );
+    const childPid = fs.readFileSync(childPidFile, 'utf8').trim();
+    // 判定「已不在运行」：进程消失 / 僵尸 / 标志位含 E（macOS 实测刚被 SIGKILL 的进程常报 `?E`，
+    // E 标志＝正在退出，它不是「还活着」）。旧断言只认 Z，在 macOS 上会随机翻红。
+    // 另外轮询最多 2s，避免把「KILL 刚投递、状态尚未迁移完」误判成失败。
+    const stat = () => spawnSync('ps', ['-o', 'stat=', '-p', childPid], { encoding: 'utf8' });
+    let lastState = '';
+    let stopped = false;
+    for (let i = 0; i < 40; i++) {
+      const state = stat();
+      assert.ifError(state.error);
+      lastState = `${state.status} ${JSON.stringify(state.stdout.trim())}`;
+      if (state.status !== 0 || /^\s*Z/.test(state.stdout) || /E/.test(state.stdout)) {
+        stopped = true;
+        break;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+    assert.ok(stopped, `TERM-ignoring child remains alive: ${childPid} ${lastState}`);
+  } finally {
+    // Only fixture-created PIDs are eligible for cleanup; never target the runner process group.
+    for (const pidFile of [childPidFile, leaderPidFile]) {
+      if (!fs.existsSync(pidFile)) continue;
+      const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+      if (Number.isInteger(pid) && pid > 0) {
+        try { process.kill(pid, 'SIGKILL'); } catch (err) { if (err.code !== 'ESRCH') throw err; }
+      }
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('run_with_deadline：fallback 快命令保留退出码且立即取消计时器', () => {
+  const start = REVIEWER_SRC_TEXT.indexOf('run_with_deadline() {');
+  const end = REVIEWER_SRC_TEXT.indexOf('\n}\n', start);
+  assert.ok(start >= 0 && end > start);
+  const definition = REVIEWER_SRC_TEXT.slice(start, end + 3);
+  const probe = `${definition}\ntimeout() { return 1; }\nrun_with_deadline 2 sh -c 'exit 7'\n`;
+  const result = spawnSync('bash', ['-c', probe], { encoding: 'utf8', timeout: 10000 });
+  assert.ifError(result.error);
+  assert.strictEqual(result.status, 7);
+});
+
+// R21（清单外，批次四验证时新发现，直接卡住本批验证）：watcher 的 TERM 会被「等计时器」的
+// wait 拖住——bash 在 `wait <具体子进程>` 期间不跑 trap，而 watcher 恰恰总停在该 wait 上。
+// 于是命令早已正常结束，父进程那句 `wait "$watcher_pid"` 仍要等 secs 秒计时器睡满才返回：
+// 一次评审白等 HOP_LIMIT 秒（实测全量 OCR 套件连跑时挂死 >6 分钟，`ps` 可见 watcher + sleep 900）。
+test('run_with_deadline：TERM 对 watcher 无效时也必须在上限内返回（不得被计时器拖住）', () => {
+  const start = REVIEWER_SRC_TEXT.indexOf('run_with_deadline() {');
+  const end = REVIEWER_SRC_TEXT.indexOf('\n}\n', start);
+  assert.ok(start >= 0 && end > start);
+  const definition = REVIEWER_SRC_TEXT.slice(start, end + 3);
+  // `trap '' TERM` 确定性模拟「TERM 送到 watcher 却毫无作用」：bash 里被忽略的信号无法再被
+  // trap，watcher 收不到 TERM，只能等自己的计时器。生产现场实测过这个形态（kill -TERM 打上去
+  // 毫无反应、watcher 与计时器都还活着，父进程那句 `wait "$watcher_pid"` 因此被拖住最多 secs
+  // 秒 —— 全量 OCR 套件连跑时挂死 >6 分钟）。
+  // 旧实现：必须等满 6s 计时器 + 到期后 sleep 2 + KILL，实测约 8s；
+  // 修好后：父进程有界等待 + SIGKILL 兜底，约 2s（40 × 0.05s 轮询上限）。
+  const probe = `${definition}\ntimeout() { return 1; }\ntrap '' TERM\nSTART=$(date +%s)\nrun_with_deadline 6 sh -c 'exit 0'\nEND=$(date +%s)\necho "elapsed=$((END-START))"\n`;
+  const result = spawnSync('bash', ['-c', probe], { encoding: 'utf8', timeout: 30000 });
+  assert.ifError(result.error);
+  const elapsed = Number((result.stdout.match(/elapsed=(\d+)/) || [])[1]);
+  assert.ok(
+    Number.isFinite(elapsed),
+    `探针没有输出 elapsed（stdout=${JSON.stringify(result.stdout)} stderr=${JSON.stringify(result.stderr)}）`
+  );
+  assert.ok(
+    elapsed < 4,
+    `TERM 对 watcher 无效时父进程必须自行兜底退出，却等了 ${elapsed}s —— 无上限 wait 被计时器拖满`
+  );
+});
+
+// 能力探测（R18）：以 scripts/ocr-review.sh 顶部的**结构化声明**为准：
+//   # zca-caps: raw_out raw_out_hardened chain_file deadline total_budget usage_log lock_cleanup
+//
+// 早先按实现细节字符串探测（`/mv -f "\$_raw_tmp"/`、`/LOCK_ACQUIRED/`、`includes('run_with_deadline')`…），
+// 只要有人把变量名改掉（语义等价的重构），对应用例就**静默变成 skip**：套件照样全绿，
+// 覆盖却没了。现在改读声明；读不到声明（例如指向历史快照）时才退回旧的字面量探测。
+// 当前仓库的脚本必须带声明，由 test/ocr-review-caps.test.js 负责看住这一点。
+const CAPS_DECL = /^\s*#\s*zca-caps:\s*(.+)$/m.exec(REVIEWER_SRC_TEXT);
+const DECLARED_CAPS = CAPS_DECL ? new Set(CAPS_DECL[1].trim().split(/\s+/)) : null;
+const hasCap = (name, fallback) => (DECLARED_CAPS ? DECLARED_CAPS.has(name) : fallback());
+
+const SUPPORTS_RAW_OUT = hasCap('raw_out', () => REVIEWER_SRC_TEXT.includes('OCR_REVIEW_RAW_OUT'));
 const skipUnlessRawOut = SUPPORTS_RAW_OUT
   ? {}
   : { skip: 'scripts/ocr-review.sh 尚不支持 OCR_REVIEW_RAW_OUT（同文件改动未合入）' };
 
 // 加固版（拒绝目录 / 同目录临时文件 + mv 原子发布 / 不跟随符号链接）是第二轮评审整改后
 // 才有的。只探测到 OCR_REVIEW_RAW_OUT 并不代表加固已合入，故单独探测。
-const SUPPORTS_RAW_OUT_HARDENED =
-  SUPPORTS_RAW_OUT && /mv -f "\$_raw_tmp"/.test(REVIEWER_SRC_TEXT);
+const SUPPORTS_RAW_OUT_HARDENED = hasCap(
+  'raw_out_hardened',
+  () => SUPPORTS_RAW_OUT && /mv -f "\$_raw_tmp"/.test(REVIEWER_SRC_TEXT)
+);
 const skipUnlessHardened = SUPPORTS_RAW_OUT_HARDENED
   ? {}
   : { skip: 'scripts/ocr-review.sh 的 RAW_OUT 尚未加固（原子发布/目录拒绝）' };
 
 // 链外置 / 时间预算 / 用量台账 / 锁清理 是另一处改动引入的能力，与 RAW_OUT 同文件但独立。
 // 逐项探测、缺哪项跳哪项，免得「同文件里一个特性已合入、另一个还没合」时整套测试被染红。
-const SUPPORTS_CHAIN_FILE = REVIEWER_SRC_TEXT.includes('OCR_REVIEW_CHAIN_FILE');
-const SUPPORTS_DEADLINE = REVIEWER_SRC_TEXT.includes('run_with_deadline');
-const SUPPORTS_BUDGET = REVIEWER_SRC_TEXT.includes('OCR_REVIEW_TOTAL_BUDGET');
-const SUPPORTS_USAGE_LOG = REVIEWER_SRC_TEXT.includes('OCR_REVIEW_USAGE_LOG');
+const SUPPORTS_CHAIN_FILE = hasCap('chain_file', () => REVIEWER_SRC_TEXT.includes('OCR_REVIEW_CHAIN_FILE'));
+const SUPPORTS_DEADLINE = hasCap('deadline', () => REVIEWER_SRC_TEXT.includes('run_with_deadline'));
+const SUPPORTS_BUDGET = hasCap('total_budget', () => REVIEWER_SRC_TEXT.includes('OCR_REVIEW_TOTAL_BUDGET'));
+const SUPPORTS_USAGE_LOG = hasCap('usage_log', () => REVIEWER_SRC_TEXT.includes('OCR_REVIEW_USAGE_LOG'));
 // 锁清理：cleanup() 的 trap 会覆盖前面那个锁 trap，故必须在 cleanup 里再删一次。
 // 但**必须只删自己拿到的锁**：OCR_REVIEW_FORCE=1 整段跳过、根本不取锁，无条件删会把
 // 另一个正在跑的评审的锁连根拔掉——而并行正是 FORCE 的用途。
-const SUPPORTS_LOCK_CLEANUP = /LOCK_ACQUIRED/.test(REVIEWER_SRC_TEXT);
+const SUPPORTS_LOCK_CLEANUP = hasCap('lock_cleanup', () => /LOCK_ACQUIRED/.test(REVIEWER_SRC_TEXT));
 
 const skipUnlessChainFile = SUPPORTS_CHAIN_FILE
   ? {}
@@ -648,12 +772,18 @@ test('ocr-review.sh：FORCE=1 并行运行时不得删掉别人的锁', skipUnle
     'FORCE=1 没有取锁，退出时却把锁删了 —— 并行评审会互相拆锁'
   );
 });
-// 同时钉住**有条件的**回收——无条件 rm -rf 会让 FORCE=1 的并行评审互相拆锁。
-test('ocr-review.sh：cleanup 回收 LOCK_DIR 必须限定在自己持锁时', skipUnlessLockCleanup, () => {
+// 同时钉住**有条件的**回收——无条件 rm -rf 会让 FORCE=1 的并行评审互相拆锁，
+// 而只看 LOCK_ACQUIRED 又会在「锁已被接管」时删掉接管者的锁（R08）。
+test('ocr-review.sh：cleanup 回收 LOCK_DIR 必须限定为自己仍持锁时', skipUnlessLockCleanup, () => {
   assert.match(
     REVIEWER_SRC_TEXT,
-    /\[ -n "\$LOCK_ACQUIRED" \] && rm -rf "\$LOCK_DIR"/,
-    'cleanup 的 trap 覆盖了锁 trap，必须在这里回收 LOCK_DIR；且必须限定 LOCK_ACQUIRED，否则拆掉并行评审的锁'
+    /^release_lock\(\) \{/m,
+    '删锁必须走 release_lock（校验 info 里的 pid 是否仍是自己）'
+  );
+  assert.match(
+    REVIEWER_SRC_TEXT,
+    /^  release_lock$/m,
+    'cleanup 的 trap 覆盖了锁 trap，必须在这里回收 LOCK_DIR；且必须限定为自己仍持锁'
   );
   // 反面：不得再出现无条件的 rm -rf "$LOCK_DIR"（FORCE=1 路径从未取锁）
   assert.doesNotMatch(
@@ -661,4 +791,78 @@ test('ocr-review.sh：cleanup 回收 LOCK_DIR 必须限定在自己持锁时', s
     /rm -rf \$\{LOCK_DIR:\+"\$LOCK_DIR"\}/,
     'FORCE=1 不取锁却删锁 = 拆掉并发评审的锁，这个写法已废弃'
   );
+  // 反面：不得绕过 release_lock 直接删锁目录（早期 trap 与 cleanup 都必须走它）
+  assert.doesNotMatch(
+    REVIEWER_SRC_TEXT,
+    /trap 'rm -rf "\$LOCK_DIR"'/,
+    '删除锁目录必须经 release_lock 校验归属'
+  );
+});
+
+// R08：持锁者被接管后，原持锁者退出时不得把接管者正在用的锁连根删掉。
+// 原实现只判断 LOCK_ACQUIRED（"我取过锁"），不校验 info 里的 pid 是否仍是自己：
+// A 的 info 被 B 接管改写后，A 退出仍 rm -rf → B 的锁消失，第三个进程立刻 mkdir 成功，
+// 两个评审并行跑（正是这把锁要防的事）。
+test('ocr-review.sh：被接管后原持锁者退出不得删掉接管者的锁', skipUnlessLockCleanup, () => {
+  const sb = mkSandbox();
+  const lockDir = path.join(sb.repo, '.git', 'ocr-review.lock');
+  const info = path.join(lockDir, 'info');
+  // 假 ocr 在评审进行中把 info 改写成「接管者」的 pid（用本测试进程，保证 kill -0 为真）
+  writeFakeOcr(sb, `#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --output) out="$2"; shift 2;; *) shift;; esac; done
+printf 'pid=${process.pid}\\nstarted=0\\n' > ${JSON.stringify(info)}
+printf '%s\\n' '${JSON.stringify(COMPLETE_JSON)}' > "$out"
+echo "fake ocr ok"
+`);
+  runReviewer(sb, { OCR_REVIEW_FORCE: '' });
+  assert.ok(
+    fs.existsSync(lockDir),
+    '原持锁者退出时把接管者的锁删了 —— 第三个进程会立刻取锁成功，两个评审并行'
+  );
+  assert.match(
+    fs.readFileSync(info, 'utf8'),
+    new RegExp(`^pid=${process.pid}$`, 'm'),
+    '原持锁者不得清掉接管者写入的锁信息'
+  );
+});
+
+// —— R10（残留）：OCR 输出的 comments 元素未做类型/结构验证 ——
+// valid_output 原先只看「comments 是数组」就认为这一跳完整。数组里混进 null / 字符串
+// 说明上游 LLM 输出已被截断或损坏（只是恰好还能被 json.loads 解析），而渲染层会把非对象
+// 元素过滤掉 → 0 条意见 → 打出「评审完成 / 未发现问题」并 exit 0：坏结果被当成成功发布，
+// 调用方（pre-push hook / CI）拿到的是绿色信号。
+test('ocr-review.sh：comments 里混入非对象元素时必须判无效并失败退出', () => {
+  const sb = mkSandbox();
+  writeFakeOcr(sb, `#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --output) out="$2"; shift 2;; *) shift;; esac; done
+printf '%s\\n' '{"status":"complete","comments":[null,"垃圾","{截断"],"summary":"坏结论"}' > "$out"
+echo "fake ocr ok"
+`);
+  const r = runReviewerSync(sb, {});
+  assert.notStrictEqual(
+    r.code,
+    0,
+    `元素损坏的输出必须判本次评审无效（链耗尽后非零退出），实际 exit=${r.code}；stdout=${r.stdout}`
+  );
+  assert.doesNotMatch(
+    r.stdout,
+    COMPLETED_RE,
+    '不得把元素损坏的输出当成一次完成的评审（否则「未发现问题」是假绿灯）'
+  );
+});
+
+// 反向锁：真正「0 条意见」的干净结论必须仍然通过——加固不得把正常放行变成误杀。
+test('ocr-review.sh：comments 为空的干净结论仍必须通过（R10 加固不得误杀）', () => {
+  const sb = mkSandbox();
+  writeFakeOcr(sb, `#!/usr/bin/env bash
+out=""
+while [ $# -gt 0 ]; do case "$1" in --output) out="$2"; shift 2;; *) shift;; esac; done
+printf '%s\\n' '{"status":"complete","comments":[],"summary":"未发现问题"}' > "$out"
+echo "fake ocr ok"
+`);
+  const out = runReviewer(sb, {});
+  assert.match(out, COMPLETED_RE, '空 comments 是合法的「未发现问题」');
+  assert.match(out, /未发现问题/);
 });

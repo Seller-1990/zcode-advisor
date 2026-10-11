@@ -66,7 +66,7 @@ const DEFAULTS = {
 
 const INT_KEYS = ['immuneTurns', 'maxDeltaMessages', 'maxTokens', 'maxBlocksPerTurn', 'reviewTimeoutMs', 'maxContextChars', 'pendingNotesCap', 'maxNoteChars', 'maxGlobalWorkers', 'backfillLimitBytes'];
 // 必须为正的整数键（immuneTurns 允许 0）。越界回退默认并挂 problems，防止 0/负数触发静默荒谬行为。
-const POSITIVE_INT_KEYS = INT_KEYS.filter((k) => k !== 'immuneTurns');
+const POSITIVE_INT_KEYS = INT_KEYS.filter((k) => k !== 'immuneTurns' && k !== 'maxTokens');
 const BOOL_KEYS = ['proseFallback', 'startEnabled'];
 const FLOAT_KEYS = ['temperature'];
 
@@ -186,7 +186,7 @@ function readZcodeProviders(env) {
   try {
     raw = JSON.parse(fs.readFileSync(zcodeConfigPath(env), 'utf8'));
   } catch (_) {
-    return [];
+    // 两个配置源独立：主文件缺失/损坏不应屏蔽界面新建的服务商。
   }
   const map = raw && raw.provider && typeof raw.provider === 'object' ? raw.provider : {};
   const out = [];
@@ -214,11 +214,8 @@ function readZcodeProviders(env) {
     });
   }
   // 合并第二个源（provider_config.json）：用户在 ZCode 界面新建的服务商只写在那里。
-  // ⚠️ 两源**存在 ID 重叠**（实测 4 个：Ark API / Fengwind / lucy / AIPM），故不能简单去重：
-  //   重叠项的 baseUrl 与 apiKey 实测**完全相同**，但 provider_config 侧的
-  //   personalModelIds **更全**（如 Ark 4 vs 2、lucy 5 vs 3）——它是更新的一侧。
-  //   合并策略：以 config.json 的条目为基底（保留它的 source/official 标记与既有顺序），
-  //   但用 provider_config 的模型清单**补全**（取并集，保持前者顺序在前，避免下拉跳动）。
+  // 两源可能共享 ID；模型清单取并集。凭据/协议优先完整 config 元组，
+  // 否则整体使用完整 provider_config 元组，绝不根据历史样本推定字段可互补。
   const byId = new Map(out.map((p) => [p.id, p]));
   for (const p of readProviderConfigRules(env)) {
     const rawKey = String(p.apiKey || '').trim();
@@ -228,9 +225,14 @@ function readZcodeProviders(env) {
       const merged = exist.models.slice();
       for (const m of p.models) if (!merged.includes(m)) merged.push(m);
       exist.models = merged;
-      // 端点/key 两源一致（实测）；仅当 config.json 侧缺失时才补，避免意外覆盖。
-      if (!exist.baseURL && p.baseURL) exist.baseURL = p.baseURL;
-      if (!exist.apiKey && key) exist.apiKey = key;
+      // 凭据与协议不可跨源补字段：完整主元组优先，否则整体选完整第二元组。
+      // 两侧都不完整时保留不可用状态，由门禁明确拒绝，不能猜 key 属于哪个端点。
+      if (!(exist.eligible && exist.baseURL && exist.apiKey) && isUsableKind(p.kind) && p.baseURL && key) {
+        Object.assign(exist, {
+          baseURL: p.baseURL, apiKey: key, kind: p.kind,
+          protocol: protocolOf(p.kind), eligible: true, source: p.source
+        });
+      }
       continue;
     }
     const item = Object.assign({}, p, { apiKey: key, eligible: isUsableKind(p.kind), protocol: protocolOf(p.kind) });
@@ -475,7 +477,8 @@ function loadConfig(pluginRoot, env) {
   // maxTokens 专守卫：接受字符串数字（手写配置常见，Number("8192")=8192 直接采用）；
   // 数值越界**钳到** [64,16384]（贴近用户意图，低侧回退是 64 倍成本惩罚、高侧回退是 4 倍质量退化）；
   // 非整数垃圾（""/null/true/[]）回退默认。修复：字符串被静默降级、999999999 无上界直发、浮点穿透。
-  const mtRaw = Number(cfg.maxTokens);
+  const mtRaw = (typeof cfg.maxTokens === 'number' || (typeof cfg.maxTokens === 'string' && cfg.maxTokens.trim()))
+    ? Number(cfg.maxTokens) : NaN;
   if (!Number.isInteger(mtRaw) || mtRaw <= 0) {
     problems.push(`config_out_of_range: maxTokens=${JSON.stringify(cfg.maxTokens)} 不是正整数，已回退默认 ${DEFAULTS.maxTokens}`);
     cfg.maxTokens = DEFAULTS.maxTokens;

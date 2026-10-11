@@ -19,11 +19,17 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-// 隔离生产日志：controller.cjs:135 在 require 期固化 LOG_FILE。本文件目前不写日志，
-// 但「require controller 就必须隔离日志路径」是这里的统一约束——否则将来新增用例
-// 一旦走到 startApi/saveUserConfig，噪音会直接落进用户真实日志。
-process.env.ZCODE_ADVISOR_COMPANION_LOG = path.join(
-  fs.mkdtempSync(path.join(os.tmpdir(), 'zca-lock-log-')), 'companion.log');
+// 捕获 controller 常量前隔离 HOME 与临时目录，绝不备份/覆盖宿主租约。
+const hostTmp = os.tmpdir();
+const fixture = fs.mkdtempSync(path.join(hostTmp, 'zca-lock-test-'));
+Object.assign(process.env, {
+  HOME: fixture, USERPROFILE: fixture, TMPDIR: fixture, TMP: fixture, TEMP: fixture,
+  ZCODE_ADVISOR_COMPANION_LOG: path.join(fixture, 'companion.log')
+});
+test.after(() => {
+  assert.ok(path.resolve(fixture).startsWith(path.resolve(hostTmp) + path.sep + 'zca-lock-test-'));
+  fs.rmSync(fixture, { recursive: true, force: true });
+});
 
 const { _internal: I } = require('../tools/companion/controller.cjs');
 const LOCK = I.LOCK_FILE;

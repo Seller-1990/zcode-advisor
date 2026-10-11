@@ -141,9 +141,9 @@ test('toggleSessionEnabled：无信标 → no_session', () => {
 test('toggleSessionEnabled：与 hook 侧活锁并发 → lock_timeout（互斥而非互相覆盖）', () => {
   writeBeacon();
   writeState({ enabled: true });
-  // 模拟 hook 正持锁：wrlock 内容为存活 pid（pid 1 恒存在）、mtime 新鲜
+  // 模拟 hook 正持锁：使用所有平台都存活的本进程 pid、mtime 新鲜
   const file = path.join(stateDir, `sess-${SESSION_ID}.json`);
-  fs.writeFileSync(`${file}.wrlock`, '1');
+  fs.writeFileSync(`${file}.wrlock`, String(process.pid));
   try {
     const r = controller.toggleSessionEnabled(false);
     assert.strictEqual(r.ok, false);

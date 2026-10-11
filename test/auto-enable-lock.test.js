@@ -17,6 +17,16 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
+// 子进程继承隔离路径；锁、日志、假可执行文件全部落在 fixture。
+const hostTmp = os.tmpdir();
+const fixture = fs.mkdtempSync(path.join(hostTmp, 'zca-auto-enable-test-'));
+Object.assign(process.env, {
+  HOME: fixture, USERPROFILE: fixture, TMPDIR: fixture, TMP: fixture, TEMP: fixture
+});
+test.after(() => {
+  assert.ok(path.resolve(fixture).startsWith(path.resolve(hostTmp) + path.sep + 'zca-auto-enable-test-'));
+  fs.rmSync(fixture, { recursive: true, force: true });
+});
 const SCRIPT = path.join(__dirname, '..', 'tools', 'companion', 'auto-enable.cjs');
 const LOCK = path.join(os.homedir(), '.zcode', 'advisor-auto-enable.lock');
 const INFO = path.join(LOCK, 'info');
