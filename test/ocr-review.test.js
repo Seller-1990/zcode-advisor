@@ -114,23 +114,33 @@ test('run_with_deadline：TERM 对 watcher 无效时也必须在上限内返回�
   const end = REVIEWER_SRC_TEXT.indexOf('\n}\n', start);
   assert.ok(start >= 0 && end > start);
   const definition = REVIEWER_SRC_TEXT.slice(start, end + 3);
-  // `trap '' TERM` 确定性模拟「TERM 送到 watcher 却毫无作用」：bash 里被忽略的信号无法再被
-  // trap，watcher 收不到 TERM，只能等自己的计时器。生产现场实测过这个形态（kill -TERM 打上去
-  // 毫无反应、watcher 与计时器都还活着，父进程那句 `wait "$watcher_pid"` 因此被拖住最多 secs
-  // 秒 —— 全量 OCR 套件连跑时挂死 >6 分钟）。
-  // 旧实现：必须等满 6s 计时器 + 到期后 sleep 2 + KILL，实测约 8s；
-  // 修好后：父进程有界等待 + SIGKILL 兜底，约 2s（40 × 0.05s 轮询上限）。
-  const probe = `${definition}\ntimeout() { return 1; }\ntrap '' TERM\nSTART=$(date +%s)\nrun_with_deadline 6 sh -c 'exit 0'\nEND=$(date +%s)\necho "elapsed=$((END-START))"\n`;
-  const result = spawnSync('bash', ['-c', probe], { encoding: 'utf8', timeout: 30000 });
+  // 「TERM 送到 watcher 却毫无作用」必须**确定性**地造出来，不能靠「父 shell 忽略 TERM →
+  // 子 shell 继承 SIG_IGN 且 bash 无法 reset」这种版本相关语义：本地 bash 3.2 能 reset
+  // （watcher 收 TERM 立刻退出，父进程 0.25s 就返回），CI runner 的 bash 5 不能（watcher 全程
+  // 不响应，父进程走满兜底循环）—— 同一份脚本在两个平台走出两种形态，阈值卡在 4s 就成了掷骰子
+  // （macos-15 runner 实测 elapsed=4 判红，run 38123024541）。这里直接把 watcher 自己的 TERM
+  // 处理换成忽略：`trap '' TERM` 之后该信号无法再被 trap，watcher 必然等满自己的计时器。
+  // 旧形态（历史快照）的 watcher 是裸 sleep/轮询、本来就不响应 TERM，原样使用即可。
+  const patched = definition.includes("trap 'exit 0' TERM")
+    ? definition.replace("trap 'exit 0' TERM", "trap '' TERM")
+    : definition;
+  const probe = `${patched}\ntimeout() { return 1; }\nrun_with_deadline 15 sh -c 'exit 0'\n`;
+  // 计时改在 Node 侧量毫秒：`date +%s` 是整秒截断，4.0–4.9s 全显示 4。
+  // 旧实现：必须等满 15s 计时器 + 到期后 sleep 2 + KILL ≈ 17s；
+  // 修好后：父进程有界等待 + SIGKILL 兜底，走 40 × 0.05s 轮询（每次 sleep 都是一次进程派生，
+  // runner 负载下实测约 4s）。阈值 10s：两端各留 5s 以上余量，负载抖动不会误判。
+  const t0 = Date.now();
+  const result = spawnSync('bash', ['-c', probe], { encoding: 'utf8', timeout: 60000 });
+  const elapsedMs = Date.now() - t0;
   assert.ifError(result.error);
-  const elapsed = Number((result.stdout.match(/elapsed=(\d+)/) || [])[1]);
-  assert.ok(
-    Number.isFinite(elapsed),
-    `探针没有输出 elapsed（stdout=${JSON.stringify(result.stdout)} stderr=${JSON.stringify(result.stderr)}）`
+  assert.strictEqual(
+    result.status,
+    0,
+    `探针应正常结束（命令本身 exit 0），实际 status=${result.status} signal=${result.signal} stderr=${JSON.stringify(result.stderr)}`
   );
   assert.ok(
-    elapsed < 4,
-    `TERM 对 watcher 无效时父进程必须自行兜底退出，却等了 ${elapsed}s —— 无上限 wait 被计时器拖满`
+    elapsedMs < 10000,
+    `TERM 对 watcher 无效时父进程必须自行兜底退出，却等了 ${(elapsedMs / 1000).toFixed(1)}s —— 无上限 wait 被计时器拖满`
   );
 });
 

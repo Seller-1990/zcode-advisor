@@ -395,11 +395,24 @@ test('P0 回归：审查在飞时 /advisor-off 不被 worker 旧快照回滚', a
   assert.strictEqual(readState(stateDir, 's11').enabled, false);
 
   // worker 落盘后（llm_timeout 计入），enabled 必须保持 false——字段级合并不许回滚
+  // 预算 60s（原 20s）：CI runner 上十几个测试文件并行，worker 是 detached 进程，冷启动 +
+  // 3s 审查超时在负载下可能远超本地实测；20s 在本机充裕，却在 macos-15 runner 上耗尽
+  // （run 38123024541 该用例 20358ms 判红）。失败时把现场一并打出来——否则「等满了」这种
+  // 红只有结论、没有证据，下一轮还得再猜一次。
   const settled = waitUntil(() => {
     const s = readState(stateDir, 's11');
     return (s.dropped.llm_timeout || 0) === 1;
-  }, 20000);
-  assert.ok(settled, 'worker 应在审查超时后落盘');
+  }, 60000);
+  assert.ok(
+    settled,
+    'worker 应在审查超时后落盘：' +
+      `dropped=${JSON.stringify(readState(stateDir, 's11').dropped)} ` +
+      `enabled=${readState(stateDir, 's11').enabled} ` +
+      `lock=${fs.existsSync(path.join(stateDir, 'sess-s11.json.lock'))} ` +
+      `stateDir=${JSON.stringify(fs.readdirSync(stateDir))} ` +
+      `stop.stderr=${JSON.stringify(r.stderr)} ` +
+      `off.stderr=${JSON.stringify(off.stderr)}`
+  );
   assert.strictEqual(readState(stateDir, 's11').enabled, false, '/advisor-off 不得被 worker 回滚');
   assert.strictEqual(fs.existsSync(path.join(stateDir, 'sess-s11.json.lock')), false);
 });

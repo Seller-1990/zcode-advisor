@@ -208,11 +208,20 @@ function probeUninstall(opts, extraEnv) {
 // install --now 走的是 ensureLoaded 的「跳过」分支，这是 install 侧的主修复点。
 // 必须在子进程里打桩：真机上不拦的话，`install --now` 会把沙箱 plist bootstrap 进
 // 用户真实的 gui 域，等于凭空多出一个自启作业。
-function probeInstallNow(opts, extraEnv) {
+//
+// extra.stubUid：Windows 上根本没有 process.getuid，`uid()` 返回 null，ensureLoaded 会先命中
+// 「无法获取 uid，跳过加载」分支 —— 于是「沙箱路径不得进 launchd 域」这条判定在 Windows 上
+// 永远轮不到执行，用例只能红成「警告文本不符」这种误导性失败（CI run 38123024541 的
+// windows-2022 实测如此）。打桩一个 uid，让**路径判定**成为决定分支，三个平台验证的才是同一件事。
+// （Windows 上 canTouchLaunchd 因 `process.platform === 'darwin'` 为假同样返回 false，
+// 落到同一个「跳过 launchd 加载」分支，所以打桩后该断言在 Windows 上也成立。）
+function probeInstallNow(opts, extraEnv, extra) {
+  const stubUid = !!(extra && extra.stubUid);
   const runner = `
     const cp = require('child_process');
     const calls = [];
     cp.execFileSync = (f, a) => { calls.push([f, a]); return ''; };
+    ${stubUid ? 'process.getuid = () => 501;' : ''}
     const L = require(${JSON.stringify(path.join(__dirname, '../tools/companion/launchd.cjs'))});
     const r = L.install(${JSON.stringify(opts)});
     process.stdout.write(JSON.stringify({ r, calls }));
@@ -226,7 +235,11 @@ function probeInstallNow(opts, extraEnv) {
 
 test('install --now：沙箱 dir 只落盘，绝不 bootstrap 进真实 gui 域', () => {
   const dir = tmpDir();
-  const probe = probeInstallNow({ dir, now: true, nodeBin: '/x/node', controllerPath: '/x/controller.cjs' });
+  const probe = probeInstallNow(
+    { dir, now: true, nodeBin: '/x/node', controllerPath: '/x/controller.cjs' },
+    null,
+    { stubUid: true }
+  );
   assert.deepStrictEqual(probe.calls, [],
     '沙箱 install --now 不得调用任何 launchctl（bootstrap 会往用户真实 gui 域塞作业）');
   assert.strictEqual(probe.r.loaded, false);
