@@ -5,7 +5,7 @@
 ## 一、范围与纪律
 
 - **对象**：CI run `38135048979`（headSha `5851112`）在 `ubuntu-latest` 上**唯一**的失败用例 —— `test/e2e.test.js:369`「P0 回归：审查在飞时 /advisor-off 不被 worker 旧快照回滚」。
-- **授权边界**：用户此前授权的是「提交批次六并第三次推送」（已完成）；本批是 CI 暴露问题的**本地修复**，**第四次推送未获授权**，故本批不含提交与推送。
+- **授权边界**：用户先授权「提交批次六并第三次推送」（已完成）；本批先在本地完成红→绿，随后用户授权**第四次推送**（原话「进行第四次推送吧，验证三平台是否真绿」），已提交 `99f8ec4` 并推送，run `38139560150` **三平台全绿**。
 - **纪律**：红 → 绿 → 关联回归 → 全量回归；**产品代码零改动**（红灯所用的临时注入已复原并校验 sha256）；不改冻结报告；新证据一律落 `.audit-evidence/`。
 
 ## 二、结论摘要表
@@ -14,6 +14,7 @@
 | --- | --- | --- | --- | --- |
 | **M2** | 用例前提竞态（**非产品缺陷**） | 已修 | `.audit-evidence/m2-red.log` `tests 1 / pass 0 / fail 1`（60371.86ms，断言与 CI 逐字一致） | `.audit-evidence/m2-green-slowed.log` `1 / 1 / 0`（同一注入下 11471.97ms）；`.audit-evidence/m2-green-repeats.log` 3/3；`.audit-evidence/m2-e2e-file-green.log` 整文件 `42 / 42 / 0` |
 | **ECONNRESET** | 修复自身引入的测试侧 uncaughtException | 已修 | 全量首跑 `.audit-evidence/batch7-final.log`（已被覆盖，原文见 §3.4） | `.audit-evidence/batch7-final.log`（覆盖后）`tests 719 / pass 718 / fail 0 / skipped 1`，async/ECONNRESET 计数 0 |
+| **三平台 CI** | 第四次推送真机验证 | **全绿** | ubuntu 上一轮 `711 / 1 fail`（M2 红） | run `38139560150`（commit `99f8ec4`）三腿 `fail 0`：ubuntu `712/0`、macos-15 `717/0`、windows-2022 `669/0`；详见 `.audit-evidence/batch7-ci.txt` |
 
 ## 三、机制 · 修复 · 证据
 
@@ -86,6 +87,7 @@ M2 用例本身**通过**（6424.54ms），红来自文件级 uncaughtException�
 | 重复（无注入） | 同上，跑 3 次 | `.audit-evidence/m2-green-repeats.log` 3/3（6520.94 / 6456.81 / 6346.41 ms） |
 | 整文件 | `node --test test/e2e.test.js` | `.audit-evidence/m2-e2e-file-green.log` `42 / 42 / 0`，0 async |
 | 全量 | `npm test` | `.audit-evidence/batch7-final.log` exit=0、`tests 719 / pass 718 / fail 0 / skipped 1 / duration 45387.117138ms`，async/ECONNRESET 计数 0 |
+| 三平台 CI | push `99f8ec4` → run `38139560150` | 三腿全绿：ubuntu-latest `719/712/0/7`、macos-15 `719/717/0/2`、windows-2022 `719/669/0/50`；M2 用例三腿均 `ok 158`（6173.93 / 6179.58 / 6290.40 ms） |
 
 用例总数与批次六相同（719）——本批**只改用例、未加用例**。
 
@@ -98,6 +100,7 @@ M2 用例本身**通过**（6424.54ms），红来自文件级 uncaughtException�
 | `.audit-evidence/m2-green-repeats.log` | 0 | 3 | 无注入连跑 3 次全绿 |
 | `.audit-evidence/m2-e2e-file-green.log` | 0 | 42 | 整文件（含 ECONNRESET 处置）全绿、0 async |
 | `.audit-evidence/batch7-final.log` | 0 | 718 | 全量 719 用例 / 718 通过 / 0 失败 / 1 跳过 |
+| `.audit-evidence/batch7-ci-ubuntu.log`<br>`.audit-evidence/batch7-ci-macos15.log`<br>`.audit-evidence/batch7-ci-windows2022.log` | 0 | 712 / 717 / 669 | 第四次推送的三平台原始作业日志（`fail 0`、M2 三腿 `ok 158`）；判读见 `.audit-evidence/batch7-ci.txt` |
 
 ## 五、红灯取得方式与已披露缺口
 
@@ -108,7 +111,7 @@ M2 用例本身**通过**（6424.54ms），红来自文件级 uncaughtException�
 
 ## 六、局限
 
-1. **第四次推送未授权** ⇒ 本修复在三平台是否真绿**尚未验证**；CI 上该用例的历史行为是「macos-15 上曾 20358ms 判红、ubuntu 上 60177ms 判红」，修复针对的是前提而非耗时，耗时本身仍受 runner 负载影响。
+1. **第四次推送已完成**：commit `99f8ec4` → run `38139560150`，三平台全绿（见 `.audit-evidence/batch7-ci.txt`）。但 CI 上该用例的历史行为是「macos-15 上曾 20358ms 判红、ubuntu 上 60177ms 判红」，修复针对的是**前提**而非耗时；耗时本身仍受 runner 负载影响（本轮三腿均为 6.2s 左右）。
 2. 本批**只动用例**，故不涉及镜像同步（`tools/sync-plugin-dir.cjs` 只同步 `hooks/`、`commands/`、`.zcode-plugin/`、`tools/`）。
 3. `.gitignore:2` 是 `*.log` ⇒ `.audit-evidence/*.log` **不入库**，本批全部原始日志只在本机。
 4. 冻结报告 `.audit-evidence/audit-report.md` 的 R 清单未收录 M2（它不在冻结清单里，是 CI 第三次真跑才暴露的用例问题）；如需并账，应在后续批次报告中以「轮外发现」形式登记。
@@ -119,10 +122,11 @@ M2 用例本身**通过**（6424.54ms），红来自文件级 uncaughtException�
 | --- | --- | --- |
 | `test/e2e.test.js` | +31 / −1 | 纯测试：`sawReviewRequest` 信号（`:378-386`）、异步前提等待与显式断言（`:409-420`）、ECONNRESET 处置（`:384`） |
 
-产品代码零改动（`hooks/advisor-hook.js` 与 HEAD 一致）。
+产品代码零改动（`hooks/advisor-hook.js` 与 HEAD 一致）。本批已提交为 `99f8ec4` 并推送（`.audit-evidence/batch7-report.md` 与 `.audit-evidence/batch6-ci.txt` 一并入库，CI 原始日志因 `*.log` 被忽略只在本机）。
 
 ## 八、与冻结版 / 批次六的关系
 
 - 冻结版 `.audit-evidence/audit-report.md` sha256 未变：`8ccedbf346350c5c1f8480d06366df04dd76b99123b2115238077f2b133067e0`。
 - 批次六（`.audit-evidence/batch6-report.md`）已提交并推送（commit `5851112`，CI run `38135048979`）；本批是其 CI 结果的**后续处置**，不修改批次六的任何结论。
-- 批次六的 `[R24c 观测]` 结论已按真机数据修正：真 Windows runner 上无权进程报 **EPERM 而非 EACCES**，EACCES 分支仍只由注入用例覆盖（详见 `.audit-evidence/batch6-ci.txt`）。
+- 批次六的 `[R24c 观测]` 结论已按真机数据修正：真 Windows runner 上无权进程报 **EPERM 而非 EACCES**，EACCES 分支仍只由注入用例覆盖（详见 `.audit-evidence/batch6-ci.txt`）。第四次推送的同一 run 里该观测行**再次复现**为 EPERM（见 `.audit-evidence/batch7-ci.txt` §五）。
+- 本批结论只覆盖「M2 用例前提竞态」这一项：CI 三平台绿**不等于**冻结报告的 R01–R19 残余项或 S1 安装链路检查点已被验证。

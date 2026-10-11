@@ -1,0 +1,60 @@
+# 第四次推送 · 三平台 CI 真机结果（批次七验证）
+
+## 一、运行信息
+
+- run id：`38139560150`
+- url：https://github.com/Seller-1990/zcode-advisor/actions/runs/38139560150
+- headSha：`99f8ec4d6694595168db077f9e80805931d67354`（commit `99f8ec4` 「test: 批次七 —— 修掉 e2e「审查在飞」用例的前提竞态（M2）」）
+- event：`push`（main），status `completed`，**conclusion `success`**
+- 触发范围：push main ⇒ 只跑 `test` 作业；`plan-macos` / `windows` / `macos` / `release` 均 `skipped`（只有 tag `v*` 或 workflow_dispatch 才跑构建发布）
+
+## 二、三平台结论（全绿）
+
+| 平台 | 作业 id | 结论 | TAP 汇总 | 失败用例数 |
+| --- | --- | --- | --- | --- |
+| ubuntu-latest | `114470413673` | **success** | `tests 719 / pass 712 / fail 0 / skipped 7 / duration 40742.57ms` | 0 |
+| macos-15 | `114470413728` | **success** | `tests 719 / pass 717 / fail 0 / skipped 2 / duration 71150.08ms` | 0 |
+| windows-2022 | `114470414085` | **success** | `tests 719 / pass 669 / fail 0 / skipped 50 / duration 39572.26ms` | 0 |
+
+三次推送的 ubuntu 对比：run `38135048979` `711/1 fail`（M2 红）→ run `38139560150` **`712/0 fail`**（首次 ubuntu 全绿）。三腿 `fail 0`，同一 run 内三腿各自有明确 pass 结论 ⇒ 按「真绿」口径成立。
+
+> 平台间 `skipped` 差异（7 / 2 / 50）来自既有的平台条件用例（launchd 仅 macOS、DMG 仅 macOS、Windows 专有分支等），非本批引入；判绿口径是 `fail 0`。
+
+## 三、本次验证对象：M2 用例
+
+| 平台 | 结果 | 耗时 |
+| --- | --- | --- |
+| ubuntu-latest | `ok 158 - P0 回归：审查在飞时 /advisor-off 不被 worker 旧快照回滚` | **6173.93ms** |
+| macos-15 | `ok 158 - …` | **6179.58ms** |
+| windows-2022 | `ok 158 - …` | **6290.40ms** |
+
+三腿耗时都稳定落在 6.2s 左右（修复前 ubuntu 该用例 `duration_ms: 60177.45` 判红、macos-15 在更早一轮 `20358.4ms` 判红）⇒ 修复后该用例不再依赖「worker 恰好还没读状态」这种时序运气。
+
+## 四、本批新增机制的跨平台表现
+
+| 检查点 | ubuntu | macos-15 | windows-2022 |
+| --- | --- | --- | --- |
+| `ECONNRESET` 出现次数 | 0 | 0 | 0 |
+| `asynchronous activity after the test ended` 出现次数 | 0 | 0 | 0 |
+| `not ok` 行数 | 0 | 0 | 0 |
+
+即：新增的 `net` 连接信号 / 异步等待 / mock 服务端 `sock.on('error')` 三处在 Windows 与高负载腿上都未引入新 flake。
+
+## 五、顺带复核：第三次推送的 `[R24c 观测]`（同一 run 原始行）
+
+```
+# [R24c 观测] linux  已退出 pid=4302 kill(pid,0) errno=ESRCH
+# [R24c 观测] linux  pid=1（无权 open）kill(pid,0) errno=EPERM
+# [R24c 观测] darwin 已退出 pid=3417 kill(pid,0) errno=ESRCH
+# [R24c 观测] darwin pid=1（无权 open）kill(pid,0) errno=EPERM
+# [R24c 观测] win32  已退出 pid=2464 kill(pid,0) errno=ESRCH
+# [R24c 观测] win32  pid=4（无权 open）kill(pid,0) errno=EPERM
+```
+
+结论与批次六一致、再次复现：真 Windows runner 上「活着但无权 open」的进程报 **EPERM**（不是 EACCES），因此 libuv「Windows access denied → EACCES」这一映射在本项目 CI 上**仍未被观测到**；`EACCES` 分支只有注入用例覆盖。「只有 ESRCH 算已死」的规则对 EPERM/EACCES/其它 errno 一律保守判活，故两种映射下都安全。
+
+## 六、判读口径与如实说明
+
+1. **「真绿」的界定**：同一次 run、三腿各自 `fail 0` 且结论 success。本次满足；构建/发布作业按设计 `skipped`（未推 tag），不参与「测试真绿」的判定，也不代表安装包已在三平台构建成功。
+2. **CI 绿对本批的证明力有限**：红灯是靠临时注入（不在仓库）复现的高负载偶发交错；单次三平台绿证明「修复与 CI 现象一致、且未引入跨平台新 flake」，**不等于**竞态已被数学证明根除。
+3. 原始日志（本机，`*.log` 被 `.gitignore` 排除，不入库）：`.audit-evidence/batch7-ci-ubuntu.log`（303501 B）、`.audit-evidence/batch7-ci-macos15.log`（304559 B）、`.audit-evidence/batch7-ci-windows2022.log`（305526 B）。下载方式：`gh api repos/Seller-1990/zcode-advisor/actions/jobs/<job id>/logs`，遇 TLS handshake timeout 需重试（本次均为首次即成功）。
