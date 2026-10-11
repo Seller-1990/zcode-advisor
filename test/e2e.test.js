@@ -371,7 +371,19 @@ test('P0 回归：审查在飞时 /advisor-off 不被 worker 旧快照回滚', a
   const stateFile = path.join(stateDir, 'sess-s11.json');
   // 本地"只收连接不回包"的 TCP 服务：审查请求确定性地挂起到超时，保证 off 落在在飞窗口内
   const net = require('net');
-  const server = net.createServer((sock) => { /* 故意不响应 */ });
+  // 收到连接 = worker 已经越过 enabled 门禁、真正发起了审查请求 ⇒ 此刻才叫「审查在飞」。
+  // 不能只凭锁文件或时间差判断：worker 在认领锁之后才读状态，若 /advisor-off 抢在它读状态之前
+  // 落盘，worker 会走「未启用」的静默早退（不记 drop、不留痕），用例便会白等满预算再判红
+  // （run 38135048979 的 ubuntu runner 上正是如此：dropped={} + lock=false，60.18s 判红）。
+  let sawReviewRequest = false;
+  const server = net.createServer((sock) => {
+    sawReviewRequest = true;
+    // 审查 3s 超时后 worker 会直接 RST 掉这个"故意不回包"的连接，服务端 socket 因此收到
+    // ECONNRESET——那是本用例的预期行为，不是被测缺陷；不挂 error 监听会让它变成
+    // uncaughtException（本地全量首跑就把整个 e2e.test.js 判红过）。
+    sock.on('error', () => {});
+    /* 故意不响应 */
+  });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(() => {
     try { server.close(); } catch (_) {}
@@ -388,6 +400,24 @@ test('P0 回归：审查在飞时 /advisor-off 不被 worker 旧快照回滚', a
   const r = runHook(['stop'], { session_id: 's11', transcript_path: transcript }, envSpawn);
   assert.strictEqual(r.status, 0);
   assert.strictEqual(r.stdout.trim(), '');
+
+  // 先确认审查真的在飞，再执行 /advisor-off：worker 只有越过 enabled 门禁才会发起 HTTP 请求，
+  // 所以这个等待把「off 抢在 worker 读状态之前」的交错在构造上排除掉——本用例要测的是
+  // 「在飞期间 off，字段级合并不被旧快照回滚」，前提不成立就不该继续往下走。
+  // 必须用异步等待：waitUntil 内部是 Atomics.wait 同步阻塞，主线程被占住时 TCP 连接回调
+  // 永远不会触发，标志位恒为 false（这个坑本用例已实测踩过一次）。
+  const inFlight = await new Promise((resolve) => {
+    const startedAt = Date.now();
+    const timer = setInterval(() => {
+      if (sawReviewRequest) { clearInterval(timer); resolve(true); }
+      else if (Date.now() - startedAt > 60000) { clearInterval(timer); resolve(false); }
+    }, 25);
+  });
+  assert.ok(
+    inFlight,
+    'worker 未在预算内发起审查请求：无法确认「审查在飞」，本用例前提不成立' +
+      `（stateDir=${JSON.stringify(fs.readdirSync(stateDir))} stop.stderr=${JSON.stringify(r.stderr)}）`
+  );
 
   // 审查在飞期间执行 /advisor-off
   const off = runHook(['ctl', 'off', '--state', stateFile], null, envSpawn);

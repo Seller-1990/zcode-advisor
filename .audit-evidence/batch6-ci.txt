@@ -1,0 +1,48 @@
+批次六第三次推送 —— CI 三平台真跑证据（R24c：process.kill(pid, 0) 存活判定）
+================================================================================
+
+run:     38135048979
+url:     https://github.com/Seller-1990/zcode-advisor/actions/runs/38135048979
+event:   push
+headSha: 5851112a333243ecad318a3d6041248d90abf02c
+head:    5851112 test: 批次六 —— R24 写锁静默丢写 + R24c 存活判定 errno 完备性
+jobs:    test (ubuntu-latest)  failure  114457093509
+         test (macos-15)       success  114457093585
+         test (windows-2022)   success  114457093603
+         plan-macos / windows / macos / release  skipped（构建与发布只在 tag v* 跑）
+
+三平台用例数（node --test 的 TAP 汇总，逐条 grep 原始日志）
+ubuntu-latest   tests 719  pass 711  fail 1  skipped 7
+macos-15        tests 719  pass 717  fail 0  skipped 2
+windows-2022    tests 719  pass 669  fail 0  skipped 50
+
+R24c 观测行（原文，仅去掉日志时间戳前缀）
+# [R24c 观测] linux 已退出 pid=4380 kill(pid,0) errno=ESRCH
+# [R24c 观测] linux pid=1（无权 open）kill(pid,0) errno=EPERM
+# [R24c 观测] darwin 已退出 pid=2665 kill(pid,0) errno=ESRCH
+# [R24c 观测] darwin pid=1（无权 open）kill(pid,0) errno=EPERM
+# [R24c 观测] win32 已退出 pid=3116 kill(pid,0) errno=ESRCH
+# [R24c 观测] win32 pid=4（无权 open）kill(pid,0) errno=EPERM
+
+R24c 结论（本次推送的验证对象）
+- 规则「只有 ESRCH 算已死」在三平台真机上成立：三平台都把「已退出」报成 ESRCH，
+  test/lock-alive-errno.test.js 在三平台全部通过（该文件在日志里各出现 8 处输出，无失败）。
+- 需要如实修正一处预期：真 Windows runner 上 pid 4 报的是 **EPERM**，不是 EACCES。
+  即 libuv「Windows access denied → EACCES」这一映射在本轮**没有被观测到**；
+  EACCES 分支仍然只由**注入用例**覆盖（本机与 CI 都无法自然产生）。
+  这不改变修复本身：未知/无权 errno 一律算活是「判错方向不可逆」下的保守选择，
+  且比原实现（只认 EPERM）严格更宽 —— 原实现在本轮 Windows 上恰好也能活，属运气而非保证。
+
+唯一失败（与 R24c 无关）：ubuntu-latest 上的 M2
+not ok 158 - P0 回归：审查在飞时 /advisor-off 不被 worker 旧快照回滚
+  duration_ms: 60177.451105
+  error: 'worker 应在审查超时后落盘：dropped={} enabled=false lock=false
+          stateDir=[".mock-allowed","advisor-health-s11.json","sess-s11.json","snapshots","zcode-v2.json"]
+          stop.stderr="" off.stderr=""'
+按代码路径解读（hooks/advisor-hook.js:973 认领锁 → :979 loadState → :984 `if (!state.enabled) return;`）：
+worker 是在 /advisor-off 之后才读到会话状态的，于是走静默早退（不记 drop、结束时清锁），
+所以 dropped={} 且 lock=false。即该用例的前提「审查在飞时」在负载高的 runner 上并未成立，
+等满 60s 也等不到任何落盘。批次七用确定性夹具复现并修掉这个前提竞态，证据见 batch7-report.md。
+
+原始日志（本机工作树；`.gitignore` 的 `*.log` 不入库）
+.audit-evidence/r24c-ci-ubuntu.log / r24c-ci-macos15.log / r24c-ci-windows2022.log
