@@ -57,9 +57,10 @@ test('mutateStateExclusive：拿不到锁返回 null，状态不被破坏', (t) 
   const dir = tmpDir(t);
   const file = path.join(dir, 'sess-y.json');
   saveState(file, freshState('y', '', true));
-  // 人为制造新鲜写锁并保持持有
+  // 人为制造新鲜写锁并保持持有：属主必须是**活着的** pid —— R24 之后属主已死的锁会被立即
+  // 回收（那是崩溃残留，不是「有人正持锁」），继续用魔数 pid 会让本用例失去意义。
   const wrlock = `${file}.wrlock`;
-  fs.writeFileSync(wrlock, '999', 'utf8');
+  fs.writeFileSync(wrlock, String(process.pid), 'utf8');
   // 把 mtime 设为当前，确保不被陈旧回收
   const r = mutateStateExclusive(file, () => { throw new Error('不应执行'); }, { retries: 2 });
   assert.strictEqual(r, null);

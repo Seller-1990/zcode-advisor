@@ -206,8 +206,28 @@ function createStateExclusive(file, state) {
   return created;
 }
 
+// 锁属主是否仍活着：**只有 ESRCH（进程不存在）算已死**，其余 errno 一律保守算活。
+// 误判方向不对称：把死属主当活 ⇒ 最多多等一次 mtime 兜底（staleMs 10s）；把活属主当死
+// ⇒ 删掉活持有者的锁 ⇒ 双写者复活（正是 R24 要防的丢写方向）。
+// 不能只认 EPERM：libuv 在 Windows 把 access denied 映射成 EACCES，不是 POSIX 的 EPERM。
+function lockOwnerAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (err) { return Boolean(err) && err.code !== 'ESRCH'; }
+}
+
+// 读锁属主 pid：只认纯数字内容。'wx' 创建与写入内容之间有一个极短空窗，此刻读到的空内容
+// 不是「死属主」，必须留给 mtime 规则——否则会删掉活持有者刚建的锁，双写者复活。
+function readLockOwner(lockFile) {
+  try {
+    const raw = fs.readFileSync(lockFile, 'utf8').trim();
+    if (!/^\d+$/.test(raw)) return null;
+    const n = Number(raw);
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
+  } catch (_) { return null; }
+}
+
 // —— 通用跨进程短临界区 ——
-// 取 lockFile 的排他短租约（'wx' 创建 → 陈旧按 mtime 接管 → 归属校验），临界区内只做
+// 取 lockFile 的排他短租约（'wx' 创建 → 陈旧按 mtime 或属主存活接管 → 归属校验），临界区内只做
 // 同步文件操作。fn(ownLock) 的返回值即本函数返回值；拿不到锁返回 null，由调用方降级。
 // 是否在临界区中途失去锁由调用方用 ownLock() 判定：慢持有者（杀毒/索引器拖慢 IO）被
 // 对手按陈旧抢锁后必须能自己发现并放弃写入。
@@ -222,9 +242,23 @@ function withExclusiveLock(lockFile, fn, opts) {
       got = true;
       break;
     } catch (_) {
+      // 陈旧判定 = mtime 超 staleMs（原规则）**或属主进程已死**（R24：崩溃/被 KILL 的持锁者残留）。
+      // 只看 mtime 会让残留锁把随后 staleMs(默认 10s) 内的所有写挡在门外，而重试预算只有
+      // retries×25ms≈1s ⇒ 写全部返回 null 被静默丢弃（实测：属主已死的残留锁 1140ms 后丢写、
+      // 状态文件未变）。属主存活时不抢，保住「慢持有者」原语义。
       try {
         const st = fs.statSync(lockFile);
-        if (Date.now() - st.mtimeMs > staleMs) {
+        let stale = Date.now() - st.mtimeMs > staleMs;
+        if (!stale) {
+          const owner = readLockOwner(lockFile);
+          // 只回收「别人的、已死的」锁；自己的 pid 交给 mtime 规则（避免与重入调用打架）。
+          // 删前重读一次属主，防止把刚接管者的新锁删掉。
+          if (owner !== null && owner !== process.pid && !lockOwnerAlive(owner)
+              && readLockOwner(lockFile) === owner) {
+            stale = true;
+          }
+        }
+        if (stale) {
           try { fs.unlinkSync(lockFile); } catch (_) {}
         }
       } catch (_) {}
@@ -468,5 +502,5 @@ function countLocks(stateDir, staleMs) {
 module.exports = {
   ensureState, loadState, loadStateDetailed, saveState, mutateStateExclusive, withExclusiveLock, latestStatePath, listStatePaths, stateFilePath,
   sanitizeSessionId, pruneStates, bumpDrop, bumpPrimaryFailStreak, isFailStreakReason, freshState, createLock, clearLock, clearLockIfOwner,
-  lockPathFor, countLocks, admitGlobalWorker, sleepSync
+  lockPathFor, countLocks, admitGlobalWorker, sleepSync, lockOwnerAlive, readLockOwner
 };

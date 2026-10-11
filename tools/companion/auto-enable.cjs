@@ -143,15 +143,16 @@ function isStale(info) {
   if (!info.started) return true;
   if (now - info.started > LOCK_TTL_MS) return true;
   if (!info.pid) return true;
-  // 注意 errno 语义（实测）：kill(pid,0) 对**存在但无权限**的进程抛 EPERM，
-  // 只有 ESRCH 才代表进程不存在。早期实现把任何异常都当"已死"，
-  // 会把存活的持锁者误判为陈旧而接管（并发风险）。
+  // 注意 errno 语义：**只有 ESRCH 代表进程不存在**，其余 errno 一律算存活——
+  // EPERM 是「存在但无权限」，而 Windows 上 libuv 把 access denied 映射成 EACCES
+  // （本机 macOS 只观测到 EPERM，EACCES 分支靠注入 errno 的用例 + 三平台 CI 覆盖）。
+  // 早期实现「把任何异常都当已死」/「只认 EPERM 算活」，都会把存活的持锁者误判为陈旧而接管。
   try {
     process.kill(info.pid, 0);
     return false;                       // 存活
   } catch (err) {
-    if (err && err.code === 'EPERM') return false;   // 存在，只是无权限
-    return true;                        // ESRCH 等 → 不存在
+    if (err && err.code !== 'ESRCH') return false;   // 存在，只是无权限（EPERM/EACCES…）
+    return true;                        // ESRCH → 不存在
   }
 }
 

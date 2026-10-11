@@ -298,7 +298,8 @@ function readLockInfo(lockFile) {
 }
 
 // 陈旧判定：无 started / 心跳超时 / pid 不存在 / 长期无 CDP（僵尸）→ 陈旧。
-// kill(pid,0) 的 errno 语义要分清：EPERM = 存在但无权限（视为存活），ESRCH = 不存在。
+// kill(pid,0) 的 errno 语义要分清：**只有 ESRCH = 不存在**；EPERM/EACCES（Windows 的
+// access denied 映射成 EACCES）等都代表进程存在，视为存活——判成「死」会接管活租约。
 function isStale(info) {
   if (!info.started) return true;
   if (Date.now() - info.started > LOCK_TTL_MS) return true;
@@ -308,7 +309,7 @@ function isStale(info) {
     process.kill(info.pid, 0);
     alive = true;
   } catch (err) {
-    if (err && err.code === 'EPERM') alive = true;
+    if (err && err.code !== 'ESRCH') alive = true;
   }
   if (!alive) return true;
   // 活着但长期无 CDP：僵尸租约（进程在跑、服务不可用）。
@@ -861,7 +862,9 @@ function withConfigLock(target, fn) {
       const pid = parseInt(holder, 10);
       let alive = false;
       if (pid > 0) {
-        try { process.kill(pid, 0); alive = true; } catch (e) { alive = !!(e && e.code === 'EPERM'); }
+        // 只有 ESRCH 算已死；EPERM/EACCES（Windows access denied 映射 EACCES）等一律算活。
+        // 与 tools/config-bridge.js 的同名协议保持一致（test/static-guards.test.js 会拦漂移）。
+        try { process.kill(pid, 0); alive = true; } catch (e) { alive = !!(e && e.code !== 'ESRCH'); }
       }
       if (!alive || stale) { try { fs.unlinkSync(lock); } catch (_) {} }
       sleepSync(25);

@@ -226,12 +226,30 @@ test('配置锁协议：config-bridge 与 controller 的 vendored 双副本一�
     '`${target}.lock`',    // 锁路径后缀（<target>.lock）
     '10000',               // 陈旧阈值 10s
     "flag: 'wx'",          // wx 抢建
-    'process.kill(pid, 0)', // 持有者存活检查（EPERM=存活）
+    'process.kill(pid, 0)', // 持有者存活检查（只有 ESRCH 算已死）
     'code !== \'EEXIST\'',  // 仅竞争重试，EACCES/EROFS 立即失败
   ];
   for (const m of markers) {
     assert.ok(bridge.includes(m), `tools/config-bridge.js 缺锁协议标记：${m}`);
     assert.ok(ctrl.includes(m), `tools/companion/controller.cjs 缺锁协议标记：${m}`);
+  }
+});
+
+test('存活判定：kill(pid,0) 一律「只有 ESRCH 算已死」（Windows access denied 映射 EACCES/EINVAL，不是 EPERM）', () => {
+  // 误判方向不对称：判成「活」最多多等一次 mtime 兜底（10s）；判成「死」会删掉活持有者的锁
+  // → 双写者复活（R24 的丢写方向）。这四处（含 hooks/lib/state.js）都是跨进程锁/租约的存活
+  // 判定，必须同一条规则：EPERM/EACCES/EINVAL/未知一律算活。
+  const files = [
+    'hooks/lib/state.js',
+    'tools/config-bridge.js',
+    'tools/companion/controller.cjs',
+    'tools/companion/auto-enable.cjs',
+  ];
+  for (const f of files) {
+    const body = read(f);
+    assert.ok(body.includes("!== 'ESRCH'"), `${f} 的存活判定必须「只有 ESRCH 算已死」`);
+    assert.ok(!/code\s*===\s*'EPERM'/.test(body),
+      `${f} 不得退回「只认 EPERM」的旧判定（Windows 上会误判活属主已死）`);
   }
 });
 

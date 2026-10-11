@@ -129,7 +129,9 @@ function withConfigLock(target, fn) {
       const pid = parseInt(holder, 10);
       let alive = false;
       if (pid > 0) {
-        try { process.kill(pid, 0); alive = true; } catch (e) { alive = !!(e && e.code === 'EPERM'); }
+        // 只有 ESRCH 算已死；EPERM/EACCES（Windows access denied 映射 EACCES）等一律算活。
+        // 判错方向不对称：判活最多多等一次 mtime 兜底，判死会删掉活持有者的锁 → 双写者。
+        try { process.kill(pid, 0); alive = true; } catch (e) { alive = !!(e && e.code !== 'ESRCH'); }
       }
       if (!alive || stale) { try { fs.unlinkSync(lock); } catch (_) {} }
       sleepSync(25);
