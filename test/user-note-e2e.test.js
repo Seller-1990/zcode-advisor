@@ -55,6 +55,9 @@ function hookEnv(stateDir) {
     ZCODE_ADVISOR_USER_CONFIG: path.join(stateDir, 'no-such-user-config.json'),
     ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg,
     ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(stateDir, 'no-such-provider-config.json'),
+    // 隔离角标链路探测并禁用自愈：测试绝不 kickstart 真实 launchd 作业。
+    ZCODE_ADVISOR_COMPANION_TMP: path.join(stateDir, 'companion-tmp'),
+    ZCODE_ADVISOR_BADGE_REVIVE: '0',
     // hook 侧的历史文件必须与 controller 侧同一个（面板据此标注"已跟进"）
     ZCODE_ADVISOR_HISTORY: historyFile
   });

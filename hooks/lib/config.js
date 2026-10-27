@@ -475,12 +475,17 @@ function loadConfig(pluginRoot, env) {
   }
 
   // maxTokens 专守卫：接受字符串数字（手写配置常见，Number("8192")=8192 直接采用）；
+  // **0 = 不发送 max_tokens**（对齐上游 dsh-advisor 2026-10-18 裁决：OpenAI 兼容 API 的
+  // max_tokens 把 reasoning+content 一起截，思考型模型会间歇性烧光预算 → 空响应 → 静默丢意见；
+  // 不发送则由端点默认值兜底，输出长度由 maxNoteChars 在提取侧截断）；
   // 数值越界**钳到** [64,16384]（贴近用户意图，低侧回退是 64 倍成本惩罚、高侧回退是 4 倍质量退化）；
-  // 非整数垃圾（""/null/true/[]）回退默认。修复：字符串被静默降级、999999999 无上界直发、浮点穿透。
+  // 非整数垃圾（""/null/true/[]）回退默认。
   const mtRaw = (typeof cfg.maxTokens === 'number' || (typeof cfg.maxTokens === 'string' && cfg.maxTokens.trim()))
     ? Number(cfg.maxTokens) : NaN;
-  if (!Number.isInteger(mtRaw) || mtRaw <= 0) {
-    problems.push(`config_out_of_range: maxTokens=${JSON.stringify(cfg.maxTokens)} 不是正整数，已回退默认 ${DEFAULTS.maxTokens}`);
+  if (mtRaw === 0) {
+    cfg.maxTokens = 0; // 合法哨兵：请求体不带 max_tokens
+  } else if (!Number.isInteger(mtRaw) || mtRaw < 0) {
+    problems.push(`config_out_of_range: maxTokens=${JSON.stringify(cfg.maxTokens)} 不是正整数或 0（0=不发送），已回退默认 ${DEFAULTS.maxTokens}`);
     cfg.maxTokens = DEFAULTS.maxTokens;
   } else if (mtRaw < 64 || mtRaw > 16384) {
     const clamped = Math.min(16384, Math.max(64, mtRaw));

@@ -199,6 +199,15 @@ function warnCdpRisk() {
 // 退出码 3 与 launchd.cjs 的 RETRY_EXIT_CODE 一致，配 ThrottleInterval=30
 // 把重试频率限制在 30s 一次（不会重启风暴）。
 const SUPERVISED = process.env.ZCODE_ADVISOR_SUPERVISED === '1';
+
+// 只附着不代启（2026-10-27 用户拍板的启动模型）：launchd/后台路径**永不**主动
+// 拉起 ZCode——用户不双击 Advisor 时，机器上不该凭空多出一个 ZCode 窗口；
+// ZCode 退出后外挂也不该把它再拽起来。附着到「已在运行的调试实例」仍允许
+// （那是纯旁观，不产生新进程）；唯一允许 spawn 的是用户**显式**启动 Advisor
+// 启动器（未受监督路径）——双击即授权。
+// 配套：attach-only 下「无 CDP 可附着」不再退 3 死循环重试，而是安静退出 0
+// （launchd 视为任务完成，停止重启——这正是「退出后不自启」的实现机制）。
+const ATTACH_ONLY = SUPERVISED || process.env.ZCODE_ADVISOR_ATTACH_ONLY === '1';
 const RETRY_EXIT_CODE = 3;
 
 // 退出码决策（纯函数，便于直接单测）。两类语义必须分开：
@@ -279,6 +288,22 @@ const LOCK_HEARTBEAT_MS = 20 * 1000;
 // 又不会让用户点击后等太久（修②的自愈通常几秒内就恢复了，这里只是兜底）。
 const LOCK_ZOMBIE_GRACE_MS = 3 * 60 * 1000;
 const LOCK_FILE = path.join(os.tmpdir(), 'zcode-advisor-companion.lock');
+
+// 等待提示的落盘节流（受监督模式专用）：「ZCode 已在运行但无调试端口」时本进程
+// 每 30s 被 launchd 重启一轮，同样的提示若每轮都写，一天近万行会把真实故障淹掉
+// （2026-10-27 实测：日志里连续 40+ 轮只有这一句话）。WAIT_STAMP 文件跨轮传递
+// 「上次落盘时间」，10 分钟至多一条；写戳失败按「要打印」处理（宁可重复不丢提示）。
+const WAIT_STAMP_FILE = path.join(os.tmpdir(), 'zcode-advisor-wait.stamp');
+const WAIT_LOG_INTERVAL_MS = 10 * 60 * 1000;
+function shouldLogWait(now) {
+  const at = Number.isFinite(now) ? now : Date.now();
+  try {
+    const last = Number(fs.readFileSync(WAIT_STAMP_FILE, 'utf8').trim()) || 0;
+    if (at - last < WAIT_LOG_INTERVAL_MS) return false;
+  } catch (_) { /* 无戳文件 = 从未落盘，允许打印 */ }
+  try { fs.writeFileSync(WAIT_STAMP_FILE, String(at), 'utf8'); } catch (_) { /* 打印兜底 */ }
+  return true;
+}
 
 function readLockInfo(lockFile) {
   try {
@@ -672,6 +697,17 @@ async function rescan() {
     currentPort = 0;
   }
   cdpPortRef.value = 0;
+  // 只附着模式：ZCode 没了就跟着退场，**绝不重新拉起 ZCode**（用户拍板的启动模型：
+  // 用完退出后机器上不该凭空再弹一个 ZCode）。给 30s 宽限（覆盖 ZCode 闪退重启），
+  // 之后安静退出 0——受监督下 launchd 停止重启，直到用户下次双击 Advisor。
+  if (ATTACH_ONLY) {
+    const now2 = Date.now();
+    if (cdpLostSince === 0) cdpLostSince = now2;
+    if (now2 - cdpLostSince > CDP_SELFHEAL_GRACE_MS) {
+      exitPermanent(0, '调试实例已消失，外挂随之退出（只附着模式不代启 ZCode；下次双击 ZCode Advisor 即恢复角标）');
+    }
+    return;
+  }
   // 自愈：CDP 消失超过宽限期后，重新走 ensureCdp（会重新拉起带调试端口的 ZCode）。
   // 旧实现只打印「等待重新出现」——一旦被附着的 ZCode 死掉，本进程就永久空转：
   // 进程活着、占着单实例锁、却永远不恢复服务（实测故障：用户点图标「没反应」）。
@@ -754,17 +790,36 @@ async function ensureCdp() {
   // 旧实现对此毫不知情，照旧 spawn 然后死等 25s 才报错；日志里只留一句超时，
   // 用户看到的是「点了没反应」。这里提前识别，给出**可操作**的指引后立即失败。
   if (hostInstanceRunning(zcodePath)) {
+    if (ATTACH_ONLY) {
+      // 只附着模式：不代启也不死等。用户双击的是裸 ZCode（无调试端口）——
+      // 这轮无法附着，安静退出 0（受监督下 launchd 停止重启）；
+      // 用户下次双击 Advisor 启动器时才以调试模式拉起带角标的 ZCode。
+      // 等待提示同样走节流，避免「裸 ZCode 整天开着」时日志被刷爆。
+      exitPermanent(0, SUPERVISED && !shouldLogWait()
+        ? ''
+        : 'ZCode 已在运行但无调试端口（直接双击启动的），本轮不附着、不代启。'
+          + '角标需用「ZCode Advisor」启动器打开。');
+    }
     // 可重试：用户「完全退出 ZCode」后重启外挂即可自愈。受监督时让 launchd
     // 每 30s 重试一次——用户退出 ZCode 后无需再手动点图标，外挂会自己接上。
-    // 受监督时会每 30s 重试，故只打一行（多行指引会随重试刷爆日志）；
+    // 受监督时等待提示走 shouldLogWait 节流（10 分钟一条，空串=本轮不打印）；
     // 未受监督时是用户主动点击触发的单次失败，给出完整可操作指引。
-    exitRetryable(1, SUPERVISED
+    exitRetryable(1, SUPERVISED && !shouldLogWait()
+      ? ''
+      : SUPERVISED
       ? 'ZCode 已在运行但无调试端口，等待其完全退出后自动接管（受 launchd 监督，每 30s 重试）'
       : 'ZCode 已在运行，但它不是以调试模式启动的（当前实例没有 CDP 端口）。\n' +
         '角标/设置面板需要调试通道，而调试端口无法注入到已在运行的进程。\n' +
         '请先**完全退出 ZCode（含菜单栏图标）**，再重新打开「ZCode Advisor」。\n' +
         '（若你是直接双击 ZCode 打开的，请改用 ZCode Advisor 启动器。）'
     );
+  }
+
+  // 只附着模式走到这里 = 没有任何 CDP 端口、也没有裸 ZCode 在跑（否则上面早拦了）。
+  // 仍然不能 spawn：attach-only 的语义是「永不代启」，包括 ZCode 根本没开的情形——
+  // 否则登录自启（launchd RunAtLoad）就会凭空打开一个 ZCode 窗口。安静退出 0。
+  if (ATTACH_ONLY) {
+    exitPermanent(0, '未发现可附着的调试实例（ZCode 未运行），外挂退出。双击「ZCode Advisor」即启动带角标的 ZCode。');
   }
 
   let port = cfg.port && cfg.port >= CDP_PORT_RANGE[0] && cfg.port <= CDP_PORT_RANGE[1] ? cfg.port : CDP_PORT_RANGE[0];

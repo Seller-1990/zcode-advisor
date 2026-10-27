@@ -44,7 +44,11 @@ function makeEnv(stateDir, extra) {
     ZCODE_ADVISOR_USER_CONFIG: path.join(stateDir, 'no-such-user-config.json'),
     ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg,
     // 隔离 provider_config.json（用户新建的服务商只写在那里）——否则读开发机真实配置。
-    ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(stateDir, 'no-such-provider-config.json')
+    ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(stateDir, 'no-such-provider-config.json'),
+    // 隔离角标链路探测：锁文件指向空目录（判 down），并明确禁用自愈——
+    // 测试绝不 kickstart 开发机/CI 的真实 launchd 作业。
+    ZCODE_ADVISOR_COMPANION_TMP: path.join(stateDir, 'companion-tmp'),
+    ZCODE_ADVISOR_BADGE_REVIVE: '0'
   }, extra || {});
 }
 
@@ -199,6 +203,35 @@ test('门禁失败：注册行与门禁提示仍然投递（命令通道不失�
   assert.ok(out.hookSpecificOutput.additionalContext.includes('zcode_provider_missing'),
     '应给出可操作原因（ZCode 里没有可用第三方服务商）');
   assert.ok(out.hookSpecificOutput.additionalContext.includes('状态文件'));
+});
+
+test('角标链路提示随注册行投递：down/waiting 各一句、attached 沉默、REVIVE=0 绝不自愈', (t) => {
+  const { transcript, stateDir } = setup(t);
+  const lockDir = path.join(stateDir, 'lockdir');
+  fs.mkdirSync(lockDir, { recursive: true });
+  const lockFile = path.join(lockDir, 'zcode-advisor-companion.lock');
+  const writeLock = (cdp) => fs.writeFileSync(
+    lockFile, `pid=${process.pid}\nstarted=${Date.now()}\ncdp=${cdp}\ncdpSince=${Date.now()}\n`, 'utf8');
+  const ups = (sid) => JSON.parse(runHook(
+    ['user-prompt-submit'], { session_id: sid, transcript_path: transcript, prompt: 'x' },
+    makeEnv(stateDir, { ZCODE_ADVISOR_COMPANION_TMP: lockDir, ZCODE_ADVISOR_BADGE_REVIVE: '0' })
+  ).stdout).hookSpecificOutput.additionalContext;
+
+  // down：锁文件不存在（companion 不在）→ 提示「未运行」；REVIVE=0 下不得出现自愈结果行
+  let ctx = ups('badge-down');
+  assert.ok(ctx.includes('角标外挂未运行'), `down 必须提示，实际：${ctx}`);
+  assert.ok(!ctx.includes('已发起'), 'REVIVE=0 时绝不发起自愈，也不得假装发起过');
+
+  // waiting：锁新鲜但 cdp=0（ZCode 无调试端口在跑）→ 提示「等待中」
+  writeLock(0);
+  ctx = ups('badge-waiting');
+  assert.ok(ctx.includes('角标等待中'), `waiting 必须提示，实际：${ctx}`);
+
+  // attached：锁新鲜且有 CDP → 注册行不带任何角标提示
+  writeLock(9223);
+  ctx = ups('badge-ok');
+  assert.ok(!ctx.includes('角标等待中') && !ctx.includes('角标外挂未运行'),
+    `attached 必须沉默，实际：${ctx}`);
 });
 
 test('注册行门禁按会话生效值评估：全局无可用服务商 + 本会话已覆盖 → 不误报门禁未满足', (t) => {

@@ -389,24 +389,22 @@ async function callReviewer(params) {
             Authorization: `Bearer ${apiKey}`
           };
       const body = anthropic
-        ? {
+        ? Object.assign({
             model,
             system: systemPrompt,
             messages: [{ role: 'user', content: userContent }],
-            max_tokens: maxTokens,
             temperature,
             stream: false
-          }
-        : {
+          }, maxTokens > 0 ? { max_tokens: maxTokens } : {})
+        : Object.assign({
             model,
             messages: [
               { role: 'system', content: systemPrompt },
               { role: 'user', content: userContent }
             ],
-            max_tokens: maxTokens,
             temperature,
             stream: false
-          };
+          }, maxTokens > 0 ? { max_tokens: maxTokens } : {});
       return await fetch(target, {
         method: 'POST',
         headers,

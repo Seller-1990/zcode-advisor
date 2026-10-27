@@ -15,6 +15,11 @@
 //   由 launchd 按 ThrottleInterval 重启——**既不会重启风暴，也不会因 exit 0
 //   而永久失去监督**（exit 0 会让 launchd 认为任务已完成，不再重启）。
 //
+// 启动模型（2026-10-27 用户拍板）：受监督 = 只附着不代启。launchd 拉起的
+// controller **永不 spawn ZCode**（登录自启不再凭空开窗口）；ZCode 退出后
+// 外挂 30s 内跟着 exit 0，launchd 不再重启——「用完退出即干净退场」。
+// 唯一允许 spawn 的是用户双击 Advisor 启动器（未受监督路径），双击即授权。
+//
 // 幂等与可逆：install 只在内容变化时写文件；uninstall 完整移除。
 // 不 bootstrap 也能生效——~/Library/LaunchAgents 下的 plist 会在下次登录时被
 // launchd 自动加载。需要**立即**生效时才用 `--now`（会立刻拉起一个实例，

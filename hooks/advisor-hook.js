@@ -39,6 +39,7 @@ const {
 } = require('./lib/route');
 const { appendHistory } = require('./lib/history');
 const health = require('./lib/health');
+const badge = require('./lib/badge');
 
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const SCRIPT_PATH = path.join(__dirname, 'advisor-hook.js');
@@ -51,6 +52,10 @@ const ADVISORY_SUFFIX = '\n（以上来自审查副模型，仅供参考，不�
 // 首次必喊，随后用信息量换频率，既不每轮刷屏也不至于固定 6 小时才吭一声。
 const FAIL_STREAK_ALERT_THRESHOLD = 3;
 const ALERT_REPEAT_LADDER_MS = [1, 3, 6, 24].map((h) => h * 3600 * 1000);
+
+// 角标自愈节流：down 态（companion 不在）时 launchctl kickstart 至多每 10 分钟一次。
+// 它是兜底不是主路径（launchd 本该自己拉起），频繁执行只会刷 launchctl 日志。
+const BADGE_REVIVE_MIN_INTERVAL_MS = 10 * 60 * 1000;
 
 // 已提醒 prevCount 次，本次是第 prevCount+1 次，对应梯队档位 ladder[prevCount-1]：
 // 第 2 次提醒距上次 1h、第 3 次 3h、第 4 次 6h、第 5 次起 24h。
@@ -233,6 +238,16 @@ function controlLines(cfg, stateDir, file, state) {
   }
   for (const p of cfg.problems || []) lines.push(`[advisor] 配置问题：${p}`);
   for (const n of cfg.notices || []) lines.push(`[advisor] 配置提示：${n}`);
+  // 确定性错误 halt 的可见性：停机必须让用户看到原因与恢复动作，否则表现为
+  // 「审查悄悄不跑了」（正是 HALT 语义要消灭的静默失败）。
+  if (state && state.halted) {
+    lines.push(`[advisor] 审查已停机：上次审查因确定性错误（${state.haltedReason || 'unknown'}）失败，已停止重试以避免无谓消耗。请修复配置（如更换有效的 API key 或模型）后运行 /advisor-on 恢复。`);
+  }
+  // startEnabled=false（= 上游 defaultEnabled 的 opt-in 模式）：新会话默认停用，
+  // 注册行必须明说怎么开，否则用户以为插件坏了。
+  if (state && state.enabled === false) {
+    lines.push('[advisor] 本会话审查默认停用（startEnabled=false）。需要时运行 /advisor-on 开启。');
+  }
   const gateReasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey, source: eff.keySource });
   if (gateReasons.length > 0) {
     lines.push(`[advisor] 门禁未满足（${gateReasons.join(',')}）：审查暂不运行。请先在 ZCode 设置里维护一个 OpenAI 兼容或 Anthropic 协议的第三方服务商（含端点与 key），再用 /advisor-status 或角标面板选择它。`);
@@ -292,6 +307,13 @@ function reviewBudgetMs(cfg) {
 // 降级（fallback，M4）：只对「换模型能治」的错切换。
 // 端点故障/限流/超时/与模型无关的错**不触发**——换模型只会加剧或无效。
 const FALLBACK_TRIGGER_REASONS = new Set(['llm_empty_response', 'unparsed', 'llm_http_404']);
+
+// 确定性错误 halt（对齐上游 dsh-advisor v0.6.3 #131）：这类错误对当前配置是**确定性**
+// 的（key 无效 / 模型不存在或明确不被支持 / 请求被永久拒绝），重试与降级都救不了——
+// 每轮照付一次调用成本、然后静默丢弃，只会烧 token + 刷失败计数，用户还看不到原因。
+// 命中即停机：会话进入 halted 态（原因写进 status 可见），/advisor-on 重建恢复。
+// 429/5xx/timeout/empty/unparsed 都是暂态或「换配置能治」，**不**在此列。
+const HALT_ERROR_RE = /^llm_http_(401|403)$/;
 
 // 备用模型的目标解析：只看全局 cfg.fallbackModel。
 // 0.2.17 起**没有**会话级备用模型——唯一的写入方（旧 /advisor-api 的 fallback: 覆盖）已随该命令删除，
@@ -450,6 +472,8 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
     logReview(cfg, Object.assign({ kind: attempt.error === 'unparsed' ? 'unparsed' : 'error', error: attempt.error, hint: remainingHint || '' }, meta));
     return {
       error: attempt.error, usage, hint: remainingHint,
+      // 确定性错误（401/403）：halt 语义随结果上抛，由 applyReviewOutcome 落盘
+      halt: HALT_ERROR_RE.test(attempt.error),
       primaryFailure: primaryFailure || (FALLBACK_TRIGGER_REASONS.has(attempt.error) ? attempt.error : ''),
       fallbackSkipped
     };
@@ -472,11 +496,22 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
 function applyReviewOutcome(s, result, eff, cfg) {
   if (result.error) {
     bumpDrop(s, result.error);
+    // 确定性错误 halt（HALT_ERROR_RE）：401/403 对当前配置是永久的——不停机的话
+    // 每轮照付调用成本再静默丢弃。停机 + 原因可见（/advisor-status、注册行），
+    // /advisor-on 清除重建。保留 failStreak：让健康告警通道把「为什么停」喊出来。
+    if (result.halt) {
+      s.halted = true;
+      s.haltedReason = result.error;
+      s.haltedAt = new Date().toISOString();
+    }
     // 降级（M4）：主模型失败连击单独维护——即便这次 fallback 也失败，
     // 主模型劣化的证据仍要留下，供降级告警归因。
     if (result.primaryFailure) bumpPrimaryFailStreak(s, result.primaryFailure);
     return;
   }
+  // 审查成功即自然解除 halt（配置被修好后的第一次成功）：清停机标记。
+  s.halted = false;
+  s.haltedReason = '';
   // 降级成功：系统可用（清 failStreak），但主模型劣化未消（primaryFailStreak 不动）。
   if (result.usedFallback) {
     s.fallbackUsed = (s.fallbackUsed || 0) + 1;
@@ -540,6 +575,7 @@ function onUserPromptSubmit(ctx) {
   let deliveredNoteCount = 0;
   let deliveredNotes = [];   // 本次送达的意见正文（写进 delivered 事件，供面板回看内容）
   let deliveryToken = '';
+  let reviveBadge = false;   // down 态待自愈：真正的 launchctl 调用放到临界区外执行
   mutateStateExclusive(file, (s) => {
     s.consecutiveSteers = 0;
     s.lastActivity = new Date().toISOString();
@@ -561,6 +597,20 @@ function onUserPromptSubmit(ctx) {
     }
     if (s.pendingRegistration) {
       parts.push(controlLines(cfg, stateDir, file, s).join('\n'));
+      // 角标链路可见性（badge.js 模块头注释）：只在注册行时顺手检查——注册行本就
+      // 只在会话启动/resume/compact 后出现，天然低频，不会逐轮刷屏；健康告警等
+      // 独立注入通道（其用例断言 deliver 形状）不受角标状态影响。
+      // companion 等待/掉线时给一句人话；down 态再标记节流自愈（launchctl 调用在临界区外执行）。
+      const badgeState = badge.deriveBadgeState(badge.readCompanionLock(process.env));
+      if (badgeState !== 'attached') {
+        parts.push(badge.badgeHintLines(badgeState, process.platform).join('\n'));
+        if (badgeState === 'down'
+          && Date.now() - (s.badgeReviveAt || 0) > BADGE_REVIVE_MIN_INTERVAL_MS
+          && process.env.ZCODE_ADVISOR_BADGE_REVIVE !== '0') {
+          s.badgeReviveAt = new Date().toISOString();
+          reviveBadge = true;
+        }
+      }
     }
     // 心跳健康告警（4a）：独立于 pendingNotes/pendingRegistration 组装——
     // 仅有告警时 deliver 也不能为空，否则监督器死了用户仍然无感知。
@@ -620,6 +670,13 @@ function onUserPromptSubmit(ctx) {
     if (parts.length > 0) deliver = parts.join('\n\n');
   });
 
+  // 角标自愈在临界区外执行（不拿锁跑子进程）：kickstart 一般 <100ms，但拿锁跑
+  // spawnSync（10s 超时上限）会把并发写者阻塞在最坏情形上，不值。
+  if (reviveBadge) {
+    const lines = badge.reviveResultLines(badge.tryRevive({}));
+    if (lines.length > 0) deliver = deliver ? `${deliver}\n\n${lines.join('\n\n')}` : lines.join('\n\n');
+  }
+
   if (!deliver) return;
 
   // 先 emit 后落盘清理：emit 后被杀只会导致下轮重复投递（两害取其轻，丢失更糟）。
@@ -671,7 +728,9 @@ function onStopAsync(ctx) {
   const current = loadState(file);
   // 门禁按会话级生效值评估：全局 key/端点/模型任一缺失但本会话已覆盖时照常审查。
   const { reasons: gateReasons } = gateWithSession(cfg, apiKeyInfo, current);
-  if (!current || !current.enabled || gateReasons.length > 0) {
+  // 确定性错误 halt：停机的会话不再发起审查（重试救不了 401/403），但保留
+  // lastActivity 更新——「会话还活着、审查不跑」要通过 /advisor-status 的 reason 可见。
+  if (!current || !current.enabled || gateReasons.length > 0 || current.halted) {
     mutateStateExclusive(file, (s) => {
       s.lastActivity = new Date().toISOString();
       if (s.enabled && gateReasons.length > 0) s.disabledReason = gateReasons.join(',');
@@ -787,11 +846,11 @@ async function onStopSync(ctx) {
   const current = loadState(file);
   if (!current || !current.enabled) return;
 
-  // 门禁按会话级生效值评估（与 async 路径同一口径）。
+  // 门禁按会话级生效值评估（与 async 路径同一口径）；halted 会话同样不审（见 HALT_ERROR_RE）。
   const gateReasons = gateWithSession(cfg, apiKeyInfo, current).reasons;
-  if (gateReasons.length > 0) {
+  if (gateReasons.length > 0 || current.halted) {
     mutateStateExclusive(file, (s) => {
-      s.disabledReason = gateReasons.join(',');
+      if (gateReasons.length > 0) s.disabledReason = gateReasons.join(',');
     });
     // 门禁失败不推进指针：修复配置后可回看积压（受增量窗口与 backfill 上限截断）。
     return;
@@ -1290,7 +1349,12 @@ async function handleCtl(args) {
     // /advisor-model set 改了会话覆盖时会用过期结果覆盖 disabledReason。
     let reasons = [];
     let enabledModel = '';
+    let wasHalted = false;
     if (!mutateCtlState((s) => {
+      // /advisor-on 是手动恢复路径（对齐上游语义）：halted 会话由此重建。
+      wasHalted = s.halted === true;
+      s.halted = false;
+      s.haltedReason = '';
       s.enabled = true;
       const r = gateWithSession(cfg, resolveApiKey(cfg, process.env), s);
       reasons = r.reasons;
@@ -1299,6 +1363,8 @@ async function handleCtl(args) {
     })) return;
     if (reasons.length > 0) {
       process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 ZCode 里的第三方服务商配置，或用 /advisor-model set 为本会话单独指定。\n`);
+    } else if (wasHalted) {
+      process.stdout.write(`advisor: 本会话已启用（模式 ${cfg.reviewMode}，模型 ${enabledModel}），并已清除停机标记（此前因确定性错误停机，下轮审查将重建）。\n`);
     } else {
       process.stdout.write(`advisor: 本会话已启用（模式 ${cfg.reviewMode}，模型 ${enabledModel}）。\n`);
     }

@@ -62,7 +62,10 @@ function makeEnv(stateDir, zcodeCfg, extra) {
     ZCODE_ADVISOR_USER_CONFIG: path.join(stateDir, 'no-user.json'),
     ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg,
     // 隔离 provider_config.json（第二个数据源），避免读开发机真实配置。
-    ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(stateDir, 'no-such-provider-config.json')
+    ZCODE_ADVISOR_ZCODE_PROVIDER_CONFIG: path.join(stateDir, 'no-such-provider-config.json'),
+    // 隔离角标链路探测并禁用自愈：测试绝不 kickstart 真实 launchd 作业。
+    ZCODE_ADVISOR_COMPANION_TMP: path.join(stateDir, 'companion-tmp'),
+    ZCODE_ADVISOR_BADGE_REVIVE: '0'
   }, extra || {});
 }
 

@@ -157,11 +157,15 @@ DMG 安装的 `.app` 首次打开时会**自动装上 LaunchAgent**（`~/Library
 
 - `RunAtLoad`：登录时自动拉起；`KeepAlive{SuccessfulExit:false}`：崩溃后自动重启；
   `ThrottleInterval=30`：重试间隔 30s（不会重启风暴）。
-- 由 launchd 监督时，controller 的退出码语义会切换：**暂不可用**（ZCode 正以非调试模式运行、
-  端口占用等）退 `3` 让 launchd 稍后重试；**永久性失败**（Node 版本过低、`zcodePath` 不可执行）
-  退 `0` 停止重启，避免每 30s 空转刷日志。
-- 若你**习惯直接打开 ZCode**：那个实例没有调试端口，注入无法后补——受监督的外挂会每 30s 重试，
-  你**完全退出 ZCode（含菜单栏图标）**后它会自动接管并重新以调试模式拉起，无需手动操作。
+- **启动模型（默认）**：登录自启的 controller 是**只附着、不代启**模式——它只附着到
+  已在运行的调试实例；没有可附着的实例（ZCode 没开，或开的是无调试端口的裸 ZCode）就安静退出，
+  **绝不会替你打开 ZCode，也不会在 ZCode 退出后把它拽回来**。要角标，双击 `ZCode Advisor`
+  启动器（唯一允许拉起 ZCode 的入口，双击即授权）。
+- 由 launchd 监督时，controller 的退出码语义会切换：**让位**（已有健康实例在跑）退 `3` 让
+  launchd 稍后重试以便接管；**无 CDP 可附着**（attach-only 下不再死等）与**永久性失败**
+  （Node 版本过低、`zcodePath` 不可执行）退 `0` 停止重启，避免空转刷日志。
+- 若你**直接双击打开了 ZCode**：那个实例没有调试端口，注入无法后补——新会话的注册行会提示
+  「角标等待中」。要角标：完全退出 ZCode（⌘Q）后双击 `ZCode Advisor`。审查功能不受影响。
 
 管理命令（用包内 Node 运行，`<app>` = `ZCode Advisor.app/Contents/Resources`）：
 
@@ -238,7 +242,7 @@ dsh 端教训（`ADVISOR-GUARD-REPORT.md`，[issue #102](https://github.com/omds
 | `reviewMode` | `async` | `async`（亚秒级固定税，意见下条消息送达）或 `sync`（立即打断，超时自动钳制 ≤300s） |
 | `immuneTurns` | 3 | steer 后的冷却轮数；冷却期内 concern 降级顺延（blocker 不受限） |
 | `maxDeltaMessages` / `maxContextChars` | 60 / 48000 | 送审窗口（条数 / 总字符）。两者同时生效，长消息下字符帽先到 |
-| `maxTokens` | 4096 | 单次审查输出预算；接受字符串数字，越界钳到 64–16384 并登记「配置问题」 |
+| `maxTokens` | 4096 | 单次审查输出预算；接受字符串数字，越界钳到 64–16384 并登记「配置问题」。**设 `0` 则请求完全不发送 `max_tokens`**（对齐上游 dsh-advisor 2026-10-18 裁决：OpenAI 兼容 API 的 max_tokens 把思考+正文一起截，思考型模型会间歇性空响应；不发送由端点默认兜底，输出长度仍受 `maxNoteChars` 截断） |
 | `fallbackModel` | 空（关闭） | **降级备用模型**：主模型遇白名单错误（`llm_empty_response`/`unparsed`/`llm_http_404`）时临时换用它，端点/key 不变。**仅 async 生效**（sync 下会砍半 primary 预算，已禁用）。建议配**快模型/非思考型**——它要在主模型烧剩的预算里跑完。降级成功会写 history 的 `degraded` 事件并触发独立降级告警（不掩盖主模型劣化） |
 | `temperature` | 0.2 | 审查调用温度 |
 | `proseFallback` / `maxNoteChars` | true / 768 | 无 JSON 帧时把清洗后的散文救回为 nit；JSON 帧与散文的 note 统一按码点截断到该上限 |
@@ -337,6 +341,8 @@ printf '隔离目录（验证后可手动删除）：%s\n' "$mock_home"
 - **降级（fallback）仅 async**：sync 下单轮受 Stop 硬超时约束，切预算会复活"强杀→指针不推进→每轮重审"停滞循环，故禁用。且只在"换模型能治"的白名单错误上切换（401/403/429/5xx/timeout 都不切——那是 key/端点问题）。
 - **配置面板的 Ping 仍按旧口径**（`max_tokens=1`，思考型模型会误报 OK）；能力探针 `ctl doctor --probe` 是 CLI 入口，面板用户暂不受益。三处 ping 的统一是后续项。
 - **健康状态灯依赖 CDP 角标**：controller 未运行时角标不存在，也就没有灯（不是"灯变灰"，是"没有灯"）。此时用 `/advisor-status` 或 `ctl doctor` 兜底。
+- **确定性错误停机（halt）**：审查遇 401/403（key 无效/被拒）时对该配置是永久失败——重试与降级都救不了。命中即停机：该会话不再发起审查调用（不再无谓烧 token），原因在注册行与 `/advisor-status` 可见，修复配置后 `/advisor-on` 清除恢复。404/429/5xx/超时/空响应不在停机之列（暂态或换模型能治，仍走既有重试/降级）。对齐上游 dsh-advisor v0.6.3。
+- **看不到角标的三种成因与自查**（2026-10-27 实测故障复盘）：① 直接双击启动的 ZCode 没有调试端口——companion 只能等其完全退出后自动接管（约 30 秒），期间角标不可用，会话里新会话的注册行会带「角标等待中」提示；② companion 掉线（launchd 监督停摆）——hook 会在注册行提示「角标外挂未运行」并节流执行 `launchctl kickstart` 自愈（每会话 10 分钟至多一次，`ZCODE_ADVISOR_BADGE_REVIVE=0` 可禁用）；③ ZCode 大版本更新改了输入框 DOM——锚点选择器全部落空时角标退回右下角悬浮兜底，仍可见。审查功能在这三种情况下都不受影响。
 
 ## 目录结构
 
