@@ -58,7 +58,7 @@ ZCode（z.ai CLI）插件：**每轮被动审查对话增量的独立审查副�
 
 **版本倾斜（插件与 companion 不同步）**：通常**无症状**——hook 侧与面板各自独立工作。安装器与升级流程会把两半一起更新；若你手动只替换了一半且行为异常，重新运行安装器即可自愈（`--force` 覆盖）。登记为已知简化，不做运行时检测。
 
-**模型怎么选**：审查模型建议与主对话模型形成能力差（主模型是 flash 级时，审查优先试 `glm-5.3` 等更强模型，以 ZCode 里该服务商实际登记/可用的为准）。改全局模型两处入口等价：**完整配置面板**（角标内嵌面板或本地配置面板）、直接编辑配置文件；两者都能「从端点拉取」实时清单并 Ping 验证候选模型。会话级临时切换用角标面板的「本会话的审查模型」块，或 `/advisor-model set <model-id> [provider:<服务商>]`（自下一轮审查生效，仅当前会话，优先级高于全局；`/advisor-model reset` 恢复全局）。`maxTokens` 默认即 4096（有实证支撑的下限：768 会把预算耗在思考上导致空转，有实测）；越界值会被钳到 64–16384 并在 `/advisor-status` 的「配置问题」行登记。
+**模型怎么选**：审查模型建议与主对话模型形成能力差（主模型是 flash 级时，审查优先试 `glm-5.3` 等更强模型，以 ZCode 里该服务商实际登记/可用的为准）。改全局模型两处入口等价：**完整配置面板**（角标内嵌面板或本地配置面板）、直接编辑配置文件；两者都能「从端点拉取」实时清单并 Ping 验证候选模型。会话级临时切换用角标面板的「本会话的审查模型」块，或 `/advisor-model set <model-id> [provider:<服务商>]`（自下一轮审查生效，仅当前会话，优先级高于全局；`/advisor-model reset` 恢复全局）。
 
 ## 发行包
 
@@ -211,7 +211,8 @@ Stop ──────────── 每轮结束时触发审查（按 revi
 | `agent.inject`（nit） | UserPromptSubmit `additionalContext` | 语义一致：不唤醒、下个边界消费 |
 | `agent.steer`（concern/blocker） | sync：Stop block；async：顺延队列 | async 是宿主约束下的选择（见上），非被迫 |
 | 每步审查（step boundary） | Stop 时点审查 | zcode 无逐步注入通道，粒度为整轮 |
-| `immuneTurns` / `maxDeltaMessages` / `maxTokens` / `systemPrompt` | 同名配置 | 语义一致；冷却设点差异见下 |
+| `immuneTurns` / `maxDeltaMessages` / `systemPrompt` | 同名配置 | 语义一致；冷却设点差异见下 |
+| `maxTokens` | **语义分叉（2026-10-27）** | OpenAI 兼容通道**不发送**模型侧预算——`max_tokens` 把 reasoning 与正文一并计费，思考型模型的正文会被截成半截 JSON（2026-10-24~26 unparsed 丢弃潮的实证根因；对齐上游 dsh-advisor 0.5.7 同款裁决）。仅 Anthropic /v1/messages 通道继续发送（协议硬性要求） |
 | `proseFallback` | 同名配置，**本移植默认 true** | 上游默认 false；对齐 dsh 端本地补丁 v2.2 的生效状态。守门规则见下 |
 | `enabled` 配置键（已废弃） | 同样没有 | 插件管理里的启用开关即主开关；会话级用 `/advisor-on` `/advisor-off` |
 | `/advisor status\|on\|off\|model` | `/advisor-status` `/advisor-setup` `/advisor-on` `/advisor-off` `/advisor-model` | 会话级命令经注册行里的**状态文件路径**精确定位本会话；多会话并存时裸 `ctl` 会被拒绝，防误伤 |
@@ -236,14 +237,14 @@ dsh 端教训（`ADVISOR-GUARD-REPORT.md`，[issue #102](https://github.com/omds
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `zcodeProvider` | 空 | **全局审查服务商**（ZCode provider 的 id，容忍写名称）。留空 = 自动选择（优先含所填模型的可用第三方服务商，否则第一个可用的）。必须是**非官方内置 + 协议受支持（OpenAI 兼容或 Anthropic）+ 端点/key 齐备**，否则门禁拦下并在「配置问题」行给出原因 |
-| `model` | 空 | **全局审查模型**；留空取所选服务商登记清单首项。建议与主模型形成能力差，思考型模型配 `maxTokens: 4096`。会话级覆盖见 `/advisor-model` 与角标面板 |
+| `model` | 空 | **全局审查模型**；留空取所选服务商登记清单首项。建议与主模型形成能力差。会话级覆盖见 `/advisor-model` 与角标面板 |
 | `protocol` | 自动 | **审查协议**（只读展示，**不是可落盘的配置键**）：`openai`（chat/completions）或 `anthropic`（/v1/messages）。一律由所选服务商的协议自动推导；唯一的显式覆盖入口是环境变量 `ZCODE_ADVISOR_PROTOCOL`（必须与 `ZCODE_ADVISOR_BASE_URL`+`ZCODE_ADVISOR_API_KEY` 同时给）。刻意不开放为配置键：协议与端点/凭据是一个三元组，分开配会让 key 以错误的鉴权方案发出 |
 | `apiKeyEnv` | 见文件 | **仅环境变量逃生舱**：`ZCODE_ADVISOR_API_KEY` 等（CI/特殊部署）。占位符样式值（`REPLACE_*`、`test*`、含中文的模板文案等）视为未配置。共享 env key 发往非签发方端点会触发警告 |
 | `reviewMode` | `async` | `async`（亚秒级固定税，意见下条消息送达）或 `sync`（立即打断，超时自动钳制 ≤300s） |
 | `immuneTurns` | 3 | steer 后的冷却轮数；冷却期内 concern 降级顺延（blocker 不受限） |
 | `maxDeltaMessages` / `maxContextChars` | 60 / 48000 | 送审窗口（条数 / 总字符）。两者同时生效，长消息下字符帽先到 |
-| `maxTokens` | 4096 | 单次审查输出预算；接受字符串数字，越界钳到 64–16384 并登记「配置问题」。**设 `0` 则请求完全不发送 `max_tokens`**（对齐上游 dsh-advisor 2026-10-18 裁决：OpenAI 兼容 API 的 max_tokens 把思考+正文一起截，思考型模型会间歇性空响应；不发送由端点默认兜底，输出长度仍受 `maxNoteChars` 截断） |
-| `fallbackModel` | 空（关闭） | **降级备用模型**：主模型遇白名单错误（`llm_empty_response`/`unparsed`/`llm_http_404`）时临时换用它，端点/key 不变。**仅 async 生效**（sync 下会砍半 primary 预算，已禁用）。建议配**快模型/非思考型**——它要在主模型烧剩的预算里跑完。降级成功会写 history 的 `degraded` 事件并触发独立降级告警（不掩盖主模型劣化） |
+| `maxTokens` | 4096 | **仅 Anthropic 协议生效**（/v1/messages 硬性要求 max_tokens）；OpenAI 兼容通道不发送模型侧预算，输出由 `maxNoteChars` 抽取帽约束。存量配置里的该键容忍但被 OpenAI 通道忽略。接受字符串数字，越界钳到 64–16384 并登记「配置问题」 |
+| `fallbackModel` | 空（关闭） | **降级备用模型**：主模型遇白名单错误（`llm_empty_response`/`unparsed`/`llm_truncated`/`llm_http_404`）时临时换用它，端点/key 不变。**仅 async 生效**（sync 下会砍半 primary 预算，已禁用）。建议配**快模型/非思考型**——它要在主模型烧剩的预算里跑完。降级成功会写 history 的 `degraded` 事件并触发独立降级告警（不掩盖主模型劣化） |
 | `temperature` | 0.2 | 审查调用温度 |
 | `proseFallback` / `maxNoteChars` | true / 768 | 无 JSON 帧时把清洗后的散文救回为 nit；JSON 帧与散文的 note 统一按码点截断到该上限 |
 | `systemPrompt` | 内置 | **完全替换**内置审查提示词（含 advisory-only 纪律）。注意：插件目录可被会话内的工具写入，不建议设置——保持内置纪律不可被改写 |
@@ -308,11 +309,12 @@ printf '隔离目录（验证后可手动删除）：%s\n' "$mock_home"
 
 | 类别 | 含义 | 处置 |
 | --- | --- | --- |
-| `llm_empty_response` | 模型把输出预算耗在思考上，正文为空 | `maxTokens` 提到 4096 |
-| `unparsed` | 无合法 JSON 帧且救回被守门拒绝 | 确认 `proseFallback: true`；换格式稳定的模型 |
+| `llm_empty_response` | 模型返回完成但正文为空（含思考耗尽输出上限） | 检查端点/网关是否套了默认输出上限；Anthropic 协议可调大 `maxTokens` |
+| `llm_truncated` | 正文非空但在 JSON 输出中途被截断（finish=length，重试 2 次后仍无帧） | 检查端点/网关的输出上限；样本见 `~/.zcode/advisor-review-samples.jsonl` |
+| `unparsed` | 无合法 JSON 帧且救回被守门拒绝 | 确认 `proseFallback: true`；JSON 形状的无帧回复（键名漂移等）会先经 2 次 schema 纠正重试；样本见 `~/.zcode/advisor-review-samples.jsonl`；仍频发则换格式稳定的模型 |
 | `llm_timeout` | 审查超时（含重试共享截止） | 提高 `reviewTimeoutMs`（sync 已自动钳制 ≤300s）或缩小 `maxDeltaMessages`（20~30） |
 | 面板保存 503 | 配置文件正被其他进程写入（跨进程锁在保护它） | 等几秒重试；持续出现则删除 `~/.zcode/advisor.config.json.lock`（进程崩溃残留，锁协议会自动接管死主的锁，正常无需手动） |
-| `llm_http_4xx/5xx` | 端点/认证/限流错误 | 检查 key 与模型 id；429/5xx 已内置一次共享截止的退避重试 |
+| `llm_http_4xx/5xx` | 端点/认证/限流错误 | 检查 key 与模型 id；429/5xx 已内置一次共享截止的退避重试。**连续 404 会停机**（status 出现「停机」行、Stop 不再派发）——`/advisor-on` 恢复或 `/advisor-model set` 换模型 |
 | `llm_error` | 网络层失败（DNS/连接） | 检查端点可达性 |
 | `no_transcript` | 转录文件缺失 | 宿主契约问题，带 `ZCODE_ADVISOR_DEBUG=1` 反馈 |
 | `parse_empty` | 转录有完整行但全部无法解析 | 转录格式与预期不符，带样例反馈 |
@@ -322,12 +324,14 @@ printf '隔离目录（验证后可手动删除）：%s\n' "$mock_home"
 
 其他：无 key/停用状态下**不会全哑**——控制面提示照常可达；每轮收尾变慢 → 确认在 `async`；长会话后命令失联 → resume/compact 会重发注册行。
 
+**两类自动告警**（经下一条用户消息注入）：① **停摆告警**——连续失败达 3 次（连击制）；② **评审质量告警**——近 10 轮审查失败率 ≥50%（滑动窗口制）。两者互补：成功/失败**交替**出现时连击会被洗零（2026-10-24~26 的丢弃潮正是此形态、69% 失败率却从未触达连击阈值），窗口比率照样暴露。审查停机（404 停机）另有一次性告知行；`/advisor-status` 的「近期失败率」行持久可查。
+
 ## 安全与成本
 
 - **注入链残余风险（如实声明）**：本插件向主会话新增两条自动注入通道（sync 的 Stop block、async 的 additionalContext）。**能影响转录内容的一方**（被 Read 的网页/代码注释/工具输出）理论上可经审查模型植入 note 影响主模型；缓解是 note 码点截断（768）、帧校验（多帧取末帧而非最高severity）、advisory 前缀与"仅供参考"框架、内置提示词禁止 note 携带可执行指令——但对蓄意注入无硬性防线。选型提示拆开说：**担心注入链 → 用 async**（无强制续跑）；**担心 blocker 迟到 → 用 sync**（当轮打断），两个维度独立决策。
 - **敏感数据外发（如实声明）**：转录增量（代码、路径、可能的密钥）不做脱敏直接发送到 `baseUrl`；主模型 Read `.env` 后其内容会进入转录并外发。当前无可配置脱敏规则——请自行权衡端点可信度；插件目录（含本配置文件）可被会话内工具改写，"独立审查"对被审查者不设防，`/advisor-status` 的配置警告行可辅助发现端点篡改。
 - **key 落盘**：用户级配置（`~/.zcode/advisor.config.json`）不在任何 git 仓库内、跨升级保留；插件目录的 `advisor.config.json` 已被 gitignore（模板见 example）。共享 env key（`ZAI_API_KEY` 等）发往非官方端点会在状态中警告；`http://` 非本机端点会警告明文传输。
-- **成本可观测**：每次调用的 usage 解析入账（`/advisor-status` 的 Token 累计；数字来自端点自报，恶意端点可伪造）；单次调用输入上限 48K 字符 + `maxTokens` 输出，单轮（含空响应重试）最多 3 次调用、总耗时 ≤ 预算上界（sync=1×、async=2× `reviewTimeoutMs`）。空转（有调用无产出）在 `Dropped:llm_empty_response` 可见。
+- **成本可观测**：每次调用的 usage 解析入账（`/advisor-status` 的 Token 累计；数字来自端点自报，恶意端点可伪造）；单次调用输入上限 48K 字符，输出无模型侧预算（OpenAI 兼容通道不发送 `max_tokens`，思考量由模型自定；Anthropic 通道发送 `maxTokens`），单轮单模型（含重试）最多 3 次调用；配了降级备用模型时主/备各最多 3 次。总耗时 ≤ 预算上界（sync=1×、async=2× `reviewTimeoutMs`）。空转（有调用无产出）在 `Dropped:llm_empty_response`/`unparsed`/`llm_truncated` 可见，响应头部样本留存于 `~/.zcode/advisor-review-samples.jsonl`（0600、上限 100 行）。
 
 ## 局限（如实声明）
 

@@ -42,7 +42,7 @@ test('maxTokens=0：请求体不含 max_tokens（上游 2026-10-18 裁决：思�
   } finally { f.restore(); }
 });
 
-test('maxTokens>0：max_tokens 照常发送（向后兼容不回归）', async () => {
+test('maxTokens>0：OpenAI 通道仍不发送（2026-10-27 起预算只由抽取帽约束）', async () => {
   const { callReviewer } = require('../hooks/lib/reviewer.js');
   const f = withFetch(null, {
     choices: [{ message: { content: '{"severity":"nit","note":"ok"}' }, finish_reason: 'stop' }],
@@ -54,11 +54,11 @@ test('maxTokens>0：max_tokens 照常发送（向后兼容不回归）', async (
       systemPrompt: 'sp', userContent: 'uc', maxTokens: 1024, temperature: 0.2, timeoutMs: 5000
     });
     const body = JSON.parse(f.seen().opt.body);
-    assert.strictEqual(body.max_tokens, 1024);
+    assert.strictEqual(body.max_tokens, undefined, 'OpenAI 通道一律不发送 max_tokens');
   } finally { f.restore(); }
 });
 
-test('maxTokens=0(anthropic 协议)：请求体同样不带 max_tokens', async () => {
+test('maxTokens=0(anthropic 协议)：仍发送兜底 4096（/v1/messages 硬性要求该字段）', async () => {
   const { callReviewer } = require('../hooks/lib/reviewer.js');
   const f = withFetch(null, {
     content: [{ type: 'text', text: '{"severity":"nit","note":"ok"}' }],
@@ -70,7 +70,7 @@ test('maxTokens=0(anthropic 协议)：请求体同样不带 max_tokens', async (
       apiKey: 'sk-ant', systemPrompt: 'sp', userContent: 'uc', maxTokens: 0, temperature: 0.2, timeoutMs: 5000
     });
     const body = JSON.parse(f.seen().opt.body);
-    assert.strictEqual(body.max_tokens, undefined);
+    assert.strictEqual(body.max_tokens, 4096, 'Anthropic 协议必须带 max_tokens，缺省兜底 4096');
   } finally { f.restore(); }
 });
 

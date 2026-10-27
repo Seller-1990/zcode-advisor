@@ -45,7 +45,7 @@ argument-hint: "[model:<model-id>] [provider:<id|名称>]"
    若探针/ping 失败：
    - `llm_http_401/403` → 该服务商的 key 无效或无权限（去 ZCode 设置里改）；
    - `llm_http_404/400` → 模型 id 或端点路径不对，建议换模型再用 `ctl doctor --probe --model <id>` 逐个验证；
-   - `llm_empty_response` → 思考型模型烧预算（探针会带 reasoning 提示），调大 maxTokens（建议 ≥4096）；
+   - `llm_empty_response` → 模型返回完成但无正文（探针会带 reasoning 提示），检查端点/网关是否套了默认输出上限；Anthropic 协议服务商可调大 maxTokens（建议 ≥4096）；
    - `llm_timeout`/`llm_error` → 网络或端点问题；
    - 门禁提示 `zcode_provider_*` → 服务商不满足条件（官方内置/协议不兼容/缺端点或 key/找不到），按提示去 ZCode 设置里修。
 6. **收尾**：告知用户配置已写入用户级配置文件（给出实际路径），对新会话与既有会话的下一轮审查立即生效；会话级临时换服务商/模型用角标面板的「本会话的审查模型」块或 `/advisor-model set <id> [provider:<id>]`；之后可用 `/advisor-status` 观察审查次数与 Token 累计。

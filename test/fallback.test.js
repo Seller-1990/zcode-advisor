@@ -205,11 +205,14 @@ test('主败备成：primory llm_empty_response → 切备用并拿到帧', asyn
 });
 
 test('主败备成：unparsed 也触发降级（白名单）', async () => {
+  // 2026-10-27 起 JSON 形状的无帧回复（含半截 JSON）会先走主模型内的 schema 纠正重试
+  //（见 review-resilience.test.js），到不了降级；散文型（proseFallback 关闭时）不重试，
+  // 直接落到白名单降级——本用例守住这条路径。
   const call = seqCaller([
-    { text: '{"severity":' },  // 半截 JSON → unparsed（不会空响应重试）
+    { text: '这是一段完全不像 JSON 的散文回复' },  // 散文 → unparsed（不进重试通道）
     OK_FRAME
   ]);
-  const r = await reviewTurn(mkCfg({ fallbackModel: 'fb' }), TARGET, 'd', false, { state: {}, callReviewer: call });
+  const r = await reviewTurn(mkCfg({ fallbackModel: 'fb', proseFallback: false }), TARGET, 'd', false, { state: {}, callReviewer: call });
   assert.ok(r.frame);
   assert.strictEqual(r.usedFallback, true);
   assert.strictEqual(r.primaryFailure, 'unparsed');
@@ -340,12 +343,12 @@ function applyInChild(result, stateInit) {
   return JSON.parse(out.trim().split('\n').pop());
 }
 
-test('落盘：确定性错误 halt → 置 pendingRegistration（停机原因下一轮必须可见）', () => {
+test('落盘：确定性错误 halt → 置 halted 且下一轮 UPS 一次性告知（停机原因必须可见）', () => {
   const got = applyInChild({ error: 'llm_http_401', halt: true }, {});
   assert.strictEqual(got.s.halted, true);
   assert.strictEqual(got.s.haltedReason, 'llm_http_401');
-  assert.strictEqual(got.s.pendingRegistration, true,
-    'halt 发生在会话中途，必须借下一轮注册行把原因说出来，否则就是静默失败');
+  assert.strictEqual(got.s.haltNotifiedAt || '', '',
+    'halt 发生在会话中途：下一轮 UPS 用 haltNotifiedAt 一次性把原因说出来，否则就是静默失败');
 });
 
 test('落盘：主模型失败（无降级）→ 累加 failStreak', () => {
