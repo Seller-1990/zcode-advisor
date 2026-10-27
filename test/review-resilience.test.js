@@ -246,7 +246,10 @@ const EFF = { model: 'm-404', providerName: 'p' };
 test('applyReviewOutcome：llm_http_404 终局 → halted + history；fallback 救回的不停机', () => {
   const s = { sessionId: 's1', dropped: {}, droppedAt: {}, halted: null };
   applyReviewOutcome(s, { error: 'llm_http_404' }, EFF, mkCfg());
-  assert.ok(s.halted && s.halted.reason === 'llm_http_404' && s.halted.model === 'm-404', '404 终局必须停机');
+  assert.strictEqual(s.halted, true, '404 终局必须停机');
+  assert.strictEqual(s.haltedReason, 'llm_http_404');
+  assert.strictEqual(s.haltedModel, 'm-404');
+  assert.ok(s.haltedAt, '停机时间必须落盘');
   const hist = fs.readFileSync(process.env.ZCODE_ADVISOR_HISTORY, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.ok(hist.some((h) => h.event === 'halted' && h.reason === 'llm_http_404'), '停机必须留 history');
 
@@ -340,7 +343,10 @@ test('UPS：halted → 一次性停机告知，再次提交不重复', () => {
     const stateDir = path.join(dir, 'state');
     const sessionId = 'ups_halt';
     preseedState(stateDir, sessionId, {
-      halted: { reason: 'llm_http_404', model: 'm-404', at: '2026-10-27T00:00:00.000Z' }
+      halted: true,
+      haltedReason: 'llm_http_404',
+      haltedModel: 'm-404',
+      haltedAt: '2026-10-27T00:00:00.000Z'
     });
     const r1 = runUps(stateDir, sessionId);
     assert.strictEqual(r1.status, 0);
@@ -356,7 +362,7 @@ test('UPS：halted → 一次性停机告知，再次提交不重复', () => {
     assert.strictEqual(on.status, 0);
     assert.ok(on.stdout.includes('停机状态已清除'), `on 应报告清除停机：${on.stdout}`);
     const st3 = JSON.parse(fs.readFileSync(path.join(stateDir, `sess-${sessionId}.json`), 'utf8'));
-    assert.strictEqual(st3.halted, null);
+    assert.strictEqual(st3.halted, false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

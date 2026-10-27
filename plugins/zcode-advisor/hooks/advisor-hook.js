@@ -552,7 +552,13 @@ function applyReviewOutcome(s, result, eff, cfg) {
     // unparsed 潮里 404 混在计数器里无人看见）。停机并可见，/advisor-on 重建、
     // /advisor-model 换模型时清除。备用模型救回的不停（usedFallback 说明有活路）。
     if (result.error === 'llm_http_404' && !result.usedFallback && !s.halted) {
-      s.halted = { reason: 'llm_http_404', model: eff.model, at: new Date().toISOString() };
+      // 停机状态只保留一种形状：布尔位 + haltedReason/haltedAt/haltedModel。曾经 404 写
+      // 对象、401/403 写布尔，读取侧统一读 s.halted.reason，布尔态下就打印 undefined。
+      s.halted = true;
+      s.haltedReason = 'llm_http_404';
+      s.haltedAt = new Date().toISOString();
+      s.haltedModel = eff.model || '';
+      s.haltNotifiedAt = '';
       appendHistory({ event: 'halted', sessionId: s.sessionId, reason: 'llm_http_404', model: eff.model });
     }
     return;
@@ -700,7 +706,7 @@ function onUserPromptSubmit(ctx) {
     // 停机告知（P1-⑤）：一次性。状态持久（status 可查、Stop 不再派发），注入只为
     // 把"审查为什么突然安静了"送到用户眼前——修复动作（/advisor-on）在文案里给出。
     if (s.enabled === true && s.halted && !s.haltNotifiedAt) {
-      parts.unshift(`[advisor] 审查已停机：${s.halted.reason}（模型 ${s.halted.model}，${s.halted.at}）。这是确定性失败，继续重试只会白烧预算；修复端点/模型后运行 /advisor-on 恢复，或 /advisor-model set 换模型。`);
+      parts.unshift(`[advisor] 审查已停机：${s.haltedReason || 'unknown'}（模型 ${s.haltedModel || '未知'}，${s.haltedAt || ''}）。这是确定性失败，继续重试只会白烧预算；修复端点/模型后运行 /advisor-on 恢复，或 /advisor-model set 换模型。`);
       s.haltNotifiedAt = new Date().toISOString();
     }
     // 滑动窗口失败率告警（P1-④）：与连击告警互补——连击看"连续坏"，窗口看"坏得密"。
@@ -1362,7 +1368,7 @@ async function handleCtl(args) {
     if (dropLine) lines.push(`  Dropped: ${dropLine}`);
     // 确定性失败停机（P1-⑤）：status 是停机状态的持久出口——UPS 告知行只出现一次。
     if (state.halted) {
-      lines.push(`  停机: ${state.halted.reason}（模型 ${state.halted.model}，自 ${state.halted.at}）—— Stop 不再派发审查；/advisor-on 恢复或 /advisor-model set 换模型`);
+      lines.push(`  停机: ${state.haltedReason || 'unknown'}（模型 ${state.haltedModel || '未知'}，自 ${state.haltedAt || ''}）—— Stop 不再派发审查；/advisor-on 恢复或 /advisor-model set 换模型`);
     }
     // 滑动窗口失败率（P1-④）：连击 failStreak 之外的"坏得密"视角。
     const win = state.winStats || { total: 0, failed: 0 };
@@ -1435,7 +1441,10 @@ async function handleCtl(args) {
       s.enabled = true;
       // 停机清除（P1-⑤）：/advisor-on 是唯一的人工恢复入口——用户按下它时已读过
       // 告知行/状态行，重置 halt 状态让 Stop 重新派发；审查本身会再次验证端点。
-      s.halted = null;
+      s.halted = false;
+      s.haltedReason = '';
+      s.haltedAt = '';
+      s.haltedModel = '';
       s.haltNotifiedAt = '';
       const r = gateWithSession(cfg, resolveApiKey(cfg, process.env), s);
       reasons = r.reasons;
@@ -1486,7 +1495,7 @@ async function handleCtl(args) {
         if (provider) s.sessionProvider = provider;
         // 换审查目标 = 停机原因（旧模型对端点 404）多半不再成立：一并清除停机。
         // 若新目标同样 404，worker 会重新停机并再次告知——代价可控，不赌用户的判断。
-        s.halted = null;
+        s.halted = false;
         s.haltNotifiedAt = '';
       })) return;
       const parts = [];
@@ -1504,7 +1513,7 @@ async function handleCtl(args) {
       if (!mutateCtlState((s) => {
         s.sessionProvider = provider;
         s.sessionModel = ''; // 换服务商后旧模型多半不属于它：一并清掉，回落新服务商清单
-        s.halted = null;     // 换目标清停机，理由同 set 分支
+        s.halted = false;     // 换目标清停机，理由同 set 分支
         s.haltNotifiedAt = '';
       })) return;
       process.stdout.write(`advisor: 本会话服务商已固定为 ${provider}（模型已回落该服务商默认；用 model set <模型> 再指定）。恢复全局用 model reset。\n`);
@@ -1514,7 +1523,7 @@ async function handleCtl(args) {
       if (!mutateCtlState((s) => {
         s.sessionModel = '';
         s.sessionProvider = '';
-        s.halted = null;   // 回全局默认同样是换目标：清停机
+        s.halted = false;   // 回全局默认同样是换目标：清停机
         s.haltNotifiedAt = '';
       })) return;
       const eff = resolveTarget(cfg, null, process.env);

@@ -60,7 +60,8 @@ function freshState(sessionId, transcriptPath, startEnabled) {
     rateAlertCount: 0,
     rateNotifiedAt: '',
     // —— 确定性失败停机（P1-⑤）——
-    // 非空 = 当前模型对端点确定性不可用（如 llm_http_404），审查暂停派发；
+    // 布尔位：true = 当前模型对端点确定性不可用（如 llm_http_404），审查暂停派发。
+    // 原因/时间/模型分存 haltedReason/haltedAt/haltedModel（单一形状，别混对象）。
     // /advisor-on 或 /advisor-model set 清除。haltNotifiedAt：UPS 一次性告知后置位。
     halted: null,
     haltNotifiedAt: '',
