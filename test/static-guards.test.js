@@ -281,3 +281,15 @@ test('测试文件：require controller.cjs 必须同时隔离 ZCODE_ADVISOR_COM
   assert.deepStrictEqual(offenders, [],
     `以下测试 require 了 controller.cjs 但未隔离 ZCODE_ADVISOR_COMPANION_LOG，会污染用户真实日志：${offenders.join(', ')}`);
 });
+
+test('临时目录两侧同源：controller 与 hook 必须用同一解析方式（锁/待命标记写读不能分叉）', () => {
+  const ctl = read('tools/companion/controller.cjs');
+  const badge = read('hooks/lib/badge.js');
+  assert.ok(/const TMP_DIR = process\.env\.ZCODE_ADVISOR_COMPANION_TMP \|\| os\.tmpdir\(\);/.test(ctl),
+    'controller 必须走 TMP_DIR（与 hook 的 resolveLockDir 同源），否则写读可能落在两个文件上');
+  assert.ok(/env\.ZCODE_ADVISOR_COMPANION_TMP\) \|\| os\.tmpdir\(\)/.test(badge),
+    'badge.resolveLockDir 的覆盖口径被改动：两侧必须同时改');
+  const strays = ['zcode-advisor-companion.lock', 'zcode-advisor-companion.standby', 'zcode-advisor-wait.stamp']
+    .filter((name) => new RegExp(`path\\.join\\(os\\.tmpdir\\(\\), '${name.replace(/\./g, '\\.')}'\\)`).test(ctl));
+  assert.deepStrictEqual(strays, [], `这些文件仍在直接拼 os.tmpdir()，会绕过 TMP_DIR：${strays.join(', ')}`);
+});

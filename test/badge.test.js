@@ -107,6 +107,69 @@ test('deriveBadgeState：三态判定', () => {
   assert.strictEqual(BADGE.deriveBadgeState({ present: true, fresh: true, cdp: 0 }), 'waiting');
 });
 
+// ---------------- 待命标记（裸 ZCode 场景） ----------------
+
+function writeStandby(dir, { at, reason }) {
+  fs.writeFileSync(
+    path.join(dir, BADGE.STANDBY_FILE_NAME),
+    `reason=${reason || 'bare-zcode'}\nat=${at || Date.now()}\n`,
+    'utf8'
+  );
+}
+
+test('readStandby：缺失/坏内容 → present:false；新鲜 → present:true 且带原因', () => {
+  assert.strictEqual(BADGE.readStandby({ ZCODE_ADVISOR_COMPANION_TMP: tmpDir() }).present, false);
+  const bad = tmpDir();
+  fs.writeFileSync(path.join(bad, BADGE.STANDBY_FILE_NAME), 'garbage', 'utf8');
+  assert.strictEqual(BADGE.readStandby({ ZCODE_ADVISOR_COMPANION_TMP: bad }).present, false);
+
+  const dir = tmpDir();
+  writeStandby(dir, { at: Date.now(), reason: 'bare-zcode' });
+  const st = BADGE.readStandby({ ZCODE_ADVISOR_COMPANION_TMP: dir });
+  assert.strictEqual(st.present, true);
+  assert.strictEqual(st.reason, 'bare-zcode');
+});
+
+test('readStandby：超过保鲜期 → present:false（陈旧标记不得长期冒充等待中）', () => {
+  const dir = tmpDir();
+  writeStandby(dir, { at: Date.now() - BADGE.STANDBY_TTL_MS - 1000 });
+  assert.strictEqual(BADGE.readStandby({ ZCODE_ADVISOR_COMPANION_TMP: dir }).present, false);
+});
+
+test('deriveBadgeState：锁死了但有待命标记 → waiting（宿主是裸 ZCode，不该 kickstart）', () => {
+  const dir = tmpDir();
+  writeStandby(dir, { at: Date.now() });
+  const deadLock = { present: true, fresh: false, cdp: 0 };
+  assert.strictEqual(BADGE.deriveBadgeState(deadLock, BADGE.readStandby({ ZCODE_ADVISOR_COMPANION_TMP: dir })),
+    'waiting');
+  assert.strictEqual(BADGE.deriveBadgeState(deadLock, null), 'down', '无待命证据时必须仍旧判 down');
+});
+
+test('deriveBadgeState：健康锁优先于待命标记（附着成功就不能报 waiting）', () => {
+  const dir = tmpDir();
+  writeStandby(dir, { at: Date.now() });
+  const lock = { present: true, fresh: true, cdp: 9223 };
+  assert.strictEqual(BADGE.deriveBadgeState(lock, BADGE.readStandby({ ZCODE_ADVISOR_COMPANION_TMP: dir })), 'attached');
+});
+
+// ---------------- shouldRevive（节流） ----------------
+
+test('shouldRevive：ISO 时间戳必须真正参与节流（Number(ISO)=NaN 的回归）', () => {
+  const now = Date.now();
+  const min = 10 * 60 * 1000;
+  assert.strictEqual(BADGE.shouldRevive('down', new Date(now - 60 * 1000).toISOString(), now, { minIntervalMs: min }),
+    false, '10 分钟内刚拉过就必须压住');
+  assert.strictEqual(BADGE.shouldRevive('down', new Date(now - 11 * 60 * 1000).toISOString(), now, { minIntervalMs: min }),
+    true, '超过间隔应放行');
+  assert.strictEqual(BADGE.shouldRevive('down', '', now, { minIntervalMs: min }), true, '从未拉过 → 立即放行');
+  assert.strictEqual(BADGE.shouldRevive('down', 'not-a-date', now, { minIntervalMs: min }), true,
+    '坏时间戳按从未拉过处理（宁可多拉一次也不永久沉默）');
+  assert.strictEqual(BADGE.shouldRevive('waiting', new Date(0).toISOString(), now, { minIntervalMs: min }), false,
+    'waiting 不是自愈对象');
+  assert.strictEqual(BADGE.shouldRevive('down', '', now, { minIntervalMs: min, disabled: true }), false,
+    'ZCODE_ADVISOR_BADGE_REVIVE=0 必须彻底关闭');
+});
+
 // ---------------- revivePlan ----------------
 
 test('revivePlan：非 darwin 平台无从自愈', () => {
@@ -194,10 +257,15 @@ test('badgeHintLines：waiting/down 给人话且承诺审查不受影响；attac
   assert.strictEqual(waiting.length, 1);
   assert.ok(waiting[0].startsWith('[advisor]'));
   assert.ok(waiting[0].includes('审查不受影响'), '必须写明审查不受影响，防止用户误读成顾问挂了');
+  assert.ok(waiting[0].includes('启动器'), '必须给出用户真正能做的一步：用启动器重开');
+  assert.ok(!waiting[0].includes('自动以角标模式重新拉起'),
+    'attach-only 不会代启，文案不得承诺「退出后自动拉起」（这是旧文案的硬伤）');
 
   const down = BADGE.badgeHintLines('down', 'darwin');
   assert.strictEqual(down.length, 1);
   assert.ok(down[0].includes('launchctl kickstart'), 'darwin 文案必须给出可操作命令');
+  assert.ok(!down[0].includes('已尝试自动拉起'),
+    '是否真的拉起由 reviveResultLines 如实报告，静态文案不得预先声称已尝试');
 
   const downWin = BADGE.badgeHintLines('down', 'win32');
   assert.strictEqual(downWin.length, 1);

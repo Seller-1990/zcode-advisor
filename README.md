@@ -153,7 +153,7 @@ ZCode 桌面版没有官方 UI 扩展机制，因此在界面内提供设置入�
 ### macOS 登录自启动（LaunchAgent）
 
 DMG 安装的 `.app` 首次打开时会**自动装上 LaunchAgent**（`~/Library/LaunchAgents/local.zcode.advisor.plist`），
-此后**登录即自动就绪**——不必再用启动器打开，直接双击 ZCode 也会有角标：
+此后登录时 launchd 会自动拉起 controller（没有可附着的调试实例时它安静退出，不会凭空打开 ZCode）：
 
 - `RunAtLoad`：登录时自动拉起；`KeepAlive{SuccessfulExit:false}`：崩溃后自动重启；
   `ThrottleInterval=30`：重试间隔 30s（不会重启风暴）。
@@ -165,7 +165,7 @@ DMG 安装的 `.app` 首次打开时会**自动装上 LaunchAgent**（`~/Library
   launchd 稍后重试以便接管；**无 CDP 可附着**（attach-only 下不再死等）与**永久性失败**
   （Node 版本过低、`zcodePath` 不可执行）退 `0` 停止重启，避免空转刷日志。
 - 若你**直接双击打开了 ZCode**：那个实例没有调试端口，注入无法后补——新会话的注册行会提示
-  「角标等待中」。要角标：完全退出 ZCode（⌘Q）后双击 `ZCode Advisor`。审查功能不受影响。
+  「角标不可用」。要角标：完全退出 ZCode（⌘Q）后双击 `ZCode Advisor`。审查功能不受影响。
 
 管理命令（用包内 Node 运行，`<app>` = `ZCode Advisor.app/Contents/Resources`）：
 
@@ -342,7 +342,7 @@ printf '隔离目录（验证后可手动删除）：%s\n' "$mock_home"
 - **配置面板的 Ping 仍按旧口径**（`max_tokens=1`，思考型模型会误报 OK）；能力探针 `ctl doctor --probe` 是 CLI 入口，面板用户暂不受益。三处 ping 的统一是后续项。
 - **健康状态灯依赖 CDP 角标**：controller 未运行时角标不存在，也就没有灯（不是"灯变灰"，是"没有灯"）。此时用 `/advisor-status` 或 `ctl doctor` 兜底。
 - **确定性错误停机（halt）**：审查遇 401/403（key 无效/被拒）时对该配置是永久失败——重试与降级都救不了。命中即停机：该会话不再发起审查调用（不再无谓烧 token），原因在注册行与 `/advisor-status` 可见，修复配置后 `/advisor-on` 清除恢复。404/429/5xx/超时/空响应不在停机之列（暂态或换模型能治，仍走既有重试/降级）。对齐上游 dsh-advisor v0.6.3。
-- **看不到角标的三种成因与自查**（2026-10-27 实测故障复盘）：① 直接双击启动的 ZCode 没有调试端口——companion 只能等其完全退出后自动接管（约 30 秒），期间角标不可用，会话里新会话的注册行会带「角标等待中」提示；② companion 掉线（launchd 监督停摆）——hook 会在注册行提示「角标外挂未运行」并节流执行 `launchctl kickstart` 自愈（每会话 10 分钟至多一次，`ZCODE_ADVISOR_BADGE_REVIVE=0` 可禁用）；③ ZCode 大版本更新改了输入框 DOM——锚点选择器全部落空时角标退回右下角悬浮兜底，仍可见。审查功能在这三种情况下都不受影响。
+- **看不到角标的三种成因与自查**（2026-10-27 实测故障复盘）：① 直接双击启动的 ZCode 没有调试端口——attach-only 下 companion 不代启、不空等，会写一个待命标记后安静退出，新会话的注册行据此提示「角标不可用」（并说明用启动器重开）；待命标记也让 hook 不再做无用的 `kickstart`；② companion 掉线（launchd 监督停摆）——hook 会在注册行提示「角标外挂未运行」并节流执行 `launchctl kickstart` 自愈（每会话 10 分钟至多一次，`ZCODE_ADVISOR_BADGE_REVIVE=0` 可禁用）；③ ZCode 大版本更新改了输入框 DOM——锚点选择器全部落空时角标退回右下角悬浮兜底，仍可见。审查功能在这三种情况下都不受影响。
 
 ## 目录结构
 

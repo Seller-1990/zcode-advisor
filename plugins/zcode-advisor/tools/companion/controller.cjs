@@ -287,13 +287,32 @@ const LOCK_HEARTBEAT_MS = 20 * 1000;
 // 3 分钟足以覆盖一次正常的 ZCode 重启 + CDP 重建（正常只需数秒），
 // 又不会让用户点击后等太久（修②的自愈通常几秒内就恢复了，这里只是兜底）。
 const LOCK_ZOMBIE_GRACE_MS = 3 * 60 * 1000;
-const LOCK_FILE = path.join(os.tmpdir(), 'zcode-advisor-companion.lock');
+// 临时目录与 hook 侧 resolveLockDir 同源：默认系统 tmp，ZCODE_ADVISOR_COMPANION_TMP
+// 可重定向（测试/多用户）。两侧必须用同一解析方式——否则写读落在两个文件上，
+// 待命标记静默失效、锁也会读不到，且这种分叉在开发者终端里测不出来。
+const TMP_DIR = process.env.ZCODE_ADVISOR_COMPANION_TMP || os.tmpdir();
+const LOCK_FILE = path.join(TMP_DIR, 'zcode-advisor-companion.lock');
+// 待命标记：attach-only 发现「宿主是裸 ZCode」时写，成功附着后清。格式与
+// hooks/lib/badge.js 的 readStandby 对齐（reason/at，at=epoch ms）——hook 靠它把
+// down（该自愈）与 waiting（自愈也没用，得换启动器）分开，避免每次会话都白跑一轮
+// kickstart + auto-enable。
+const STANDBY_FILE = path.join(TMP_DIR, 'zcode-advisor-companion.standby');
+
+function writeStandby(reason) {
+  try {
+    fs.writeFileSync(STANDBY_FILE, `reason=${reason || 'bare-zcode'}\nat=${Date.now()}\n`, 'utf8');
+  } catch (_) { /* 标记写不了只是少一条提示，不能影响退出路径 */ }
+}
+
+function clearStandby() {
+  try { fs.unlinkSync(STANDBY_FILE); } catch (_) {}
+}
 
 // 等待提示的落盘节流（受监督模式专用）：「ZCode 已在运行但无调试端口」时本进程
 // 每 30s 被 launchd 重启一轮，同样的提示若每轮都写，一天近万行会把真实故障淹掉
 // （2026-10-27 实测：日志里连续 40+ 轮只有这一句话）。WAIT_STAMP 文件跨轮传递
 // 「上次落盘时间」，10 分钟至多一条；写戳失败按「要打印」处理（宁可重复不丢提示）。
-const WAIT_STAMP_FILE = path.join(os.tmpdir(), 'zcode-advisor-wait.stamp');
+const WAIT_STAMP_FILE = path.join(TMP_DIR, 'zcode-advisor-wait.stamp');
 const WAIT_LOG_INTERVAL_MS = 10 * 60 * 1000;
 function shouldLogWait(now) {
   const at = Number.isFinite(now) ? now : Date.now();
@@ -770,6 +789,7 @@ async function ensureCdp() {
   for (let p = CDP_PORT_RANGE[0]; p <= CDP_PORT_RANGE[1]; p++) {
     if (await portReachable(p)) {
       log(`发现已运行的调试实例（端口 ${p}），直接附着`);
+      clearStandby();
       return p;
     }
   }
@@ -795,6 +815,8 @@ async function ensureCdp() {
       // 这轮无法附着，安静退出 0（受监督下 launchd 停止重启）；
       // 用户下次双击 Advisor 启动器时才以调试模式拉起带角标的 ZCode。
       // 等待提示同样走节流，避免「裸 ZCode 整天开着」时日志被刷爆。
+      // 留待命标记：告诉 hook「这不是外挂挂了，是宿主没端口」，别去 kickstart。
+      writeStandby('bare-zcode');
       exitPermanent(0, SUPERVISED && !shouldLogWait()
         ? ''
         : 'ZCode 已在运行但无调试端口（直接双击启动的），本轮不附着、不代启。'
@@ -819,6 +841,8 @@ async function ensureCdp() {
   // 仍然不能 spawn：attach-only 的语义是「永不代启」，包括 ZCode 根本没开的情形——
   // 否则登录自启（launchd RunAtLoad）就会凭空打开一个 ZCode 窗口。安静退出 0。
   if (ATTACH_ONLY) {
+    // 宿主根本没开：旧的待命标记已经不成立（不是「裸 ZCode 在跑」），一并清掉。
+    clearStandby();
     exitPermanent(0, '未发现可附着的调试实例（ZCode 未运行），外挂退出。双击「ZCode Advisor」即启动带角标的 ZCode。');
   }
 
@@ -1904,6 +1928,10 @@ async function main() {
   if (!acquireLock()) {
     exitRetryable(0, SUPERVISED ? '已有健康的 companion 实例在运行，本次让位（稍后重试以便接管）' : '');
   }
+  // 心跳必须从**持锁那一刻**开始：auto-enable 最长 150s，远超 60s 的租约 TTL；
+  // 若等 ensureCdp 之后才起心跳，慢启动期间租约看起来是死的，hook 会 kickstart
+  // 出第二个 controller 抢锁，两个进程各自 auto-enable/attach。
+  startLockHeartbeat(cdpPortRef);
   injectSource = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
   log('zcode-advisor 输入框角标外挂启动');
 
@@ -1923,13 +1951,13 @@ async function main() {
   } catch (_) { /* 自动启用失败不阻断外挂 */ }
 
   const cdpPort = await ensureCdp();
+  clearStandby();
   // 风控告知（issue #7）：此刻已确定工作实例处于 CDP 调试模式（无论是本次 spawn 的，
   // 还是附着到已在运行的调试实例）——两者都是同一风险面，故在汇合点统一告知，
   // 而不是只在 spawn 分支里讲（那条分支会漏掉"上次启动的调试实例还活着"这种情况）。
   warnCdpRisk();
   // 锁心跳：把「当前 CDP 端口」写进租约，证明服务可用（僵尸租约靠它被识别）。
   cdpPortRef.value = cdpPort;
-  startLockHeartbeat(cdpPortRef);
   const apiPort = await pickApiPort();
   const token = crypto.randomBytes(16).toString('hex');
   // 角标固定位置：'composer'（输入框工具栏右侧）或 'topbar'（任务窗口上边）。

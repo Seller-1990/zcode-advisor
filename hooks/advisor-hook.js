@@ -503,6 +503,9 @@ function applyReviewOutcome(s, result, eff, cfg) {
       s.halted = true;
       s.haltedReason = result.error;
       s.haltedAt = new Date().toISOString();
+      // 下一轮把控制面（含停机原因）再投递一次：halt 往往发生在会话中途，
+      // 只写进状态文件的话，用户要等到下次启动/resume 才会看到——那正是静默失败。
+      s.pendingRegistration = true;
     }
     // 降级（M4）：主模型失败连击单独维护——即便这次 fallback 也失败，
     // 主模型劣化的证据仍要留下，供降级告警归因。
@@ -601,12 +604,16 @@ function onUserPromptSubmit(ctx) {
       // 只在会话启动/resume/compact 后出现，天然低频，不会逐轮刷屏；健康告警等
       // 独立注入通道（其用例断言 deliver 形状）不受角标状态影响。
       // companion 等待/掉线时给一句人话；down 态再标记节流自愈（launchctl 调用在临界区外执行）。
-      const badgeState = badge.deriveBadgeState(badge.readCompanionLock(process.env));
+      const badgeState = badge.deriveBadgeState(
+        badge.readCompanionLock(process.env), badge.readStandby(process.env));
       if (badgeState !== 'attached') {
         parts.push(badge.badgeHintLines(badgeState, process.platform).join('\n'));
-        if (badgeState === 'down'
-          && Date.now() - (s.badgeReviveAt || 0) > BADGE_REVIVE_MIN_INTERVAL_MS
-          && process.env.ZCODE_ADVISOR_BADGE_REVIVE !== '0') {
+        // 节流判定收进 badge.shouldRevive：badgeReviveAt 落盘的是 ISO 字符串，
+        // 曾因直接做减法得到 NaN 而让节流静默失效（每个新会话都 kickstart）。
+        if (badge.shouldRevive(badgeState, s.badgeReviveAt, Date.now(), {
+          disabled: process.env.ZCODE_ADVISOR_BADGE_REVIVE === '0',
+          minIntervalMs: BADGE_REVIVE_MIN_INTERVAL_MS
+        })) {
           s.badgeReviveAt = new Date().toISOString();
           reviveBadge = true;
         }
@@ -1262,6 +1269,10 @@ async function handleCtl(args) {
     lines.push('advisor 状态');
     lines.push(`  会话: ${state.sessionId || '(未知)'}`);
     lines.push(`  启用: ${state.enabled ? '是' : `否${state.disabledReason ? '（' + state.disabledReason + '）' : ''}`}`);
+    // 停机是「审查停止运行」的确定性状态，status 里不给就等于要用户去翻 JSON。
+    if (state.halted) {
+      lines.push(`  停机: ${state.haltedReason || 'unknown'}（确定性错误，已停止重试；修复后 /advisor-on 恢复）`);
+    }
     if (state.enabled && gateReasons.length > 0) {
       lines.push(`  门禁: 未满足 → ${gateReasons.join(',')}（审查不会运行）`);
     }

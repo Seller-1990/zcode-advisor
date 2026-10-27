@@ -222,15 +222,25 @@ test('角标链路提示随注册行投递：down/waiting 各一句、attached �
   assert.ok(ctx.includes('角标外挂未运行'), `down 必须提示，实际：${ctx}`);
   assert.ok(!ctx.includes('已发起'), 'REVIVE=0 时绝不发起自愈，也不得假装发起过');
 
-  // waiting：锁新鲜但 cdp=0（ZCode 无调试端口在跑）→ 提示「等待中」
+  // waiting：锁新鲜但 cdp=0（companion 起来了、端口还没就绪）→ 提示「角标不可用」
   writeLock(0);
   ctx = ups('badge-waiting');
-  assert.ok(ctx.includes('角标等待中'), `waiting 必须提示，实际：${ctx}`);
+  assert.ok(ctx.includes('角标不可用'), `waiting 必须提示，实际：${ctx}`);
+  assert.ok(ctx.includes('启动器'), 'waiting 必须给出可操作的一步：用启动器重开');
 
-  // attached：锁新鲜且有 CDP → 注册行不带任何角标提示
+  // 待命标记：裸 ZCode 场景下 companion 已退场（锁里 pid 已死），只剩标记——
+  // 必须判 waiting 而不是 down，否则每个新会话都会白跑一次 kickstart。
+  fs.unlinkSync(lockFile);
+  fs.writeFileSync(path.join(lockDir, 'zcode-advisor-companion.standby'),
+    `reason=bare-zcode\nat=${Date.now()}\n`, 'utf8');
+  ctx = ups('badge-standby');
+  assert.ok(ctx.includes('角标不可用'), `standby 必须提示，实际：${ctx}`);
+  assert.ok(!ctx.includes('角标外挂未运行'), '有新鲜待命标记时不得误报「外挂未运行」');
+
+  // attached：锁新鲜且有 CDP → 注册行不带任何角标提示（待命标记仍在，健康锁优先）
   writeLock(9223);
   ctx = ups('badge-ok');
-  assert.ok(!ctx.includes('角标等待中') && !ctx.includes('角标外挂未运行'),
+  assert.ok(!ctx.includes('角标不可用') && !ctx.includes('角标外挂未运行'),
     `attached 必须沉默，实际：${ctx}`);
 });
 
@@ -510,6 +520,18 @@ test('ctl：status/on/off/model 全链路（--state 精确会话 + --latest 显�
   // --latest 为显式回退标志（单会话时直接可用）
   const latest = runHook(['ctl', 'status', '--latest'], null, env);
   assert.ok(latest.stdout.includes('advisor 状态'));
+});
+
+test('ctl status：halted 会话必须显示停机原因（不能只在 JSON 里）', (t) => {
+  const { stateDir } = setup(t);
+  const env = makeEnv(stateDir);
+  const file = writeStateForAlert(stateDir, 'halt1', {
+    halted: true, haltedReason: 'llm_http_401', haltedAt: new Date().toISOString()
+  });
+  const st = runHook(['ctl', 'status', '--state', file], null, env);
+  assert.ok(st.stdout.includes('停机'), 'status 必须给出停机行');
+  assert.ok(st.stdout.includes('llm_http_401'), '停机行必须带原因');
+  assert.ok(st.stdout.includes('/advisor-on'), '必须给出恢复动作');
 });
 
 test('ctl：多会话并存时拒绝无 --state 的操作（防误伤）', (t) => {

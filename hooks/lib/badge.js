@@ -20,6 +20,15 @@ const LOCK_FILE_NAME = 'zcode-advisor-companion.lock';
 // 与 controller.cjs 的 LOCK_TTL_MS 一致：心跳 20s，三拍不跳即判心跳死亡。
 const LOCK_TTL_MS = 60 * 1000;
 
+// 待命标记（controller.cjs 在「裸 ZCode 在跑、attach-only 本轮不附着」时写）。
+// 为什么需要它：这种场景下 companion 已经**退出**（锁里 pid 是死的），只看锁只能判
+// down；而 down 会触发 kickstart 自愈——再拉起一轮、再发现裸 ZCode、再退出，白烧一次
+// auto-enable（最长 150s）且提示词说错原因。标记把「本轮为什么不附着」跨进程传出来。
+const STANDBY_FILE_NAME = 'zcode-advisor-companion.standby';
+// 待命标记的保鲜期：它只说明「最近一次启动时宿主是裸 ZCode」，超过一天就不再可信
+//（用户可能早已换过启动方式或外挂真的挂了），宁可退回 down 让自愈重新判断。
+const STANDBY_TTL_MS = 24 * 60 * 60 * 1000;
+
 const LAUNCHD_LABEL = 'local.zcode.advisor';
 
 // Windows 的 node 没有 process.getuid；revivePlan/tryRevive 的 platform 是参数
@@ -35,6 +44,10 @@ function resolveLockDir(env) {
 
 function resolveLockFile(env) {
   return path.join(resolveLockDir(env), LOCK_FILE_NAME);
+}
+
+function resolveStandbyFile(env) {
+  return path.join(resolveLockDir(env), STANDBY_FILE_NAME);
 }
 
 // 读 companion 租约。文件缺失/坏内容一律按「不在」处理（宁可多提示也不误报健康）。
@@ -72,13 +85,41 @@ function readCompanionLock(env, now) {
   };
 }
 
+// 读待命标记：文件缺失/坏内容/过期一律按「没有」处理（与锁同一纪律：不猜健康）。
+function readStandby(env, now) {
+  const at = Number.isFinite(now) ? now : Date.now();
+  try {
+    const txt = fs.readFileSync(resolveStandbyFile(env), 'utf8');
+    const reason = ((/(?:^|\n)reason=([^\n]*)/.exec(txt) || [])[1] || '').trim();
+    const written = Number(((/(?:^|\n)at=(\d+)/.exec(txt) || [])[1]) || 0);
+    const fresh = written > 0 && written <= at && at - written <= STANDBY_TTL_MS;
+    return { present: fresh, fresh, reason, at: written, ttlMs: STANDBY_TTL_MS };
+  } catch (_) {
+    return { present: false, fresh: false, reason: '', at: 0, ttlMs: STANDBY_TTL_MS };
+  }
+}
+
 // 链路三态（纯函数，便于单测）：
 //   attached = companion 活着且已附着调试通道（角标应存在）
-//   waiting  = companion 活着但没有 CDP 可附着——典型：ZCode 是直接双击启动的
-//   down     = companion 不在（锁缺失 / 心跳过期 / pid 已死）
-function deriveBadgeState(lock) {
-  if (!lock || !lock.present || !lock.fresh) return 'down';
-  return lock.cdp > 0 ? 'attached' : 'waiting';
+//   waiting  = 没有可附着的 CDP——要么 companion 起来了但还在等端口，要么宿主是直接
+//              双击启动的裸 ZCode（companion 已按 attach-only 语义安静退场，留了待命标记）
+//   down     = companion 不在，且没有待命证据（锁缺失/心跳过期/pid 已死）
+function deriveBadgeState(lock, standby) {
+  if (lock && lock.present && lock.fresh) return lock.cdp > 0 ? 'attached' : 'waiting';
+  if (standby && standby.present && standby.fresh) return 'waiting';
+  return 'down';
+}
+
+// 自愈节流判定（纯函数）：lastReviveIso 是状态文件里存的 ISO 字符串。
+// 这里必须是 Date.parse 而不是 Number()——Number('2026-10-27T…') 是 NaN，
+// NaN 参与比较恒为 false，节流会静默失效（曾经就是这么错的：每个新会话都 kickstart）。
+function shouldRevive(state, lastReviveIso, now, opts) {
+  const o = opts || {};
+  if (state !== 'down' || o.disabled) return false;
+  const at = Number.isFinite(now) ? now : Date.now();
+  const last = Date.parse(lastReviveIso || '') || 0;
+  const gap = Number.isFinite(o.minIntervalMs) ? o.minIntervalMs : 0;
+  return at - last > gap;
 }
 
 // launchd 自愈方案。仅 macOS 且 plist 在位才有意义；返回 null 表示本机无从自愈。
@@ -118,16 +159,18 @@ function tryRevive(opts) {
 // 关键承诺必须写明：审查功能不受影响——用户容易把「角标没了」读成「顾问也挂了」。
 function badgeHintLines(state, platform) {
   if (state === 'waiting') {
-    return ['[advisor] 角标等待中：当前 ZCode 实例没有调试端口（直接双击启动的 ZCode 都没有），'
-      + '角标/设置面板不可用，但每轮审查不受影响。完全退出 ZCode（⌘Q）后，外挂会在约 30 秒内'
-      + '自动以角标模式重新拉起它。'];
+    // 不再承诺「退出后自动拉起」：attach-only 语义下外挂不会代启，只有启动器会。
+    // 提示必须给出用户真正能做的一步，否则等于把「角标没了」翻译成一句空话。
+    return ['[advisor] 角标不可用：当前 ZCode 没有调试端口（直接双击启动的 ZCode 都没有），'
+      + '角标/设置面板不可用，但每轮审查不受影响。需要角标时请完全退出 ZCode（⌘Q）后，'
+      + '双击「ZCode Advisor」启动器重新打开。'];
   }
   if (state === 'down') {
     if (platform === 'darwin') {
-      return ['[advisor] 角标外挂未运行（后台监督进程停了），已尝试自动拉起；'
+      return ['[advisor] 角标外挂未运行（后台监督进程没在跑）。'
         + `若下轮仍提示，请手动运行：launchctl kickstart -k gui/\$(id -u)/${LAUNCHD_LABEL}，或重启 ZCode。审查功能不受影响。`];
     }
-    return ['[advisor] 角标外挂未运行（后台监督进程停了），请重装本插件或用启动器重新打开 ZCode。审查功能不受影响。'];
+    return ['[advisor] 角标外挂未运行（后台监督进程没在跑），请重装本插件或用启动器重新打开 ZCode。审查功能不受影响。'];
   }
   return [];
 }
@@ -142,11 +185,16 @@ function reviveResultLines(result) {
 module.exports = {
   LOCK_FILE_NAME,
   LOCK_TTL_MS,
+  STANDBY_FILE_NAME,
+  STANDBY_TTL_MS,
   LAUNCHD_LABEL,
   resolveLockDir,
   resolveLockFile,
+  resolveStandbyFile,
   readCompanionLock,
+  readStandby,
   deriveBadgeState,
+  shouldRevive,
   revivePlan,
   tryRevive,
   badgeHintLines,

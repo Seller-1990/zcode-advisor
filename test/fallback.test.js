@@ -340,6 +340,14 @@ function applyInChild(result, stateInit) {
   return JSON.parse(out.trim().split('\n').pop());
 }
 
+test('落盘：确定性错误 halt → 置 pendingRegistration（停机原因下一轮必须可见）', () => {
+  const got = applyInChild({ error: 'llm_http_401', halt: true }, {});
+  assert.strictEqual(got.s.halted, true);
+  assert.strictEqual(got.s.haltedReason, 'llm_http_401');
+  assert.strictEqual(got.s.pendingRegistration, true,
+    'halt 发生在会话中途，必须借下一轮注册行把原因说出来，否则就是静默失败');
+});
+
 test('落盘：主模型失败（无降级）→ 累加 failStreak', () => {
   const got = applyInChild({ error: 'llm_http_500' }, {});
   assert.strictEqual(got.s.failStreak.count, 1);
