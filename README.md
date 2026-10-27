@@ -327,7 +327,7 @@ printf '隔离目录（验证后可手动删除）：%s\n' "$mock_home"
 - **注入链残余风险（如实声明）**：本插件向主会话新增两条自动注入通道（sync 的 Stop block、async 的 additionalContext）。**能影响转录内容的一方**（被 Read 的网页/代码注释/工具输出）理论上可经审查模型植入 note 影响主模型；缓解是 note 码点截断（768）、帧校验（多帧取末帧而非最高severity）、advisory 前缀与"仅供参考"框架、内置提示词禁止 note 携带可执行指令——但对蓄意注入无硬性防线。选型提示拆开说：**担心注入链 → 用 async**（无强制续跑）；**担心 blocker 迟到 → 用 sync**（当轮打断），两个维度独立决策。
 - **敏感数据外发（如实声明）**：转录增量（代码、路径、可能的密钥）不做脱敏直接发送到 `baseUrl`；主模型 Read `.env` 后其内容会进入转录并外发。当前无可配置脱敏规则——请自行权衡端点可信度；插件目录（含本配置文件）可被会话内工具改写，"独立审查"对被审查者不设防，`/advisor-status` 的配置警告行可辅助发现端点篡改。
 - **key 落盘**：用户级配置（`~/.zcode/advisor.config.json`）不在任何 git 仓库内、跨升级保留；插件目录的 `advisor.config.json` 已被 gitignore（模板见 example）。共享 env key（`ZAI_API_KEY` 等）发往非官方端点会在状态中警告；`http://` 非本机端点会警告明文传输。
-- **成本可观测**：每次调用的 usage 解析入账（`/advisor-status` 的 Token 累计；数字来自端点自报，恶意端点可伪造）；单次调用输入上限 48K 字符，输出无模型侧预算（OpenAI 兼容通道不发送 `max_tokens`，思考量由模型自定；Anthropic 通道发送 `maxTokens`），单轮（含重试）最多 3 次调用、总耗时 ≤ 预算上界（sync=1×、async=2× `reviewTimeoutMs`）。空转（有调用无产出）在 `Dropped:llm_empty_response`/`unparsed`/`llm_truncated` 可见，响应头部样本留存于 `~/.zcode/advisor-review-samples.jsonl`（0600、上限 100 行）。
+- **成本可观测**：每次调用的 usage 解析入账（`/advisor-status` 的 Token 累计；数字来自端点自报，恶意端点可伪造）；单次调用输入上限 48K 字符，输出无模型侧预算（OpenAI 兼容通道不发送 `max_tokens`，思考量由模型自定；Anthropic 通道发送 `maxTokens`），单轮单模型（含重试）最多 3 次调用；配了降级备用模型时主/备各最多 3 次。总耗时 ≤ 预算上界（sync=1×、async=2× `reviewTimeoutMs`）。空转（有调用无产出）在 `Dropped:llm_empty_response`/`unparsed`/`llm_truncated` 可见，响应头部样本留存于 `~/.zcode/advisor-review-samples.jsonl`（0600、上限 100 行）。
 
 ## 局限（如实声明）
 
