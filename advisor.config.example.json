@@ -5,7 +5,6 @@
   "reviewMode": "async",
   "immuneTurns": 3,
   "maxDeltaMessages": 60,
-  "maxTokens": 4096,
   "fallbackModel": "",
   "temperature": 0.2,
   "proseFallback": true,

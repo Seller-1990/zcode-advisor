@@ -134,7 +134,7 @@ ${missingHint}
  <option value="async"${(cfg.reviewMode || 'async') === 'async' ? ' selected' : ''}>async（默认：零体感延迟，意见随下一条消息送达）</option>
  <option value="sync"${cfg.reviewMode === 'sync' ? ' selected' : ''}>sync（当轮打断：concern/blocker 立即送达，每轮收尾等待审查）</option>
 </select>
-<label>max_tokens（引擎默认 4096；越界会被钳到 64–16384）</label>
+<label>max_tokens（仅 Anthropic 协议生效；OpenAI 兼容通道不发送模型侧预算）</label>
 <input id="maxTokens" type="number" min="64" max="16384" value="${cfg.maxTokens || 4096}">
 <div class="btnrow">
  <button class="act" onclick="save()">保存配置</button>

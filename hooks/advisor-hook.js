@@ -38,6 +38,7 @@ const {
   decideAction, decideActionAsync, prefixFor, applyDeliveryToState, enqueueNote
 } = require('./lib/route');
 const { appendHistory } = require('./lib/history');
+const { appendSample } = require('./lib/samples');
 const health = require('./lib/health');
 
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
@@ -63,6 +64,25 @@ function formatDowntime(ms) {
   const minutes = Math.floor(ms / 60000);
   if (minutes < 60) return `${Math.max(1, minutes)} 分钟`;
   return `${Math.floor(minutes / 60)} 小时`;
+}
+
+// 窗口告警的归因行：从 dropped 计数里挑"审查本身失败"类里计数最高的一项。
+// 非失败类（busy/queue_overflow 等只说明"没跑成"）不参与归因——它们不拉高失败率窗口
+//（winStats 只在真实审查结果上累计），列进来会误导修复方向。
+const TOP_FAIL_EXACT = ['unparsed', 'parse_empty', 'no_transcript', 'ledger_write_failed'];
+function isFailReason(reason) {
+  return String(reason || '').startsWith('llm_') || TOP_FAIL_EXACT.includes(reason);
+}
+function topFailReason(state) {
+  const dropped = (state && state.dropped) || {};
+  let best = '';
+  let bestN = 0;
+  for (const [reason, n] of Object.entries(dropped)) {
+    if (!isFailReason(reason) || !(n > bestN)) continue;
+    best = reason;
+    bestN = n;
+  }
+  return best;
 }
 
 function healthAlertLine(streak, alertCount) {
@@ -291,7 +311,7 @@ function reviewBudgetMs(cfg) {
 
 // 降级（fallback，M4）：只对「换模型能治」的错切换。
 // 端点故障/限流/超时/与模型无关的错**不触发**——换模型只会加剧或无效。
-const FALLBACK_TRIGGER_REASONS = new Set(['llm_empty_response', 'unparsed', 'llm_http_404']);
+const FALLBACK_TRIGGER_REASONS = new Set(['llm_empty_response', 'unparsed', 'llm_truncated', 'llm_http_404']);
 
 // 备用模型的目标解析：只看全局 cfg.fallbackModel。
 // 0.2.17 起**没有**会话级备用模型——唯一的写入方（旧 /advisor-api 的 fallback: 覆盖）已随该命令删除，
@@ -383,17 +403,36 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
   // 哪怕累加结果是 {0,0}——不能因为「总和为 0」就退回取最后一次调用的 usage。
   const totalUsage = () => (usageSeen ? usageTotals : undefined);
 
-  // 单次尝试的收尾器：跑首调 + 最多 2 次空响应重试（全共享传入 deadline，不重新起算），
-  // **并把「解析成帧」纳入结果**——unparsed 是白名单触发原因之一，只有在解析后才知道，
+  // JSON 形状判定：以 { / [ / Markdown 围栏开头 = 模型想给结构化输出。
+  // 这类"想给帧但没给出"的回复（截断的半截 JSON、键名漂移的错误 schema——
+  // 真机采样实测：glm 经中转会返回 {turn_ok,turn_severity,...} 这类另一套 schema）
+  // 都值得一次"只输出 JSON"的纠正重试；纯散文不在此列（proseFallback 负责救回）。
+  const JSON_SHAPED_RE = /^\s*(```|\{|\[)/;
+
+  // 单次尝试的收尾器：跑首调 + 最多 2 次空响应/无帧重试（全共享传入 deadline，不重新起算），
+  // **并把「解析成帧」纳入结果**——unparsed/llm_truncated 是白名单触发原因之一，只有在解析后才知道，
   // 所以判定与降级决策必须在同一次尝试的结果上做，不能先看 res.error 再解析。
   const runAttempt = async (deadline, model, temperature) => {
     let res = await call(Object.assign({}, baseParams, { model, deadline, temperature }));
     addUsage(res);
-    for (let attempt = 0; attempt < 2 && res.error === 'llm_empty_response'; attempt++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const emptyLike = res.error === 'llm_empty_response';
+      // 无帧判定（P0-②）：解析不出帧 = {severity,note} 契约没达成。可重试形态：
+      // ① 截断（finish=length）——半截 JSON；② JSON 形状（含键名漂移的完整 JSON）——
+      // 模型有结构化意图，一次格式纠正重试的救回率可观（真机样本实证的丢弃主因）。
+      const frame = res.error ? null : parseFrame(res.text, cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
+      const retryable = emptyLike
+        || (!res.error && !frame
+          && (res.finishReason === 'length' || JSON_SHAPED_RE.test(String(res.text || ''))));
+      if (!retryable) break;
       if (deadline - Date.now() < 10000) break; // 剩余预算不足一次重试：放弃
-      const carry = res.reasoningText
-        ? `\n\n【你上一步的分析（供参考，不要重复）】\n${res.reasoningText.slice(0, 3000)}\n\n请基于以上分析，只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}。不要输出任何其他文字。`
-        : '\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）';
+      const carry = emptyLike
+        ? (res.reasoningText
+          ? `\n\n【你上一步的分析（供参考，不要重复）】\n${res.reasoningText.slice(0, 3000)}\n\n请基于以上分析，只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}。不要输出任何其他文字。`
+          : '\n\n（请直接输出一个 JSON 对象，不要输出推理过程或其他文本。）')
+        : (res.finishReason === 'length'
+          ? '\n\n（你上一条回复在 JSON 输出中途被截断。请只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}；不要输出推理过程，控制长度。）'
+          : '\n\n（你上一条回复的 JSON 结构不符合要求（缺少 severity/note 字段）。请只输出一个 JSON 对象，格式：{"severity":"none|nit|concern|blocker","note":"一句具体建议"}；不要输出其他键、推理过程或代码围栏。）');
       res = await call(Object.assign({}, baseParams, {
         model, deadline, temperature: 0, userContent: `${userContent}${carry}`
       }));
@@ -401,7 +440,11 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
     }
     if (res.error) return { res, error: res.error, frame: null };
     const frame = parseFrame(res.text, cfg.proseFallback, { maxNoteChars: cfg.maxNoteChars });
-    if (!frame) return { res, error: 'unparsed', frame: null };
+    if (!frame) {
+      // 重试耗尽仍无帧：finish=length 归 llm_truncated（查端点输出上限），其余归 unparsed
+      //（llm_ 前缀自动进 failStreak 白名单；样本留存两侧都生效，见 reviewTurn 错误分支）。
+      return { res, error: res.finishReason === 'length' ? 'llm_truncated' : 'unparsed', frame: null };
+    }
     return { res, error: '', frame };
   };
 
@@ -447,7 +490,20 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
   const meta = { model: usedFallback ? fallbackModel : target.model, ms: Date.now() - t0, requestId: hashId(userContent) };
   const usage = totalUsage();
   if (attempt.error) {
-    logReview(cfg, Object.assign({ kind: attempt.error === 'unparsed' ? 'unparsed' : 'error', error: attempt.error, hint: remainingHint || '' }, meta));
+    logReview(cfg, Object.assign({ kind: attempt.error === 'unparsed' || attempt.error === 'llm_truncated' ? 'unparsed' : 'error', error: attempt.error, hint: remainingHint || '' }, meta));
+    // 样本留存（P1-③）：unparsed/截断只存计数无法归因——留一份原始响应头部，
+    // 下次丢弃潮（2026-10-24~26 那种）打开文件就能看到模型到底返回了什么形态。
+    // 与 DEBUG review.log 互补：样本默认就开（有界 100 行），不必复现故障前先开开关。
+    if (attempt.error === 'unparsed' || attempt.error === 'llm_truncated') {
+      appendSample({
+        error: attempt.error,
+        model: meta.model,
+        finishReason: (attempt.res && attempt.res.finishReason) || '',
+        textHead: (attempt.res && attempt.res.text) || '',
+        deltaChars: userContent.length,
+        ms: meta.ms
+      });
+    }
     return {
       error: attempt.error, usage, hint: remainingHint,
       primaryFailure: primaryFailure || (FALLBACK_TRIGGER_REASONS.has(attempt.error) ? attempt.error : ''),
@@ -465,16 +521,40 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
   };
 }
 
+// 滑动窗口失败率（P1-④）参数。连击制 failStreak 的盲区：成功与失败**交替**时连击被
+// 成功洗零（2026-10-24~26 的 unparsed 潮 69% 失败率却从未触达阈值 3），端点持续劣化
+// 不告警。窗口制按"最近 N 轮里的失败占比"判定，交替模式无处遁形。
+const WIN_SIZE = 10;   // 窗口容量（审查尝试次数）
+const WIN_MIN = 8;     // 至少积累 8 次才开始判（避免 1/1=100% 的噪声误报）
+const WIN_RATE = 0.5;  // 失败率阈值
+
 // 单轮审查结果落盘（sync / async worker 共用）。抽出来的原因：这段是 M4「不得静默掩盖」
 // 的核心不变量所在，两条路径各写一遍随时可能漂移（曾经 async 路径就漏了字段）。
 // 调用方负责 reviews 计数、lastActivity、健康信标与指针推进等分支专属工作；
 // 这里只管「按审查结果更新 streak / 降级计数 / history」这部分字段。
 function applyReviewOutcome(s, result, eff, cfg) {
+  // 滑动窗口（P1-④）：成败都计入。容量 2×WIN 时对半折——近似"最近 WIN 次"的
+  // 衰减窗口（旧结果占比随新结果线性稀释），避免无界增长。
+  const win = s.winStats || (s.winStats = { total: 0, failed: 0 });
+  win.total += 1;
+  if (result.error) win.failed += 1;
+  if (win.total >= WIN_SIZE * 2) {
+    win.total = Math.ceil(win.total / 2);
+    win.failed = Math.ceil(win.failed / 2);
+  }
   if (result.error) {
     bumpDrop(s, result.error);
     // 降级（M4）：主模型失败连击单独维护——即便这次 fallback 也失败，
     // 主模型劣化的证据仍要留下，供降级告警归因。
     if (result.primaryFailure) bumpPrimaryFailStreak(s, result.primaryFailure);
+    // 确定性失败停机（P1-⑤，对齐上游 dsh-advisor 0.6.3 #131）：llm_http_404 对当前
+    // 配置的模型/端点是**确定性**的——每轮重试只是白烧预算 + 静默丢弃（曾经的
+    // unparsed 潮里 404 混在计数器里无人看见）。停机并可见，/advisor-on 重建、
+    // /advisor-model 换模型时清除。备用模型救回的不停（usedFallback 说明有活路）。
+    if (result.error === 'llm_http_404' && !result.usedFallback && !s.halted) {
+      s.halted = { reason: 'llm_http_404', model: eff.model, at: new Date().toISOString() };
+      appendHistory({ event: 'halted', sessionId: s.sessionId, reason: 'llm_http_404', model: eff.model });
+    }
     return;
   }
   // 降级成功：系统可用（清 failStreak），但主模型劣化未消（primaryFailStreak 不动）。
@@ -617,6 +697,34 @@ function onUserPromptSubmit(ctx) {
       // 主模型恢复（连击被清空或低于阈值）：重置降级告警阶梯，下次劣化从第 1 次提醒开始
       if (s.degradeNotifiedAt) { s.degradeAlertCount = 0; s.degradeNotifiedAt = ''; }
     }
+    // 停机告知（P1-⑤）：一次性。状态持久（status 可查、Stop 不再派发），注入只为
+    // 把"审查为什么突然安静了"送到用户眼前——修复动作（/advisor-on）在文案里给出。
+    if (s.enabled === true && s.halted && !s.haltNotifiedAt) {
+      parts.unshift(`[advisor] 审查已停机：${s.halted.reason}（模型 ${s.halted.model}，${s.halted.at}）。这是确定性失败，继续重试只会白烧预算；修复端点/模型后运行 /advisor-on 恢复，或 /advisor-model set 换模型。`);
+      s.haltNotifiedAt = new Date().toISOString();
+    }
+    // 滑动窗口失败率告警（P1-④）：与连击告警互补——连击看"连续坏"，窗口看"坏得密"。
+    // 成功/失败交替时连击被洗零，窗口比率照样暴露（69% 失败率潮正是漏报形态）。
+    // 已在 outage 告警中时不重复喊（同一劣化不压两遍）；恢复（比率回落）时重置阶梯。
+    const win = s.winStats || { total: 0, failed: 0 };
+    const rateActive = s.enabled === true && !outageActive
+      && win.total >= WIN_MIN && (win.failed / win.total) >= WIN_RATE;
+    if (rateActive) {
+      const prevRate = s.rateAlertCount || 0;
+      const lastRate = Date.parse(s.rateNotifiedAt || '') || 0;
+      if (!lastRate || prevRate <= 0 || Date.now() - lastRate >= alertRepeatGapMs(prevRate)) {
+        const n = prevRate + 1;
+        const top = topFailReason(s);
+        const pct = Math.round((win.failed / win.total) * 100);
+        parts.unshift(`[advisor] 评审质量告警：近 ${win.total} 轮审查 ${win.failed} 轮失败（${pct}%${top ? `，主要 ${top}` : ''}）。审查在跑但产出受损；运行 /advisor-status 查看分类计数。`);
+        s.rateAlertCount = n;
+        s.rateNotifiedAt = new Date().toISOString();
+      }
+    } else if (!rateActive && s.rateAlertCount) {
+      // 比率回落：重置阶梯，下次再劣化从第 1 次提醒开始（与 degrade 阶梯同一恢复语义）
+      s.rateAlertCount = 0;
+      s.rateNotifiedAt = '';
+    }
     if (parts.length > 0) deliver = parts.join('\n\n');
   });
 
@@ -677,6 +785,16 @@ function onStopAsync(ctx) {
       if (s.enabled && gateReasons.length > 0) s.disabledReason = gateReasons.join(',');
     });
     // 门禁失败不推进指针：修复配置后可回看积压（受增量窗口与 backfill 上限截断）。
+    return;
+  }
+
+  // 确定性失败停机（P1-⑤）：halted 非空时不再派发 worker——模型对端点已确定性不可用
+  // （llm_http_404），每轮派发只是白烧一次 spawn + 复现同一个错误。恢复路径：/advisor-on
+  // 或 /advisor-model set（两处都清 halted）。UPS 侧有一次性告知行，status 持久可查。
+  if (current.halted) {
+    mutateStateExclusive(file, (s) => {
+      s.lastActivity = new Date().toISOString();
+    });
     return;
   }
 
@@ -796,6 +914,9 @@ async function onStopSync(ctx) {
     // 门禁失败不推进指针：修复配置后可回看积压（受增量窗口与 backfill 上限截断）。
     return;
   }
+
+  // 确定性失败停机（P1-⑤）：与 async 同语义——halted 期间 sync 不发起内联审查。
+  if (current.halted) return;
 
   const delta = readDelta(current.transcriptPath, current.byteOffset, {
     expectedHeadHash: current.lastHeadHash,
@@ -982,6 +1103,9 @@ async function handleReviewWorker(args) {
     const stateDir = path.dirname(file);
 
     if (!state.enabled) return;
+    // 停机兜底（P1-⑤）：Stop 侧已在派发前拦截，这里防 spawn 与审查之间的并发窗口
+    //（/advisor-off 或 404 停机发生在锁认领之后）。
+    if (state.halted) return;
     // 门禁按会话级生效值评估：全局 key 缺失但本会话已覆盖 key 时照常审查。
     const gateReasons = gateWithSession(cfg, apiKeyInfo, state).reasons;
     if (gateReasons.length > 0) {
@@ -1236,6 +1360,16 @@ async function handleCtl(args) {
     const drops = state.dropped || {};
     const dropLine = Object.entries(drops).filter(([, n]) => n > 0).map(([k, n]) => `${k}=${n}`).join(' ');
     if (dropLine) lines.push(`  Dropped: ${dropLine}`);
+    // 确定性失败停机（P1-⑤）：status 是停机状态的持久出口——UPS 告知行只出现一次。
+    if (state.halted) {
+      lines.push(`  停机: ${state.halted.reason}（模型 ${state.halted.model}，自 ${state.halted.at}）—— Stop 不再派发审查；/advisor-on 恢复或 /advisor-model set 换模型`);
+    }
+    // 滑动窗口失败率（P1-④）：连击 failStreak 之外的"坏得密"视角。
+    const win = state.winStats || { total: 0, failed: 0 };
+    if (win.total > 0) {
+      const pct = Math.round((win.failed / win.total) * 100);
+      lines.push(`  近期失败率: ${win.failed}/${win.total}（${pct}%，窗口 ≈${WIN_SIZE} 轮）${win.total >= WIN_MIN && pct >= WIN_RATE * 100 ? ' —— 高于告警阈值' : ''}`);
+    }
 
     // KD-I3 可见性（对齐上游 v0.5.4）：展示"最后一次"发生时间，并给出可操作提示。
     // 目的：让"审查在跑但从不产出"可被发现——只看计数无法判断是陈旧积压还是正在发生。
@@ -1246,19 +1380,25 @@ async function handleCtl(args) {
       .join(' ');
     if (stampLine) lines.push(`  最近丢弃: ${stampLine}`);
 
-    // 针对最常见两类给出修复提示（与上游 KD-I3 的 warn 口径一致）
+    // 针对最常见几类给出修复提示（与上游 KD-I3 的 warn 口径一致）
     const hints = [];
     if ((drops.llm_empty_response || 0) > 0) {
-      hints.push('llm_empty_response：模型把输出预算耗在思考上 → 提高 maxTokens（思考型模型建议 4096）');
+      hints.push('llm_empty_response：模型返回完成但无正文 → 检查端点/网关是否套了默认输出上限；Anthropic 协议可调大 maxTokens');
+    }
+    if ((drops.llm_truncated || 0) > 0) {
+      hints.push('llm_truncated：回复在 JSON 输出中途被截断（finish=length）→ 检查端点/网关的输出上限；样本见 advisor-review-samples.jsonl');
     }
     if ((drops.unparsed || 0) > 0) {
-      hints.push('unparsed：回复无合法 JSON 帧 → 确认 proseFallback: true，或换格式更稳定的模型');
+      hints.push('unparsed：回复无合法 JSON 帧 → 确认 proseFallback: true，或换格式更稳定的模型；样本见 advisor-review-samples.jsonl');
     }
     if ((drops.parse_empty || 0) > 0) {
       hints.push('parse_empty：转录有完整行但全部无法解析 → 转录格式与预期不符，请带样例反馈');
     }
     if ((drops.llm_timeout || 0) > 0) {
       hints.push('llm_timeout：审查超时 → 提高 reviewTimeoutMs（配置面板或 /advisor-setup；sync 模式上限 300s）');
+    }
+    if ((drops.llm_http_404 || 0) > 0) {
+      hints.push('llm_http_404：模型/端点不存在 → 连续 404 会停机（状态行「停机」），换模型后 /advisor-on 恢复');
     }
     for (const h of hints) lines.push(`  提示: ${h}`);
 
@@ -1290,17 +1430,24 @@ async function handleCtl(args) {
     // /advisor-model set 改了会话覆盖时会用过期结果覆盖 disabledReason。
     let reasons = [];
     let enabledModel = '';
+    const hadHalted = Boolean((loadState(file) || {}).halted);
     if (!mutateCtlState((s) => {
       s.enabled = true;
+      // 停机清除（P1-⑤）：/advisor-on 是唯一的人工恢复入口——用户按下它时已读过
+      // 告知行/状态行，重置 halt 状态让 Stop 重新派发；审查本身会再次验证端点。
+      s.halted = null;
+      s.haltNotifiedAt = '';
       const r = gateWithSession(cfg, resolveApiKey(cfg, process.env), s);
       reasons = r.reasons;
       enabledModel = r.eff.model;
       s.disabledReason = reasons.length > 0 ? reasons.join(',') : '';
     })) return;
     if (reasons.length > 0) {
-      process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 ZCode 里的第三方服务商配置，或用 /advisor-model set 为本会话单独指定。\n`);
+      // 停机清除必须**无条件**报告：门禁未满足时用户最需要知道"停机也一并清了、
+      // 修好配置审查即恢复"，而不是从缺失的启用消息里猜。
+      process.stdout.write(`advisor: 已置为启用，但配置门禁未满足（${reasons.join(',')}），审查不会运行。请检查 ZCode 里的第三方服务商配置，或用 /advisor-model set 为本会话单独指定。${hadHalted ? '（此前停机状态已清除。）' : ''}\n`);
     } else {
-      process.stdout.write(`advisor: 本会话已启用（模式 ${cfg.reviewMode}，模型 ${enabledModel}）。\n`);
+      process.stdout.write(`advisor: 本会话已启用（模式 ${cfg.reviewMode}，模型 ${enabledModel}）${hadHalted ? '；此前停机状态已清除。' : ''}。\n`);
     }
     return;
   }
@@ -1337,6 +1484,10 @@ async function handleCtl(args) {
       if (!mutateCtlState((s) => {
         if (model) s.sessionModel = model;
         if (provider) s.sessionProvider = provider;
+        // 换审查目标 = 停机原因（旧模型对端点 404）多半不再成立：一并清除停机。
+        // 若新目标同样 404，worker 会重新停机并再次告知——代价可控，不赌用户的判断。
+        s.halted = null;
+        s.haltNotifiedAt = '';
       })) return;
       const parts = [];
       if (provider) parts.push(`服务商=${provider}`);
@@ -1353,6 +1504,8 @@ async function handleCtl(args) {
       if (!mutateCtlState((s) => {
         s.sessionProvider = provider;
         s.sessionModel = ''; // 换服务商后旧模型多半不属于它：一并清掉，回落新服务商清单
+        s.halted = null;     // 换目标清停机，理由同 set 分支
+        s.haltNotifiedAt = '';
       })) return;
       process.stdout.write(`advisor: 本会话服务商已固定为 ${provider}（模型已回落该服务商默认；用 model set <模型> 再指定）。恢复全局用 model reset。\n`);
       return;
@@ -1361,6 +1514,8 @@ async function handleCtl(args) {
       if (!mutateCtlState((s) => {
         s.sessionModel = '';
         s.sessionProvider = '';
+        s.halted = null;   // 回全局默认同样是换目标：清停机
+        s.haltNotifiedAt = '';
       })) return;
       const eff = resolveTarget(cfg, null, process.env);
       process.stdout.write(`advisor: 已清除本会话覆盖，回到全局默认（${eff.providerName || '（未解析出服务商）'} / ${eff.model || '（未定模型）'}）。\n`);
@@ -1392,7 +1547,9 @@ async function ctlDoctor(cfg, args, state) {
   lines.push(`  模型: ${eff.model || '（未定）'}${eff.modelSource === 'session-override' ? '（本会话覆盖）' : ''}`);
   lines.push(`  端点: ${eff.baseUrl || '（未解析出）'}`);
   lines.push(`  协议: ${eff.protocol || '（未解析出）'}`);
-  lines.push(`  模式: ${cfg.reviewMode} | 预算: maxTokens=${cfg.maxTokens}, 审查超时=${cfg.reviewTimeoutMs}ms`);
+  // 模型侧预算语义（2026-10-27）：OpenAI 通道不发送 max_tokens（reasoning 与正文共享
+  // 上限会截断思考型模型的正文），配置里的 maxTokens 仅 Anthropic 协议使用。
+  lines.push(`  模式: ${cfg.reviewMode} | 审查超时=${cfg.reviewTimeoutMs}ms | 模型侧预算: 不发送（OpenAI；Anthropic 用 maxTokens=${cfg.maxTokens}）| 输出帽: ${cfg.maxNoteChars} 字符`);
   const gateReasons = gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey, source: eff.keySource });
   lines.push(`  门禁: ${gateReasons.length > 0 ? '未满足 → ' + gateReasons.join(',') : '满足'} | key 来源: ${eff.keySource || '(无)'}${eff.apiKey ? `（${maskKey(eff.apiKey)}）` : ''}`);
   for (const p of cfg.problems || []) lines.push(`  配置问题: ${p}`);

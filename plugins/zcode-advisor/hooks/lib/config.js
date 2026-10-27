@@ -34,9 +34,11 @@ const DEFAULTS = {
   reviewMode: 'async',
   immuneTurns: 3,
   maxDeltaMessages: 60,
-  // 768 对思考型模型不够（dsh-advisor issue #102 的实测教训）。注意：2048/240s 这组默认值
-  // 没有在本插件的目标端点上独立验证过；有实证支撑的下限是 4096（dsh 端 guard 通道实测零丢弃）。
-  // 思考型模型建议 4096；提高预算时同步关注 reviewTimeoutMs。
+  // maxTokens 语义（2026-10-27，对齐 dsh-advisor 0.5.7 裁决）：**仅 Anthropic 协议使用**
+  // （/v1/messages 硬性要求 max_tokens，此值即其预算，缺省 4096）。OpenAI 兼容通道
+  // **不发送**模型侧预算——max_tokens 把 reasoning 与正文一并计费，思考型模型的正文
+  // 会被截成半截 JSON（2026-10-24~26 unparsed 丢弃潮实证）；输出由 maxNoteChars 抽取帽
+  // 约束，延迟由 reviewTimeoutMs 约束。存量配置里的该键容忍但被 OpenAI 通道忽略。
   maxTokens: 4096,
   temperature: 0.2,
   // 散文救回默认开启（对齐 dsh 端本地补丁 v2.2 的实际生效状态；上游 dsh-advisor 默认 false）。

@@ -53,6 +53,17 @@ function freshState(sessionId, transcriptPath, startEnabled) {
     // 降级告警走独立阶梯（不与停摆告警共计数，否则两类故障互相压制对方的提醒间隔）。
     degradeNotifiedAt: '',
     degradeAlertCount: 0,
+    // —— 滑动窗口失败率（P1-④）——
+    // 连击制 failStreak 的盲区补丁：成功/失败交替时连击被洗零、告警永不触发。
+    // total/failed 覆盖最近 ~WIN_SIZE 轮（2×WIN 折半衰减，见 applyReviewOutcome）。
+    winStats: { total: 0, failed: 0 },
+    rateAlertCount: 0,
+    rateNotifiedAt: '',
+    // —— 确定性失败停机（P1-⑤）——
+    // 非空 = 当前模型对端点确定性不可用（如 llm_http_404），审查暂停派发；
+    // /advisor-on 或 /advisor-model set 清除。haltNotifiedAt：UPS 一次性告知后置位。
+    halted: null,
+    haltNotifiedAt: '',
     tokensIn: 0,
     tokensOut: 0,
     // 会话级审查目标覆盖（角标面板 / /advisor-model 写入）。两者独立可空：

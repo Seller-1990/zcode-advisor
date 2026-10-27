@@ -252,6 +252,10 @@ function normalizeMessagesEndpoint(baseUrl) {
 // 否则端点返回 400（missing anthropic-version）。
 const ANTHROPIC_VERSION = '2023-06-01';
 
+// Anthropic /v1/messages 硬性要求 max_tokens（缺省即 400）。OpenAI 通道已不发模型侧
+// 预算（见 callReviewer 内注释），只有 Anthropic 通道用到该值；配置缺省时的兜底。
+const ANTHROPIC_DEFAULT_MAX_TOKENS = 4096;
+
 // Anthropic /v1/messages 响应解析：正文在 content[] 的 text 块里，
 // 与 OpenAI 的 choices[0].message.content 完全不同（不解析会 100% 空响应）。
 //
@@ -274,7 +278,9 @@ function extractAnthropicResult(data) {
             completionTokens: Number(data.usage.completion_tokens) || 0
           }
         : null;
-      return { text: alt, usage };
+      // 信封里若带 finish_reason 也透传（中转网关形状各异，取不到就留空）。
+      const fin = String((data.choices && data.choices[0] && data.choices[0].finish_reason) || '');
+      return { text: alt, usage, finishReason: normalizeFinishReason(fin) };
     }
   }
   let text = '';
@@ -311,7 +317,17 @@ function extractAnthropicResult(data) {
         completionTokens: Number(data.usage.output_tokens) || 0
       }
     : null;
-  return { text, usage };
+  // stop_reason 归一到 OpenAI 的 finish_reason 词汇：'max_tokens' ≙ 'length'（截断）。
+  // 上层据此把「正文非空但解析不出帧 + 截断」送进重试通道。
+  return { text, usage, finishReason: normalizeFinishReason(String((data && data.stop_reason) || '')) };
+}
+
+// finish_reason 词汇归一：两种协议对「输出预算截断」的叫法不同
+// （OpenAI 'length' / Anthropic 'max_tokens'），归一成 'length'；
+// 其余原样透传（40 字符帽：上游完全控制该字段，防日志无界注入）。
+function normalizeFinishReason(raw) {
+  const r = String(raw || '').trim().slice(0, 40);
+  return r === 'max_tokens' ? 'length' : r;
 }
 
 // 审查通道的唯一网络出口，支持两种协议：
@@ -388,12 +404,18 @@ async function callReviewer(params) {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${apiKey}`
           };
+      // 模型侧 token 预算的取舍（2026-10-27，对齐上游 dsh-advisor 0.5.7 的用户裁决）：
+      // OpenAI 兼容 API 的 max_tokens 把 reasoning 与正文**一并**计入——思考型模型
+      // （glm-5.3-flash 实证）会把预算耗在推理上，正文被截成半截 JSON → unparsed 静默丢弃。
+      // 因此 OpenAI 通道**不发送** max_tokens（端点/模型默认生效）；输出由抽取侧
+      // maxNoteChars（768 字符）封顶，延迟由 deadline 约束。存量配置里的 maxTokens
+      // 键容忍但忽略（仅 Anthropic 协议继续发送——/v1/messages 硬性要求该字段）。
       const body = anthropic
         ? {
             model,
             system: systemPrompt,
             messages: [{ role: 'user', content: userContent }],
-            max_tokens: maxTokens,
+            max_tokens: maxTokens || ANTHROPIC_DEFAULT_MAX_TOKENS,
             temperature,
             stream: false
           }
@@ -403,7 +425,6 @@ async function callReviewer(params) {
               { role: 'system', content: systemPrompt },
               { role: 'user', content: userContent }
             ],
-            max_tokens: maxTokens,
             temperature,
             stream: false
           };
@@ -494,8 +515,8 @@ async function callReviewer(params) {
       if (fin === 'length' && reasoning > 0) {
         return {
           error: 'llm_empty_response',
-          hint: `思考型模型把 max_tokens 全部用于推理（reasoning=${reasoning}，finish=length）——` +
-                `请调大 maxTokens（建议 ≥4096）`
+          hint: `思考把输出耗尽（finish=length，reasoning_tokens=${reasoning}）——本通道已不发送 max_tokens，` +
+                `请检查端点/网关是否套了默认输出上限，或为评审换用非思考模型`
         };
       }
       return { error: 'llm_empty_response', hint: fin ? `finish_reason=${fin}` : '' };
@@ -507,7 +528,9 @@ async function callReviewer(params) {
           completionTokens: Number(data.usage.completion_tokens) || 0
         }
       : null;
-    return { text, usage };
+    // finish_reason 透传（截断判定由上层 reviewTurn 做：正文非空但解析不出帧 + length）。
+    const fin = String((data.choices && data.choices[0] && data.choices[0].finish_reason) || '');
+    return { text, usage, finishReason: normalizeFinishReason(fin) };
   } catch (err) {
     return { error: 'llm_error', detail: String(err).slice(0, 200) };
   }
