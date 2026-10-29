@@ -193,7 +193,9 @@ function writePlist(content, dir) {
     if (fs.readFileSync(p, 'utf8') === content) return { path: p, changed: false };
   } catch (_) { /* 不存在：走写入 */ }
   const tmp = `${p}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, content, 'utf8');
+  // 显式 0644 + chmod：umask 宽松时可能落成组/他人可写，launchd 会拒绝加载这种 plist。
+  fs.writeFileSync(tmp, content, { encoding: 'utf8', mode: 0o644 });
+  try { fs.chmodSync(tmp, 0o644); } catch (_) {}
   fs.renameSync(tmp, p);
   return { path: p, changed: true };
 }

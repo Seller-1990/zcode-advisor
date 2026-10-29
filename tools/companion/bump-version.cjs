@@ -30,7 +30,7 @@ const path = require('path');
 const ROOT = process.env.ZCODE_ADVISOR_BUMP_ROOT
   ? path.resolve(process.env.ZCODE_ADVISOR_BUMP_ROOT)
   : path.resolve(__dirname, '..', '..');
-const CANON = path.join(ROOT, '.zcode-plugin', 'plugin.json');   // 构建期 VERSION 的唯一来源
+// FILES[0]（.zcode-plugin/plugin.json）是构建期 VERSION 的唯一来源。
 const FILES = [
   '.zcode-plugin/plugin.json',
   'package.json',

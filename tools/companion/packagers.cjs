@@ -17,9 +17,12 @@ const T = require('./install-templates.cjs');
 
 // ---------------- Windows：NSIS ----------------
 
-// 版本号补成 4 段数字，满足 VIProductVersion 的 x.x.x.x 要求
+// 版本号补成 4 段数字，满足 VIProductVersion 的 x.x.x.x 要求。
+// 只取开头的纯数字段（'0.2.24-rc.1' → 0.2.24.0，预发布/构建后缀丢弃）；
+// 每段上限 65535（VIProductVersion 每段是 16 位），超出则钳制，避免 makensis 报错。
 function version4(v) {
-  const parts = String(v).split('.').map((p) => parseInt(p, 10)).filter((n) => Number.isFinite(n));
+  const m = /^\s*v?(\d+(?:\.\d+){0,3})/.exec(String(v));
+  const parts = m ? m[1].split('.').map((p) => Math.min(parseInt(p, 10), 0xffff)) : [];
   while (parts.length < 4) parts.push(0);
   return parts.slice(0, 4).join('.');
 }
@@ -172,9 +175,12 @@ function buildNsisInstaller(opts) {
     return { ok: false, reason: 'makensis 不可用（Windows 建议 choco install nsis；CI 用 windows-2022 预装版）' };
   }
 
+  // 先删旧产物：否则 makensis 失败/未写出时，下面的 existsSync 会把上次构建的 exe 当成本次成功
+  if (fs.existsSync(outFile)) fs.unlinkSync(outFile);
+
   try {
-    // 以 .nsi 所在目录为工作目录运行（与脚本内相对路径的定义一致）
-    execFileSync('makensis', ['-V2', nsiPath], { stdio: 'pipe', cwd: path.dirname(nsiPath) });
+    // 以 .nsi 所在目录为工作目录运行（与脚本内相对路径的定义一致）；超时防止挂死的 makensis 卡住构建
+    execFileSync('makensis', ['-V2', nsiPath], { stdio: 'pipe', cwd: path.dirname(nsiPath), timeout: 10 * 60 * 1000 });
   } catch (err) {
     // 已知现象一：部分平台/版本的 makensis 二进制自身崩溃（如 macOS Homebrew 3.12 的
     // std::bad_alloc → SIGABRT）。此时 stderr 只有 libc++abi 提示，需要转成可读原因。
@@ -343,7 +349,7 @@ function buildDmg(opts) {
       fs.writeFileSync(path.join(stageDir, '安装说明.txt'), T.MAC_DMG_README(version), { encoding: 'utf8', mode: 0o644 });
     } catch (err) {
       // 放不进去不阻断 DMG 制作：拖拽仍可用（只是用户需手动处理 Gatekeeper）
-      if (typeof warn === 'function') warn(`安装引导文件写入失败：${String(err && err.message).slice(0, 120)}`);
+      console.warn(`安装引导文件写入失败：${String(err && err.message).slice(0, 120)}`);
     }
   }
 

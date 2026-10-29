@@ -218,10 +218,11 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  async function api(path, body) {
+  async function api(path, body, signal) {
     const opt = body !== undefined
       ? { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Advisor-Token': TOKEN }, body: JSON.stringify(body) }
       : { headers: { 'X-Advisor-Token': TOKEN } };
+    if (signal) opt.signal = signal;
     const r = await fetch(API + path, opt);
     return r.json();
   }
@@ -360,6 +361,10 @@
     const text = inp ? String(inp.value || '').trim() : '';
     if (action === 'note' && !text) { msg('「补充说明」需要先填写内容', false); return; }
     const label = USER_ACTION_LABELS[action] || action;
+    // 在途期间禁用本条的三个按钮：连点会把同一动作重复入队（占满 pendingNotes 上限）
+    const btns = ['ack', 'note', 'dismiss'].map((a) => document.getElementById(`zca-hact-${a}-${idx}`)).filter(Boolean);
+    if (btns.some((x) => x.disabled)) return;
+    btns.forEach((x) => { x.disabled = true; });
     try {
       const r = await api('/api/note', {
         action, severity: String(it.severity || ''), note: String(it.note || ''), text
@@ -372,6 +377,8 @@
       }
     } catch (e) {
       msg('提交失败：' + (e && e.message ? e.message : e), false);
+    } finally {
+      btns.forEach((x) => { x.disabled = false; });
     }
   }
 
@@ -422,9 +429,16 @@
     paintLegend(s);
   }
 
+  // 在途守卫：controller 卡住时 5s 定时器会叠加出一串挂起的请求
+  let healthInFlight = false;
   async function pollHealth() {
+    // 页面不可见时跳过（后台窗口无人看灯）；切回可见后下一个周期即恢复
+    if (healthInFlight || (typeof document.hidden === 'boolean' && document.hidden)) return;
+    healthInFlight = true;
     try {
-      const r = await api('/api/health');
+      const signal = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+        ? AbortSignal.timeout(4000) : undefined;
+      const r = await api('/api/health', undefined, signal);
       if (!r) { paintHealth('unknown', ''); return; }
       // 明确区分失败类型，别把「版本过旧/令牌失效」吞成安静的灰灯（用户会去查不存在的故障）
       if (!r.ok) {
@@ -435,9 +449,9 @@
       const b = r.beacon || null;
       let detail = '';
       if (b && b.lastSuccessAt) {
-        detail = '上次成功 ' + String(b.lastSuccessAt).replace('T', ' ').slice(5, 16);
+        detail = '上次成功 ' + fmtTs(b.lastSuccessAt);
       } else if (b && b.lastAttemptAt) {
-        detail = '上次尝试 ' + String(b.lastAttemptAt).replace('T', ' ').slice(5, 16) + '（未成功）';
+        detail = '上次尝试 ' + fmtTs(b.lastAttemptAt) + '（未成功）';
       }
       if (b && b.reason) detail += '｜' + String(b.reason).slice(0, 40);
       // 会话归属：controller 返回的是「最近活动的会话」，不是「当前会话」——
@@ -450,8 +464,10 @@
       }
       paintHealth(r.state, detail);
     } catch (_) {
-      // 外挂未运行 / 网络错误：不能装作正常，显示未知
+      // 外挂未运行 / 网络错误 / 超时：不能装作正常，显示未知
       paintHealth('unknown', '');
+    } finally {
+      healthInFlight = false;
     }
   }
 
@@ -869,8 +885,20 @@
     // 跨代清理：旧一代 observer 若不 disconnect，令牌轮换后会叠加，其回调仍闭包引用旧
     // TOKEN/healthState，可能把新一代刚拉到的正确态踹回旧值。挂到 window 供清理块断开。
     if (window.__zcaObserver) { try { window.__zcaObserver.disconnect(); } catch (_) {} }
+    // 宿主页面 DOM 变动极频繁：同一帧内的多次回调合并为一次检查（rAF 节流），
+    // 且角标仍在文档里、已挂在锚点上（非悬浮兜底）时直接返回，不做 querySelectorAll + 布局查询。
+    let scheduled = false;
+    const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (f) => setTimeout(f, 16);
     const observer = new MutationObserver(() => {
+      if (scheduled) return;
+      scheduled = true;
+      raf(check);
+    });
+    function check() {
+      scheduled = false;
+      if (!isCurrent()) return;
       const b = document.getElementById('zca-badge');
+      if (b && b.isConnected === true && !b.classList.contains('zca-floating')) return;
       if (!b) {
         // 角标被整体移除（容器重建）：重新创建
         buildBadge();
@@ -881,7 +909,7 @@
       // 角标还在但已脱离锚点（如父容器被替换）：重挂
       const anchor = findAnchor();
       if (anchor && b.parentNode !== anchor) mountBadge(b);
-    });
+    }
     observer.observe(document.body, { childList: true, subtree: true });
     window.__zcaObserver = observer;
   }

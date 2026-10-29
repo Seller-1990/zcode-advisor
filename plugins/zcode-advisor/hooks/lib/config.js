@@ -342,14 +342,21 @@ function applyZcodeTarget(cfg, problems, sources, notices, env) {
 }
 
 // 占位符样式的 key（REPLACE_YOUR_KEY / your-api-key / test-key 等）视为未配置。
-// 注意：以 test 开头的真实 key 会被误判——这是有意的安全默认，README 已说明。
+// 整值匹配而非前缀：`test-abc123realkey`、`your-co-gw-77aa`、`none-9f8e` 这类真实 key 不得被误判。
+const PLACEHOLDER_KEY_RE = new RegExp('^(?:'
+  + 'replace(?:[_-]?(?:me|your|with|this|key|api|token|here))*'   // REPLACE_ME / REPLACE_YOUR_KEY
+  + '|your[_-]?(?:own[_-]?)?(?:api[_-]?)?(?:key|token|secret)(?:[_-]?here)?' // your-api-key / your_key_here
+  + '|(?:sk-)?x{3,}'                                                // xxx / sk-xxxx
+  + '|test(?:[_-]?(?:api))?(?:[_-]?(?:key|token))?'                 // test / test-key / test_api_key
+  + '|placeholder|changeme|change[_-]me|none|null|empty|undefined|todo|dummy|fake'
+  + ')$', 'i');
+
 function isPlaceholderKey(value) {
   if (typeof value !== 'string') return true;
   const v = value.trim();
   if (!v) return true;
   if (/^<.*>$/.test(v)) return true;
-  if (/^(replace|your|xxx+|test|placeholder|changeme|sk-xxx+|none|null|empty)/i.test(v)) return true;
-  if (/your[_-]?api/i.test(v)) return true;
+  if (PLACEHOLDER_KEY_RE.test(v)) return true;
   if (/[\u4e00-\u9fff]/.test(v)) return true; // 含中文 = 未替换的模板文案
   return false;
 }
@@ -396,7 +403,7 @@ function applyLayer(cfg, raw, problems) {
     if (BOOL_KEYS.includes(k) && typeof v !== 'boolean') {
       const b = toBool(v, null);
       if (b === null) {
-        if (problems) problems.push(`config_normalized: ${k}=${JSON.stringify(v)} 不是布尔值，已忽略（保持 ${cfg[k]}）`);
+        problems.push(`config_normalized: ${k}=${JSON.stringify(v)} 不是布尔值，已忽略（保持 ${cfg[k]}）`);
         continue;
       }
       cfg[k] = b;
@@ -562,14 +569,21 @@ function gate(cfg, apiKeyInfo) {
   return reasons;
 }
 
+// 本机端点判定：URL 解析后 hostname 精确比较（前缀匹配会放过 127.evil.com / localhost.attacker.com）。
+// WHATWG URL 已把 IPv4 规范化（如 0x7f.1 → 127.0.0.1），IPv6 hostname 带方括号。
+function isLoopbackUrl(url) {
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return false; }
+  if (host === 'localhost' || host === '[::1]') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
 // 非阻断性配置警告（发往任意端点的风险提示，由 status/注册行展示）。
 function configWarnings(cfg, apiKeyInfo) {
   const warnings = [];
   const url = String(cfg.baseUrl || '');
-  if (url.startsWith('http://')) {
-    const m = /^http:\/\/([^/:]+)/.exec(url);
-    const host = m ? m[1] : '';
-    if (!/^(localhost|127\.|::1|\[::1\])/i.test(host)) {
+  if (/^http:\/\//i.test(url)) {
+    if (!isLoopbackUrl(url)) {
       warnings.push('insecure_http_endpoint: 转录与 key 将明文发送到非本机 HTTP 端点');
     }
   }

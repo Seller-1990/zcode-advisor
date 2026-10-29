@@ -107,7 +107,10 @@ details summary:hover{color:#e6e8ec}
 </div>
 <script>
 (function(){
-  const TOKEN = decodeURIComponent((location.hash || '').replace(/^#/, ''));
+  // 畸形 hash（如单独的 %）会让 decodeURIComponent 抛 URIError，中止整个 IIFE：兜底用原串
+  const RAW_HASH = (location.hash || '').replace(/^#/, '');
+  let TOKEN = RAW_HASH;
+  try { TOKEN = decodeURIComponent(RAW_HASH); } catch (_) {}
   const api = (path, body) => {
     const opt = body !== undefined
       ? { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Advisor-Token': TOKEN }, body: JSON.stringify(body) }
@@ -116,6 +119,13 @@ details summary:hover{color:#e6e8ec}
   };
   const $ = (id) => document.getElementById(id);
   const msg = (text, ok) => { const m = $('msg'); m.textContent = text; m.style.display = 'block'; m.className = 'msg ' + (ok ? 'ok' : 'bad'); };
+  // 本地时区 MM-DD HH:MM（与角标面板 fmtTs 一致；历史存的是 UTC ISO）
+  const fmtTs = (iso) => {
+    const d = new Date(String(iso || ''));
+    if (isNaN(d.getTime())) return String(iso || '').replace('T', ' ').slice(5, 16);
+    const p2 = (n) => String(n).padStart(2, '0');
+    return p2(d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+  };
   const esc = (v) => String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   let curCfg = null, providers = null;
   let modelEpoch = 0;
@@ -244,11 +254,16 @@ details summary:hover{color:#e6e8ec}
   }
 
   async function ping() {
+    // 在途期间禁用：Ping 最长 20s，连点会并发打出多个真实请求
+    const b = $('ping');
+    if (b && b.disabled) return;
+    if (b) b.disabled = true;
     try {
       msg('Ping 中…', true);
       const r = await api('/api/ping', formValues());
       msg(r.ok ? ('Ping OK（' + r.ms + 'ms）— ' + (r.provider || '') + ' / ' + (r.model || '') + ' 可用' + (r.note || '')) : ('Ping 失败 → ' + r.error + (r.hint ? '：' + r.hint : '')), r.ok);
     } catch (e) { msg('Ping 失败：' + (e && e.message || e), false); }
+    finally { if (b) b.disabled = false; }
   }
 
   // 人工动作三种语义（issue #9）：与角标面板、controller 侧 USER_ACTIONS 的 label 一致。
@@ -275,7 +290,7 @@ details summary:hover{color:#e6e8ec}
       const box = $('hist');
       if (!items.length) { box.innerHTML = '<div class="hitem">暂无记录</div>'; return; }
       box.innerHTML = items.slice(0, 12).map((it, i) => {
-        const ts = esc(String(it.ts || '').replace('T', ' ').slice(5, 16));
+        const ts = esc(fmtTs(it.ts));
         const sev = esc(it.severity || it.event || '-');
         // 用户自己的动作事件用 ev-user（紫），与机器事件（绿/蓝/红）区分
         const cls = it.event === 'user_followup' ? 'ev-user'
@@ -330,6 +345,10 @@ details summary:hover{color:#e6e8ec}
     const text = inp ? String(inp.value || '').trim() : '';
     if (action === 'note' && !text) { msg('「补充说明」需要先填写内容', false); return; }
     const label = USER_ACTION_LABELS[action] || action;
+    // 在途期间禁用本条的三个按钮：连点会把同一动作重复入队（占满 pendingNotes 上限）
+    const btns = ['ack', 'note', 'dismiss'].map(a => $('hact-' + a + '-' + idx)).filter(Boolean);
+    if (btns.some(x => x.disabled)) return;
+    btns.forEach(x => { x.disabled = true; });
     try {
       const r = await api('/api/note', {
         action, severity: String(it.severity || ''), note: String(it.note || ''), text
@@ -341,6 +360,7 @@ details summary:hover{color:#e6e8ec}
         msg('提交失败：' + ((r && (r.hint || r.error)) || '未知'), false);
       }
     } catch (e) { msg('提交失败：' + (e && e.message || e), false); }
+    finally { btns.forEach(x => { x.disabled = false; }); }
   }
 
   $('zprovider').addEventListener('change', () => { clearManualIfPicked(); fillModels(); });
@@ -350,7 +370,10 @@ details summary:hover{color:#e6e8ec}
   $('zfetch').addEventListener('click', fetchZcodeModels);
   $('save').addEventListener('click', save);
   $('ping').addEventListener('click', ping);
-  $('hist-details').addEventListener('toggle', function () { if (this.open && $('hist').childElementCount <= 1) loadHistory(); });
+  $('hist-details').addEventListener('toggle', function () {
+    // 每次展开都重读：旧条件 childElementCount<=1 只在占位/单条时加载，>=2 条后再也不刷新
+    if (this.open) loadHistory();
+  });
   refreshStatus();
 })();
 </script>

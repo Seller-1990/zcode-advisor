@@ -63,12 +63,19 @@ function findZcodeCli() {
     // 「可执行文件是否存在」。不传时 isRunnableFile 恒为 false，
     // 整条探测链静默返回空 → 自动启用失效（真机测试发现：干净机器上 .app
     // 日志只有"未找到 ZCode CLI"，而本机 /Applications/ZCode.app 明明存在）。
+    // 与 controller.readCompanionConfig 同源：用户在 advisor-companion.json 填的 zcodePath
+    // 必须在这里也生效，否则 controller 找得到 ZCode 而自动启用找不到 CLI。
+    let config = {};
+    try {
+      const companionCfg = process.env.ZCODE_ADVISOR_COMPANION_CONFIG
+        || path.join(os.homedir(), '.zcode', 'advisor-companion.json');
+      config = JSON.parse(fs.readFileSync(companionCfg, 'utf8')) || {};
+    } catch (_) { config = {}; }
     const found = zp.detectZcodePath({
       platform: process.platform,
       env: process.env,
-      config: {},
+      config,
       deps: {
-        fs, path, os,
         existsSync: fs.existsSync,
         statSync: fs.statSync,
         readFileSync: fs.readFileSync,
@@ -476,12 +483,10 @@ function runEnable(lockDir) {
       fs.mkdirSync(path.dirname(cfg), { recursive: true, mode: 0o700 });
       // 'wx'：existsSync 检查与写入之间有窗口，被并发创建时放弃（避免整文件覆盖）；
       // 0600：该文件随后会由面板写入 API key，初始权限就不放宽。
-      fs.writeFileSync(cfg, JSON.stringify({
-        baseUrl: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-        model: 'glm-5.3-flash',
-        apiKey: ''
-      }, null, 2) + '\n', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-      log(`✓ 已生成用户级配置：${cfg}（请在设置面板填 API key）`);
+      // 空对象模板：端点/key 自 0.2.17 起只来自 ZCode 服务商（controller 会把 baseUrl/apiKey
+      // 当旧版键删除），模型由面板选择；写死的旧键只会制造一次无意义的迁移日志。
+      fs.writeFileSync(cfg, '{}\n', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      log(`✓ 已生成用户级配置：${cfg}（请在设置面板选择服务商与模型）`);
     } catch (_) {}
   }
 

@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs');
+const { truncateCodePoints } = require('./reviewer');
 
 const ADVISOR_PREFIXES = ['[advisor:', '[advisor] '];
 
@@ -80,7 +81,17 @@ function readDelta(transcriptPath, byteOffset, opts) {
   const fd = fs.openSync(transcriptPath, 'r');
   try {
     const headRead = fs.readSync(fd, headBuf, 0, 64, 0);
-    headHash = headRead > 0 ? djb2Hex(headBuf.subarray(0, headRead)) : '';
+    // 指纹带上被哈希的字节数：满 64B 时为纯 hex（与旧格式兼容）；不足 64B 时为 `n:hex`。
+    // 比较只取期望值记录的前 n 字节——否则首读 <64B 的文件长大后首部"变了"，被误判为重写。
+    headHash = headRead <= 0 ? '' : headRead === 64
+      ? djb2Hex(headBuf.subarray(0, 64))
+      : `${headRead}:${djb2Hex(headBuf.subarray(0, headRead))}`;
+    const headMatches = (expected) => {
+      const m = /^(\d+):([0-9a-f]+)$/.exec(expected);
+      if (!m) return expected === headHash;
+      const n = Number(m[1]);
+      return n > 0 && n <= headRead && djb2Hex(headBuf.subarray(0, n)) === m[2];
+    };
 
     let start = byteOffset || 0;
     let reset = false;
@@ -89,7 +100,7 @@ function readDelta(transcriptPath, byteOffset, opts) {
     if (start > stat.size) {
       start = 0;
       reset = true;
-    } else if (start > 0 && options.expectedHeadHash && options.expectedHeadHash !== headHash) {
+    } else if (start > 0 && options.expectedHeadHash && !headMatches(options.expectedHeadHash)) {
       // 同路径被重写且大小未变小（旧版只靠"变小"启发式，此处补首部指纹）。
       start = 0;
       reset = true;
@@ -150,11 +161,7 @@ function readDelta(transcriptPath, byteOffset, opts) {
 
 // 按 Unicode 码点截断（不劈开 emoji/代理对）。输入先做空白归一。
 function clip(text, max) {
-  const t = String(text || '').replace(/\s+/g, ' ').trim();
-  if (t.length <= max) return t;
-  const chars = Array.from(t);
-  if (chars.length <= max) return t;
-  return `${chars.slice(0, max).join('')}…`;
+  return truncateCodePoints(String(text || '').replace(/\s+/g, ' ').trim(), max);
 }
 
 // 渲染为评审输入。两阶段：先拼原始行 → 尾部窗口（条数）→ 仅对窗口内做 clip 与总量帽，
@@ -195,7 +202,7 @@ function renderDelta(entries, opts) {
     }
   }
 
-  const clipped = windowed.map((w) => clip(w.line, w.isUserText ? userChars : (w.line.startsWith('【用户】') ? userChars : (w.line.startsWith('【工具结果】') || w.line.startsWith('【主模型·工具】')) ? toolChars : assistantChars)));
+  const clipped = windowed.map((w) => clip(w.line, w.isUserText ? userChars : (w.line.startsWith('【工具结果】') || w.line.startsWith('【主模型·工具】')) ? toolChars : assistantChars));
 
   // 保底注入的行不受总量帽约束（字符帽从尾部保留、头部先破——不豁免则保底内容
   // 恰好在目标场景第一个被裁掉，承诺反转）。先对非注入部分做帽，再拼回注入行。

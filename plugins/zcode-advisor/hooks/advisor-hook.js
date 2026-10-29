@@ -232,8 +232,9 @@ function effectiveApi(cfg, apiKeyInfo, state) {
 // 门禁按会话生效值评估的统一入口：gate() 检查第一参的 baseUrl/model 字段，
 // 传全局 cfg 会在「全局服务商解析失败 + 会话已覆盖」时误报 missing。
 // 所有 gate 调用点（stop/sync/worker/status/on）必须走这里，防止逐点手搓漏改。
-function gateWithSession(cfg, apiKeyInfo, state) {
-  const eff = resolveTarget(cfg, state, process.env);
+// 已解析过生效值的调用方传入 resolved，避免同一事件内重复读 ZCode 服务商配置。
+function gateWithSession(cfg, state, resolved) {
+  const eff = resolved || resolveTarget(cfg, state, process.env);
   // gate() 的 key 参数读的是 .key（历史字段名），resolveTarget 产出的是 .apiKey——
   // 直接传 eff 会让门禁恒报 missing:apiKey（所有会话静默不审查）。
   return { eff, reasons: gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey, source: eff.keySource }) };
@@ -372,7 +373,7 @@ function resolveFallbackModel(cfg) {
 //   注意只覆盖**模型**（服务商仍是全局那个）时凭据边界没变（同 provider = 同端点/key），
 //   降级照常可用——按 hasOverride 一刀切会把这种常见场景的降级能力白丢掉。
 function fallbackEligibility(cfg, state, eff) {
-  const model = resolveFallbackModel(cfg, state);
+  const model = resolveFallbackModel(cfg);
   if (!model) return { ok: false, reason: 'no_fallback_model' };
   if (cfg.reviewMode === 'sync') return { ok: false, reason: 'fallback_skipped:sync_mode' };
   // sessionProvider 可以是 id 或名称（面板/命令都容忍写名称），而 cfg.providerId 恒为 id——
@@ -682,7 +683,7 @@ function onSessionStart(ctx) {
 }
 
 function onUserPromptSubmit(ctx) {
-  const { stateDir, sessionId, transcriptPath, cfg, apiKeyInfo } = ctx;
+  const { stateDir, sessionId, transcriptPath, cfg } = ctx;
   const { file } = ensureState(stateDir, sessionId, transcriptPath, cfg.startEnabled);
 
   // 临界区 1：读取队列与注册标记，组装投递内容。
@@ -874,26 +875,19 @@ function onStopAsync(ctx) {
   }
 
   const current = loadState(file);
+  // 生效值每事件只解析一次（门禁与健康信标共用）。
+  const eff = effectiveApi(cfg, apiKeyInfo, current);
   // 门禁按会话级生效值评估：全局 key/端点/模型任一缺失但本会话已覆盖时照常审查。
-  const { reasons: gateReasons } = gateWithSession(cfg, apiKeyInfo, current);
-  // 确定性错误 halt：停机的会话不再发起审查（重试救不了 401/403），但保留
-  // lastActivity 更新——「会话还活着、审查不跑」要通过 /advisor-status 的 reason 可见。
+  const { reasons: gateReasons } = gateWithSession(cfg, current, eff);
+  // 确定性错误 halt（P1-⑤）：停机的会话不再派发 worker（重试救不了 401/403/404，每轮派发
+  // 只是白烧一次 spawn），但保留 lastActivity 更新——「会话还活着、审查不跑」要通过
+  // /advisor-status 的 reason 可见。恢复路径：/advisor-on 或 /advisor-model set（两处都清 halted）。
   if (!current || !current.enabled || gateReasons.length > 0 || current.halted) {
     mutateStateExclusive(file, (s) => {
       s.lastActivity = new Date().toISOString();
       if (s.enabled && gateReasons.length > 0) s.disabledReason = gateReasons.join(',');
     });
     // 门禁失败不推进指针：修复配置后可回看积压（受增量窗口与 backfill 上限截断）。
-    return;
-  }
-
-  // 确定性失败停机（P1-⑤）：halted 非空时不再派发 worker——模型对端点已确定性不可用
-  // （llm_http_404），每轮派发只是白烧一次 spawn + 复现同一个错误。恢复路径：/advisor-on
-  // 或 /advisor-model set（两处都清 halted）。UPS 侧有一次性告知行，status 持久可查。
-  if (current.halted) {
-    mutateStateExclusive(file, (s) => {
-      s.lastActivity = new Date().toISOString();
-    });
     return;
   }
 
@@ -910,19 +904,26 @@ function onStopAsync(ctx) {
     return;
   }
 
-  mutateStateExclusive(file, (s) => {
-    s.lastAction = 'spawned-review';
-    s.lastActivity = new Date().toISOString();
-  });
+  // 名额已取到：此后到 spawn 之间任何同步抛错都必须释放锁，否则会话审查停摆到 staleMs。
+  const releaseOnThrow = (fn) => {
+    try { return fn(); } catch (err) {
+      try { clearLock(file); } catch (_) {}
+      throw err;
+    }
+  };
 
-  // 健康信标（M1）：父进程必然会执行到此，记「本轮尝试了审查」。
-  // worker 被强杀时只有这条会更新，lastSuccessAt 停留 → 读取侧可判 down（而非假绿）。
-  {
-    const effAttempt = effectiveApi(cfg, apiKeyInfo, current);
+  releaseOnThrow(() => {
+    mutateStateExclusive(file, (s) => {
+      s.lastAction = 'spawned-review';
+      s.lastActivity = new Date().toISOString();
+    });
+
+    // 健康信标（M1）：父进程必然会执行到此，记「本轮尝试了审查」。
+    // worker 被强杀时只有这条会更新，lastSuccessAt 停留 → 读取侧可判 down（而非假绿）。
     health.writeAttempt(health.resolveHealthDir(process.env), sessionId, {
-      model: effAttempt.model, effectiveModel: effAttempt.model
+      model: eff.model, effectiveModel: eff.model
     }, stateDir);
-  }
+  });
 
   // —— 转录快照（ZCode 宿主契约适配）——
   // ZCode 给 hook 的 transcript_path 是**每轮临时快照**（/var/folders/.../T/zcode-*-hook-*/），
@@ -969,12 +970,13 @@ function onStopAsync(ctx) {
   }
   // 测试/调试钩子：跳过真实派生，由外部直接调 review-worker。
   if (process.env.ZCODE_ADVISOR_NO_SPAWN === '1') return;
-  const child = spawn(process.execPath, [__filename, ...workerArgs], {
+  // 同步抛错（参数非法等）：锁已取得但无 worker 认领，立即释放而不是等 staleMs。
+  const child = releaseOnThrow(() => spawn(process.execPath, [__filename, ...workerArgs], {
     detached: true,
     stdio: 'ignore',
     cwd: PLUGIN_ROOT,
     windowsHide: true
-  });
+  }));
   // spawn 失败（EMFILE 等）走异步 error 事件：不挂监听会变 uncaughtException，
   // 且锁无人认领/清除，会话审查将停摆到 staleMs。尽力清锁并计数。
   child.on('error', () => {
@@ -992,7 +994,7 @@ function onStopAsync(ctx) {
 // —— sync 模式：Stop 内联审查，concern/blocker 立即送达 ——
 async function onStopSync(ctx) {
   const { stateDir, sessionId, transcriptPath, cfg, apiKeyInfo, input } = ctx;
-  const { file, state: st } = ensureState(stateDir, sessionId, transcriptPath, cfg.startEnabled);
+  const { file } = ensureState(stateDir, sessionId, transcriptPath, cfg.startEnabled);
 
   // 续跑响应（由我们的 block 触发的那一轮）不重审、不推进指针：其内容并入下一次真实审查。
   if (isStopHookActive(input)) {
@@ -1008,8 +1010,11 @@ async function onStopSync(ctx) {
   const current = loadState(file);
   if (!current || !current.enabled) return;
 
-  // 门禁按会话级生效值评估（与 async 路径同一口径）；halted 会话同样不审（见 HALT_ERROR_RE）。
-  const gateReasons = gateWithSession(cfg, apiKeyInfo, current).reasons;
+  // 生效值每事件只解析一次（门禁、健康信标与审查共用）。
+  const eff = effectiveApi(cfg, apiKeyInfo, current);
+  // 门禁按会话级生效值评估（与 async 路径同一口径）；halted 会话同样不审（见 HALT_ERROR_RE，
+  // 确定性失败停机 P1-⑤：与 async 同语义——halted 期间 sync 不发起内联审查）。
+  const gateReasons = gateWithSession(cfg, current, eff).reasons;
   if (gateReasons.length > 0 || current.halted) {
     mutateStateExclusive(file, (s) => {
       if (gateReasons.length > 0) s.disabledReason = gateReasons.join(',');
@@ -1017,9 +1022,6 @@ async function onStopSync(ctx) {
     // 门禁失败不推进指针：修复配置后可回看积压（受增量窗口与 backfill 上限截断）。
     return;
   }
-
-  // 确定性失败停机（P1-⑤）：与 async 同语义——halted 期间 sync 不发起内联审查。
-  if (current.halted) return;
 
   const delta = readDelta(current.transcriptPath, current.byteOffset, {
     expectedHeadHash: current.lastHeadHash,
@@ -1059,7 +1061,6 @@ async function onStopSync(ctx) {
     return;
   }
 
-  const eff = effectiveApi(cfg, apiKeyInfo, current);
   const userContent = `以下是一轮对话增量（按时间顺序，可能被截断）。请按系统指令输出 JSON 判定。\n\n${rendered.text}`;
 
   // 健康信标（M1）：sync 路径无分发 worker，attempt 在审查发起前写。
@@ -1217,14 +1218,22 @@ async function handleReviewWorker(args) {
     //（/advisor-off 或 404 停机发生在锁认领之后）。
     if (state.halted) return;
     // 门禁按会话级生效值评估：全局 key 缺失但本会话已覆盖 key 时照常审查。
-    const gateReasons = gateWithSession(cfg, apiKeyInfo, state).reasons;
+    // 生效值只解析一次（门禁与审查共用）。
+    const eff = effectiveApi(cfg, apiKeyInfo, state);
+    const gateReasons = gateWithSession(cfg, state, eff).reasons;
     if (gateReasons.length > 0) {
       mutateStateExclusive(file, (s) => {
         s.disabledReason = gateReasons.join(',');
       });
       return;
     }
-    state.disabledReason = '';
+    // 门禁已放行：清掉上次门禁失败留下的原因。必须在临界区内改盘上状态——
+    // 改本地 state 副本不会落盘，后续 mutate 重读磁盘会把旧原因原样带回。
+    if (state.disabledReason) {
+      mutateStateExclusive(file, (s) => {
+        if (s.enabled === true) s.disabledReason = '';
+      });
+    }
     // 派发时刻的审查目标与停机代次：最终落盘时与最新状态比对，审查期间被
     // /advisor-off、model set/provider/reset、停机/恢复改过的，本次结果作废（见下方 isStale）。
     const spawnSnap = {
@@ -1287,7 +1296,6 @@ async function handleReviewWorker(args) {
       return;
     }
 
-    const eff = effectiveApi(cfg, apiKeyInfo, state);
     const userContent = `以下是一轮对话增量（按时间顺序，可能被截断）。请按系统指令输出 JSON 判定。\n\n${rendered.text}`;
     const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir), { state });
 
@@ -1341,7 +1349,7 @@ async function handleReviewWorker(args) {
         return;
       }
 
-      const decision = decideActionAsync(frame, s, cfg);
+      const decision = decideActionAsync(frame, s);
       if (decision.deliver === 'none') {
         applyDeliveryToState(s, false, cfg);
         return;
@@ -1468,8 +1476,7 @@ async function handleCtl(args) {
 
   if (sub === 'status') {
     const state = loadState(file);
-    const apiKeyInfo = resolveApiKey(cfg, process.env);
-    const { eff, reasons: gateReasons } = gateWithSession(cfg, apiKeyInfo, state);
+    const { eff, reasons: gateReasons } = gateWithSession(cfg, state);
     const lines = [];
     lines.push('advisor 状态');
     lines.push(`  会话: ${state.sessionId || '(未知)'}`);
@@ -1496,7 +1503,7 @@ async function handleCtl(args) {
     lines.push(`  Token 累计: 输入 ${state.tokensIn || 0} / 输出 ${state.tokensOut || 0}`);
     // 降级（M4）可见性：配了备用模型才展示；用 primaryFailStreak 说明"主模型是否在坏"。
     // 这是「不静默掩盖」在 status 侧的落点——即便降级在兜，用户也能看到主模型有问题。
-    const fbModel = resolveFallbackModel(cfg, state);
+    const fbModel = resolveFallbackModel(cfg);
     if (fbModel) {
       const pf = state.primaryFailStreak;
       const pfDesc = pf && pf.count
@@ -1589,7 +1596,7 @@ async function handleCtl(args) {
       wasHalted = s.halted === true;
       clearHalt(s);
       s.enabled = true;
-      const r = gateWithSession(cfg, resolveApiKey(cfg, process.env), s);
+      const r = gateWithSession(cfg, s);
       reasons = r.reasons;
       enabledModel = r.eff.model;
       s.disabledReason = reasons.length > 0 ? reasons.join(',') : '';
@@ -1685,7 +1692,6 @@ async function handleCtl(args) {
 // state 可选：传入后按**会话生效值**评估门禁（与 /advisor-status 同口径）；
 // 不传则只看全局解析结果（CI 无会话场景）。
 async function ctlDoctor(cfg, args, state) {
-  const apiKeyInfo = resolveApiKey(cfg, process.env);
   const eff = resolveTarget(cfg, state || null, process.env);
   const lines = [];
   lines.push('advisor 体检');

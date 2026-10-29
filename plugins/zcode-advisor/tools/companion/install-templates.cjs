@@ -130,6 +130,9 @@ if [ -f "$SRC/bin/node" ]; then
   chmod +x "$SUPPORT/bin/node" || { echo "[错误] 设置执行位失败" >&2; exit 1; }
 elif command -v node >/dev/null 2>&1; then
   SYSTEM_NODE="$(command -v node)"
+  # 版本校验：角标外挂依赖全局 WebSocket（Node >= 22），旧版 node 复制过去只会运行时才崩。
+  "$SYSTEM_NODE" -e 'process.exit(typeof WebSocket==="function"?0:1)' >/dev/null 2>&1 \\
+    || { echo "[错误] 系统 Node 版本过旧（缺少全局 WebSocket）：$SYSTEM_NODE。请安装 Node >= 22 后重试。" >&2; exit 1; }
   cp -f "$SYSTEM_NODE" "$SUPPORT/bin/node" || { echo "[错误] 复制系统 Node 失败：$SYSTEM_NODE" >&2; exit 1; }
   chmod +x "$SUPPORT/bin/node" || { echo "[错误] 设置执行位失败" >&2; exit 1; }
   echo "[提示] 包内未内嵌 Node，已使用系统 Node：$SYSTEM_NODE"
@@ -248,13 +251,18 @@ if [ ! -d "$APP_SRC" ]; then
 fi
 
 # ── 拷贝到 /Applications（覆盖旧版）──
-if [ -d "$APP_DST" ]; then
-  echo "检测到已安装的旧版本，正在替换…"
-  rm -rf "$APP_DST"
-fi
-if cp -R "$APP_SRC" "$APP_DST" 2>/dev/null; then
+# 先复制到同目录临时位置、成功后再替换：直接 rm -rf 旧版再 cp，复制失败会让用户两头落空。
+APP_TMP="$APP_DST.installing.$$"
+rm -rf "$APP_TMP"
+if cp -R "$APP_SRC" "$APP_TMP" 2>/dev/null; then
+  if [ -d "$APP_DST" ]; then
+    echo "检测到已安装的旧版本，正在替换…"
+    rm -rf "$APP_DST"
+  fi
+  mv "$APP_TMP" "$APP_DST" || { rm -rf "$APP_TMP"; echo "[错误] 替换 /Applications 中的旧版本失败。" >&2; read -r -p "按回车关闭…" _ || true; exit 1; }
   echo "已安装到 /Applications"
 else
+  rm -rf "$APP_TMP" 2>/dev/null || true
   echo "[错误] 复制到 /Applications 失败（可能没有写权限）。" >&2
   echo "        请改用拖拽方式把 .app 拖进「应用程序」，然后手动执行：" >&2
   echo "        xattr -dr com.apple.quarantine \\"$APP_DST\\"" >&2

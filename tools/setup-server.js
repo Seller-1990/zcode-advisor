@@ -14,7 +14,7 @@ const { spawn } = require('child_process');
 const { writeUserConfig, removeUserConfigKeys, USER_CONFIG } = require('./config-bridge');
 const { loadConfig, readZcodeProviders, findZcodeProvider, resolveProviderTarget } = require('../hooks/lib/config');
 const { callReviewer } = require('../hooks/lib/reviewer');
-const { readHistory } = require('../hooks/lib/history');
+const { readHistory, HISTORY_FILE } = require('../hooks/lib/history');
 
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 // 端口解析顺序：--port= 参数 > ZCODE_ADVISOR_PANEL_PORT 环境变量 > 默认 8789
@@ -52,7 +52,9 @@ function saveUserConfig(patch) {
   // 旧版残留（手动端点/key/来源）由 writeUserConfig 在写盘时统一清除（0.2.17）——
   // 这里不再重复调 removeUserConfigKeys：那是第二次读-改-写，会多占一次配置锁，
   // 且失败时状态与返回值不一致（writeUserConfig 已保证清理）。
-  return writeUserConfig(allowed);
+  // 未被接受的字段（未知键 / 空值 / 越界 maxTokens）如实回报，不再静默丢弃却回 ok:true。
+  const ignored = Object.keys(patch).filter((k) => !Object.prototype.hasOwnProperty.call(allowed, k));
+  return Object.assign({}, writeUserConfig(allowed), { ignored });
 }
 
 function esc(s) {
@@ -135,10 +137,10 @@ ${missingHint}
  <option value="sync"${cfg.reviewMode === 'sync' ? ' selected' : ''}>sync（当轮打断：concern/blocker 立即送达，每轮收尾等待审查）</option>
 </select>
 <label>max_tokens（仅 Anthropic 协议生效；OpenAI 兼容通道不发送模型侧预算）</label>
-<input id="maxTokens" type="number" min="64" max="16384" value="${cfg.maxTokens || 4096}">
+<input id="maxTokens" type="number" min="64" max="16384" value="${esc(cfg.maxTokens || 4096)}">
 <div class="btnrow">
  <button class="act" onclick="save()">保存配置</button>
- <button class="act alt" onclick="ping()">Ping 测试（验证服务商与模型）</button>
+ <button class="act alt" id="pingBtn" onclick="ping()">Ping 测试（验证服务商与模型）</button>
 </div>
 <small class="hintline">端点与 key 由 ZCode 服务商统一维护（本插件不单独保存，也不显示明文）；会话级临时换服务商/模型用 ZCode 角标面板或 /advisor-model。</small>
 <div id="msg"></div>
@@ -159,7 +161,9 @@ const esc=(v)=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt
     const items=(r&&r.ok&&Array.isArray(r.history))?r.history:[];
     if(items.length===0){document.getElementById('hist').textContent='暂无记录——顾问意见产生后会出现在这里';return;}
     document.getElementById('hist').innerHTML=items.map(it=>{
-      const ts=String(it.ts||'').replace('T',' ').slice(5,16);
+      // 本地时区显示（与角标面板 fmtTs 一致）；非法值原样兜底
+      const d=new Date(String(it.ts||''));const p2=n=>String(n).padStart(2,'0');
+      const ts=isNaN(d.getTime())?String(it.ts||'').replace('T',' ').slice(5,16):(p2(d.getMonth()+1)+'-'+p2(d.getDate())+' '+p2(d.getHours())+':'+p2(d.getMinutes()));
       const sev=it.severity||it.event||'-';
       // 历史行来自本机 JSONL（无枚举校验），ts/sev 必须转义后才能拼 innerHTML
       //（note 一直走 textContent）。本页能改写配置，不可给注入留口。
@@ -198,12 +202,18 @@ function formBody(){
 }
 async function save(){
  const r=await post('/api/save',formBody());
- msg(r.ok?('已保存：'+r.file+'（下一轮审查生效）'):('保存失败：'+r.error),r.ok);
+ const ign=(r.ok&&Array.isArray(r.ignored)&&r.ignored.length)?('；以下字段未被接受：'+r.ignored.join(', ')):'';
+ msg(r.ok?('已保存：'+r.file+'（下一轮审查生效）'+ign):('保存失败：'+r.error),r.ok);
 }
 async function ping(){
- msg('Ping 中…',true);
- const r=await post('/api/ping',formBody());
- msg(r.ok?('Ping OK（'+r.ms+'ms）— 服务商端点可达、认证与模型有效'+(r.note||'')):('Ping 失败 → '+r.error+(r.hint?('：'+r.hint):'')),r.ok);
+ // 在途期间禁用按钮：Ping 最长 20s，连点会并发打出多个真实请求
+ const b=$('pingBtn');if(b.disabled)return;b.disabled=true;
+ try{
+  msg('Ping 中…',true);
+  const r=await post('/api/ping',formBody());
+  msg(r.ok?('Ping OK（'+r.ms+'ms）— 服务商端点可达、认证与模型有效'+(r.note||'')):('Ping 失败 → '+r.error+(r.hint?('：'+r.hint):'')),r.ok);
+ }catch(e){msg('Ping 失败：'+e,false);}
+ finally{b.disabled=false;}
 }
 </script></body></html>`;
 }
@@ -305,7 +315,7 @@ const server = http.createServer((req, res) => {
           send(503, { ok: false, error: '配置文件正被其他进程写入，请等几秒重试；若持续出现，删除 ~/.zcode/advisor.config.json.lock 后再试' });
           return;
         }
-        send(200, { ok: true, file: r.file });
+        send(200, { ok: true, file: r.file, ignored: r.ignored || [] });
       } catch (err) {
         send(500, { ok: false, error: String(err).slice(0, 200) });
       }
@@ -345,7 +355,7 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === 'GET' && req.url === '/api/history') {
-    send(200, { ok: true, history: readHistory(50), file: require('../hooks/lib/history').HISTORY_FILE });
+    send(200, { ok: true, history: readHistory(50), file: HISTORY_FILE });
     return;
   }
   // 指定服务商的模型清单与端点（页面切换服务商时用；只回传模型 id/baseURL，不含 apiKey）
@@ -396,10 +406,15 @@ server.listen(PORT, '127.0.0.1', () => {
   process.stdout.write(`zcode-advisor 配置面板已启动：${url}（Ctrl+C 退出）\n`);
   if (process.env.ZCODE_ADVISOR_PANEL_NO_OPEN === '1' || process.env.NODE_ENV === 'test') return;
   if (process.platform === 'win32') {
-    spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    const c = spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true });
+    c.on('error', () => {}); // 打不开浏览器不致命：URL 已打印，用户可手动打开
+    c.unref();
   } else {
     const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
-    spawn(opener, [url], { detached: true, stdio: 'ignore' }).unref();
+    const c = spawn(opener, [url], { detached: true, stdio: 'ignore' });
+    // 无 xdg-open（ENOENT）时 spawn 异步发 'error'：无监听器会让整个面板进程崩溃
+    c.on('error', () => {});
+    c.unref();
   }
 });
 

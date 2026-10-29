@@ -28,7 +28,8 @@ const USTAR_MAGIC = 'ustar';
 const USTAR_VERSION = '00';
 // 发行包内含的 node 二进制约 100~130MB，用 4GB 作为 ZIP 硬上限留足余量
 const MAX_ZIP_TOTAL_BYTES = 0xffffffff;
-const MAX_ZIP_SINGLE_BYTES = 0xffffffff;
+// ZIP 日期字段 0 不是合法 DOS 日期（月/日为 0），部分解压器会报错；0x0021 = 1980-01-01
+const ZIP_DOS_DATE = 0x0021;
 
 // ---------------- 公共工具 ----------------
 
@@ -41,7 +42,11 @@ function normalizeMode(mode, fallback) {
 function toBuffer(data) {
   if (Buffer.isBuffer(data)) return data;
   if (data == null) return Buffer.alloc(0);
-  return Buffer.from(String(data), 'utf8');
+  if (typeof data === 'string') return Buffer.from(data, 'utf8');
+  // Uint8Array / DataView 等视图与裸 ArrayBuffer：按字节拷贝；String(data) 会把它们写成 "1,2,3" 之类的文本
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  throw new TypeError(`archive: entry data 类型不支持（${Object.prototype.toString.call(data)}）`);
 }
 
 // 归档条目的路径统一用正斜杠，且不允许绝对路径或 .. 逃逸（解压侧安全）。
@@ -87,9 +92,7 @@ function buildZip(entries) {
     const name = sanitizeEntryPath(entry.path);
     const data = toBuffer(entry.data);
     const mode = normalizeMode(entry.mode, entry.dir ? 0o755 : 0o644);
-    if (data.length > MAX_ZIP_SINGLE_BYTES) {
-      throw new Error(`archive: 单条目超过 ZIP 上限（${data.length} 字节）: ${name}`);
-    }
+    // 单条目上限与总上限相同（都是 32 位字段），总量检查已覆盖单条目
     total += data.length;
     if (total > MAX_ZIP_TOTAL_BYTES) {
       throw new Error('archive: 总大小超过 ZIP 上限（不支持 ZIP64）');
@@ -118,7 +121,7 @@ function buildZip(entries) {
     header.writeUInt16LE(ZIP_GPBF, 6); // UTF-8 文件名
     header.writeUInt16LE(f.method, 8);
     header.writeUInt16LE(0, 10); // 时间：固定 0，保证构建可复现
-    header.writeUInt16LE(0, 12); // 日期：同上
+    header.writeUInt16LE(ZIP_DOS_DATE, 12); // 日期：固定 1980-01-01，同样可复现
     header.writeUInt32LE(f.crc, 14);
     header.writeUInt32LE(f.payload.length, 18);
     header.writeUInt32LE(f.uncompressedSize, 22);
@@ -137,8 +140,8 @@ function buildZip(entries) {
     rec.writeUInt16LE(ZIP_VERSION, 6);
     rec.writeUInt16LE(ZIP_GPBF, 8);
     rec.writeUInt16LE(f.method, 10);
-    rec.writeUInt16LE(0, 12);
-    rec.writeUInt16LE(0, 14);
+    rec.writeUInt16LE(0, 12); // 时间
+    rec.writeUInt16LE(ZIP_DOS_DATE, 14); // 日期
     rec.writeUInt32LE(f.crc, 16);
     rec.writeUInt32LE(f.payload.length, 20);
     rec.writeUInt32LE(f.uncompressedSize, 24);
@@ -276,7 +279,7 @@ function computeTarChecksum(header) {
 }
 
 // 解析（可能 gzip 压缩的）tar，返回 [{ path, data, mode, type }]。
-// 只支持 ustar 普通文件与目录；不做 PAX/GNU 长名扩展（官方 Node 发行包是 ustar）。
+// 只支持 ustar 普通文件与目录；遇到改写路径的 PAX/GNU 长名扩展直接抛错（官方 Node 发行包是 ustar）。
 //
 // 完整性（R16）：先验头校验和，再验 size 是否超出实际数据。缺了这两步，`subarray` 在
 // 数据不足时会**静默返回短 buffer**，于是损坏/截断的发行包会被当成好包提取出半截 node
@@ -308,6 +311,18 @@ function readTarGz(input) {
     pos += TAR_BLOCK;
     if (size > 0 && pos + size > buf.length) {
       throw new Error(`archive: tar 数据区被截断（${name || '?'}：声明 ${size} 字节，实际仅剩 ${buf.length - pos}）—— 归档已损坏`);
+    }
+    // GNU 长名（L/K）与 PAX 头（x 单条 / g 全局）会改写后续条目的路径；不支持就必须报错，
+    // 否则下一条会用截断的 ustar 名提取，找不到目标文件时只表现为"缺 node"。
+    if (type === 'L' || type === 'K') {
+      throw new Error(`archive: 不支持 GNU 长文件名扩展（typeflag ${type}，${name || '?'}）`);
+    }
+    if (type === 'x' || type === 'g') {
+      // 只带 mtime/uid 等元数据的 PAX 头可安全忽略；一旦改写 path/linkpath 就无法正确提取
+      const pax = buf.subarray(pos, pos + size).toString('utf8');
+      if (/(^|\n)\d+ (path|linkpath)=/.test(pax)) {
+        throw new Error(`archive: 不支持 PAX 路径扩展（typeflag ${type}，${name || '?'}）`);
+      }
     }
     if (type === '0' || type === '\0' || type === '') {
       entries.push({ path: name, data: buf.subarray(pos, pos + size), mode, type: 'file' });
@@ -345,7 +360,8 @@ function extractFromTarGz(input, wantedPath) {
 //
 // 完整性（R16）：除签名与解压后长度外，还比对中央目录记录的 CRC-32（+16）。只验长度时，
 // 内容被改写但长度不变的损坏归档会被无声接受（store 条目尤其如此）。
-function readZipEntries(buf) {
+// 只解析中央目录，返回条目元数据；数据按需由 inflateZipEntry 解压并校验。
+function listZipEntries(buf) {
   // 从尾部找 EOCD（注释最长 65535，向前最多找 64KB）
   let eocdAt = -1;
   const from = Math.max(0, buf.length - 65557);
@@ -380,24 +396,34 @@ function readZipEntries(buf) {
     const localNameLen = buf.readUInt16LE(localOffset + 26);
     const localExtraLen = buf.readUInt16LE(localOffset + 28);
     const dataStart = localOffset + 30 + localNameLen + localExtraLen;
-    const payload = buf.subarray(dataStart, dataStart + compSize);
-
-    let data;
-    if (method === 0) data = Buffer.from(payload);
-    else if (method === 8) data = zlib.inflateRawSync(payload);
-    else throw new Error(`archive: 不支持 ZIP 压缩方法 ${method}（${name}）`);
-
-    if (data.length !== rawSize) {
-      throw new Error(`archive: 解压大小不符（${name}: ${data.length} != ${rawSize}）`);
-    }
-    const actualCrc = crc32(data);
-    if (actualCrc !== crcExpected) {
-      throw new Error(`archive: ZIP CRC 校验失败（${name}: 声明 ${crcExpected.toString(16)}，实际 ${actualCrc.toString(16)}）—— 归档已损坏`);
-    }
-    out.push({ path: name, data, size: rawSize, mode: (externalAttrs >>> 16) & 0o7777 });
+    out.push({
+      path: name, method, crcExpected, compSize, rawSize, dataStart,
+      size: rawSize, mode: (externalAttrs >>> 16) & 0o7777
+    });
     pos += 46 + nameLen + extraLen + commentLen;
   }
   return out;
+}
+
+function inflateZipEntry(buf, e) {
+  const payload = buf.subarray(e.dataStart, e.dataStart + e.compSize);
+  let data;
+  if (e.method === 0) data = Buffer.from(payload);
+  else if (e.method === 8) data = zlib.inflateRawSync(payload);
+  else throw new Error(`archive: 不支持 ZIP 压缩方法 ${e.method}（${e.path}）`);
+
+  if (data.length !== e.rawSize) {
+    throw new Error(`archive: 解压大小不符（${e.path}: ${data.length} != ${e.rawSize}）`);
+  }
+  const actualCrc = crc32(data);
+  if (actualCrc !== e.crcExpected) {
+    throw new Error(`archive: ZIP CRC 校验失败（${e.path}: 声明 ${e.crcExpected.toString(16)}，实际 ${actualCrc.toString(16)}）—— 归档已损坏`);
+  }
+  return data;
+}
+
+function readZipEntries(buf) {
+  return listZipEntries(buf).map((e) => ({ path: e.path, data: inflateZipEntry(buf, e), size: e.size, mode: e.mode }));
 }
 
 // 从 ZIP 中按路径取单文件（兼容发行包内的顶层目录名）；缺失返回 null。
@@ -406,15 +432,10 @@ function readZipEntries(buf) {
 // 单趟实现会错误返回嵌套那个（tar 版当时返回的是正确值，两者行为不一致）。
 function extractFromZip(buf, wantedPath) {
   const wanted = sanitizeEntryPath(wantedPath);
-  const files = readZipEntries(buf).map((e) => ({ ...e, path: e.path.replace(/^\.\//, '') }));
-
-  for (const e of files) {
-    if (e.path === wanted) return e.data;
-  }
-  for (const e of files) {
-    if (e.path.endsWith(`/${wanted}`)) return e.data;
-  }
-  return null;
+  // 只解压命中的条目（官方 Node zip 含数千文件，全量 inflate+CRC 白耗时）
+  const files = listZipEntries(buf).map((e) => ({ ...e, path: e.path.replace(/^\.\//, '') }));
+  const hit = files.find((e) => e.path === wanted) || files.find((e) => e.path.endsWith(`/${wanted}`));
+  return hit ? inflateZipEntry(buf, hit) : null;
 }
 
 module.exports = {

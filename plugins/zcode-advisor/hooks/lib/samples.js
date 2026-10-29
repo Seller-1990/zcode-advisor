@@ -50,9 +50,14 @@ function appendSample(entry) {
       deltaChars: Number(e.deltaChars) || 0,
       ms: Number(e.ms) || 0
     };
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    // mkdir + 收紧权限每进程每文件一次即可（热路径不重复 syscall）。
+    if (!preparedFiles.has(file)) {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(file, '', { encoding: 'utf8', mode: 0o600 });
+      try { fs.chmodSync(file, 0o600); } catch (_) {} // 历史遗留宽权限文件补正
+      preparedFiles.add(file);
+    }
     fs.appendFileSync(file, JSON.stringify(record) + '\n', { encoding: 'utf8', mode: 0o600 });
-    try { fs.chmodSync(file, 0o600); } catch (_) {}
     trimIfNeeded(file);
     return true;
   } catch (_) {
@@ -60,12 +65,24 @@ function appendSample(entry) {
   }
 }
 
+const preparedFiles = new Set();
+// 每条样本 JSON 至少 ~100 字节（固定字段名与 ts）；小于该门槛时行数不可能超限，免读全文件。
+const TRIM_MIN_BYTES = SAMPLES_MAX_LINES * 100;
+
+// 原子裁剪：写同目录唯一 tmp（0600）再 rename，写坏不动原文件（与 history.js 同口径）。
 function trimIfNeeded(file) {
   try {
+    if (fs.statSync(file).size <= TRIM_MIN_BYTES) return;
     const raw = fs.readFileSync(file, 'utf8');
     const lines = raw.split('\n').filter(Boolean);
     if (lines.length <= SAMPLES_MAX_LINES) return;
-    fs.writeFileSync(file, lines.slice(-Math.floor(SAMPLES_MAX_LINES / 2)).join('\n') + '\n', 'utf8');
+    const tmp = `${file}.trim-${process.pid}-${Date.now()}`;
+    try {
+      fs.writeFileSync(tmp, lines.slice(-Math.floor(SAMPLES_MAX_LINES / 2)).join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+      fs.renameSync(tmp, file);
+    } finally {
+      try { fs.unlinkSync(tmp); } catch (_) {}
+    }
   } catch (_) { /* 裁剪失败下次再试 */ }
 }
 

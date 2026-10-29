@@ -62,21 +62,11 @@ function drawShield(size) {
 
 // ---------------- PNG 编码（8-bit RGBA，filter 0） ----------------
 
-const CRC_TABLE = (() => {
-  const t = new Int32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c;
-  }
-  return t;
-})();
+// crc32 与 ZIP 共用同一实现（archive.cjs 只依赖 zlib，无循环依赖）
+const { crc32 } = require('./archive.cjs');
 
-function crc32(buf) {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
+// PNG 解码的尺寸上限：图标源图远小于此；超大宽高会让 Buffer.alloc 直接吃光内存
+const MAX_PNG_DIM = 8192;
 
 function pngChunk(type, data) {
   const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
@@ -112,26 +102,38 @@ function decodePng(buf) {
   let off = 8;
   let width = 0; let height = 0; let colorType = -1; let bitDepth = -1;
   const idat = [];
+  let sawIend = false;
   while (off + 8 <= buf.length) {
     const len = buf.readUInt32BE(off);
     const type = buf.toString('ascii', off + 4, off + 8);
+    // 块长度 + 4 字节 CRC 必须落在 buffer 内；否则 subarray 会静默返回短块
+    if (off + 12 + len > buf.length) throw new Error(`PNG chunk ${type} truncated`);
     const data = buf.subarray(off + 8, off + 8 + len);
+    const crcDeclared = buf.readUInt32BE(off + 8 + len);
+    if (crc32(buf.subarray(off + 4, off + 8 + len)) !== crcDeclared) throw new Error(`PNG chunk ${type} CRC mismatch`);
     if (type === 'IHDR') {
+      if (len !== 13) throw new Error(`bad IHDR length ${len}`);
       width = data.readUInt32BE(0); height = data.readUInt32BE(4);
+      if (!width || !height || width > MAX_PNG_DIM || height > MAX_PNG_DIM) {
+        throw new Error(`unsupported PNG size ${width}x${height}`);
+      }
       bitDepth = data[8]; colorType = data[9];
       if (data[12] !== 0) throw new Error('interlaced PNG unsupported');
     } else if (type === 'IDAT') {
       idat.push(data);
     } else if (type === 'IEND') {
+      sawIend = true;
       break;
     }
     off += 12 + len;
   }
+  if (!sawIend) throw new Error('PNG missing IEND (truncated)');
   if (bitDepth !== 8) throw new Error(`unsupported bit depth ${bitDepth}`);
   const channels = { 0: 1, 2: 3, 6: 4 }[colorType];
   if (!channels) throw new Error(`unsupported color type ${colorType}`);
   const raw = zlib.inflateSync(Buffer.concat(idat));
   const stride = width * channels;
+  if (raw.length < height * (stride + 1)) throw new Error(`PNG image data too short (${raw.length} < ${height * (stride + 1)})`);
   // 每行首字节的滤波还原（0 None / 1 Sub / 2 Up / 3 Average / 4 Paeth）
   const bpp = channels;
   const paeth = (a, b, c) => {

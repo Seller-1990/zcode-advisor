@@ -1,21 +1,24 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+// Node>=22：Atomics.wait 在主线程恒可用（engines 已声明），无需忙等兜底。
 function sleepSync(ms) {
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch (_) {
-    const end = Date.now() + ms;
-    while (Date.now() < end) { /* 忙等兜底（极老 Node 才会走到） */ }
-  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// 已是干净 id（只含 [A-Za-z0-9_-] 且 ≤80）原样返回——既有文件名不变、无需迁移。
+// 被改写或截断时追加 8 位 sha1：否则 `a/b`、`a.b`、`a b` 都映射到 `a-b`，不同会话共用一个状态文件。
+// ⚠️ tools/companion/controller.cjs 的 sanitizeSessionIdForState 必须保持同一规则。
 function sanitizeSessionId(sessionId) {
   const s = String(sessionId || '').trim();
-  const cleaned = s.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 80);
-  return cleaned || 'default';
+  if (!s) return 'default';
+  const cleaned = s.replace(/[^A-Za-z0-9_-]/g, '-');
+  if (cleaned === s && s.length <= 80) return s;
+  const hash = crypto.createHash('sha1').update(s).digest('hex').slice(0, 8);
+  return `${cleaned.slice(0, 71)}-${hash}`;
 }
 
 function stateFilePath(stateDir, sessionId) {
@@ -80,11 +83,15 @@ function freshState(sessionId, transcriptPath, startEnabled) {
 }
 
 // 找不到就创建（幂等）。所有调用方都必须拿到一个可用 state，保证流程可继续。
+const tightenedDirs = new Set();
 function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   // 目录已存在时 mkdirSync 的 mode 不生效：state 目录含会话转录路径与审查计数，
-  // 历史遗留的宽权限目录在此收紧（失败不阻断——只读文件系统下尽力而为）。
-  try { fs.chmodSync(stateDir, 0o700); } catch (_) {}
+  // 历史遗留的宽权限目录在此收紧——每进程每目录一次即可（失败不阻断，尽力而为）。
+  if (!tightenedDirs.has(stateDir)) {
+    tightenedDirs.add(stateDir);
+    try { fs.chmodSync(stateDir, 0o700); } catch (_) {}
+  }
   const file = stateFilePath(stateDir, sessionId);
   if (!fs.existsSync(file)) {
     const created = freshState(sessionId, transcriptPath, startEnabled);
@@ -171,10 +178,7 @@ function saveState(file, state) {
     try {
       // state 含会话转录路径与审查计数：0600 落盘，不依赖 umask（历史版本曾含明文 key）。
       fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
-      fs.renameSync(tmp, file);
-      // rename 后文件 inode 来自 tmp（恒 0600）；此 chmod 是针对异常文件系统的
-      // 纵深防御（正常 POSIX 下为 no-op，失败静默不影响主流程）。
-      try { fs.chmodSync(file, 0o600); } catch (_) {}
+      fs.renameSync(tmp, file); // rename 后 inode 来自 tmp（唯一名新建，恒 0600），无需再 chmod
       return;
     } catch (err) {
       lastErr = err;
@@ -203,7 +207,7 @@ function createStateExclusive(file, state) {
       // 目标文件系统不支持硬链接（少数挂载/网络盘）：退回独占打开，语义相同。
       let fd = null;
       try {
-        fd = fs.openSync(file, 'wx');
+        fd = fs.openSync(file, 'wx', 0o600);
         fs.writeSync(fd, JSON.stringify(state, null, 2));
         created = true;
       } catch (err2) {
@@ -222,8 +226,7 @@ function createStateExclusive(file, state) {
   } finally {
     try { fs.unlinkSync(tmp); } catch (_) {}
   }
-  if (created) { try { fs.chmodSync(file, 0o600); } catch (_) {} }
-  return created;
+  return created; // link 继承 tmp 的 0600；wx 回退同样以 0600 创建
 }
 
 // 锁属主是否仍活着：**只有 ESRCH（进程不存在）算已死**，其余 errno 一律保守算活。
@@ -391,31 +394,52 @@ function listStatePaths(stateDir) {
   return entries.map((e) => e.full);
 }
 
+// 旁文件（留尸 .corrupt-* / 崩溃残留 .tmp-* / 残留锁 .wrlock、.lock）超过该龄即回收。
+// 1 天远超锁的陈旧阈值（wrlock 10s、审查锁 10min），不会误删活持有者；.corrupt-* 可能
+// 含 0.2.17 前的明文 key（stripLegacySecrets 只作用于正常读取路径），不能永久留盘。
+const SIDECAR_MAX_AGE_MS = 24 * 3600 * 1000;
+const SIDECAR_RE = /^sess-.*\.json\.(?:corrupt-\d+|tmp-.+|wrlock|lock)$/;
+
+// 写者正持有新鲜 .wrlock 的状态文件不删：否则 mutateStateExclusive 写回会让刚删的会话复活，
+// 或删在其读-改-写中途。
+function hasFreshWrLock(file, now) {
+  try { return now - fs.statSync(`${file}.wrlock`).mtimeMs <= 10000; } catch (_) { return false; }
+}
+
 // 家务清理：状态文件是纯计数器，过期即可删。
 function pruneStates(stateDir, maxAgeDays, keep) {
   const limitAge = (maxAgeDays || 7) * 24 * 3600 * 1000;
   const limitKeep = keep || 50;
-  let entries = [];
+  let names = [];
   try {
-    entries = fs.readdirSync(stateDir)
-      .filter((f) => /^sess-.*\.json$/.test(f))
-      .map((f) => {
-        const full = path.join(stateDir, f);
-        let mtime = 0;
-        try { mtime = fs.statSync(full).mtimeMs; } catch (_) {}
-        return { full, mtime };
-      });
+    names = fs.readdirSync(stateDir);
   } catch (_) {
     return;
   }
   const now = Date.now();
+  const mtimeOf = (full) => { try { return fs.statSync(full).mtimeMs; } catch (_) { return 0; } };
+  for (const f of names) {
+    if (!SIDECAR_RE.test(f)) continue;
+    const full = path.join(stateDir, f);
+    const mtime = mtimeOf(full);
+    if (mtime && now - mtime > SIDECAR_MAX_AGE_MS) {
+      try { fs.unlinkSync(full); } catch (_) {}
+    }
+  }
+  const entries = names
+    .filter((f) => /^sess-.*\.json$/.test(f))
+    .map((f) => {
+      const full = path.join(stateDir, f);
+      return { full, mtime: mtimeOf(full) };
+    });
   for (const e of entries) {
-    if (now - e.mtime > limitAge) {
+    if (now - e.mtime > limitAge && !hasFreshWrLock(e.full, now)) {
       try { fs.unlinkSync(e.full); } catch (_) {}
     }
   }
   const kept = entries.filter((e) => fs.existsSync(e.full)).sort((a, b) => b.mtime - a.mtime);
   for (const e of kept.slice(limitKeep)) {
+    if (hasFreshWrLock(e.full, now)) continue;
     try { fs.unlinkSync(e.full); } catch (_) {}
   }
 }

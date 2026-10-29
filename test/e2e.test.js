@@ -89,6 +89,35 @@ function waitUntil(fn, timeoutMs) {
   return fn();
 }
 
+// 「静默」断言：hook 是 fail-open（异常被吞、exit 0），只看 stdout 为空会把崩溃误判成静默。
+// 这里同时要求退出码 0、stderr 无逃逸的异常栈（顶层 catch 之外的崩溃会打栈到 stderr）。
+function assertSilent(r, msg) {
+  assert.strictEqual(r.status, 0, `hook 应正常退出（status=${r.status} stderr=${r.stderr}）`);
+  assert.doesNotMatch(r.stderr || '', /\b\w*Error\b[\s\S]*\n\s+at /, `stderr 不应含异常栈：${r.stderr}`);
+  assert.strictEqual(r.stdout.trim(), '', msg);
+}
+
+// 「全局只有官方内置通道 + 一个第三方网关」的服务商 fixture（注册行/doctor 会话口径用例共用）
+const OFFICIAL_PLUS_3P = {
+  'builtin:bigmodel': {
+    name: 'BigModel 官方', kind: 'openai',
+    options: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'sk-official' },
+    models: { 'glm-5.3': {} }
+  },
+  'prov-3p': {
+    name: '第三方网关', kind: 'openai-compatible',
+    options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-3p' },
+    models: { 'm-a': {} }
+  }
+};
+
+// 在 stateDir 下写一份 ZCode v2 服务商配置，返回路径（供 ZCODE_ADVISOR_ZCODE_CONFIG 使用）
+function writeZcodeCfg(stateDir, name, providers) {
+  const file = path.join(stateDir, name);
+  fs.writeFileSync(file, JSON.stringify({ provider: providers }));
+  return file;
+}
+
 test('core regression: providers 在零会话及多会话时均不触发状态门禁', (t) => {
   const { transcript, stateDir } = setup(t);
   const env = makeEnv(stateDir);
@@ -162,7 +191,7 @@ test('session-start 创建状态且无输出；resume 后注册标记重置', (t
   const env = makeEnv(stateDir);
   const r = runHook(['session-start'], { session_id: 's1', transcript_path: transcript }, env);
   assert.strictEqual(r.status, 0);
-  assert.strictEqual(r.stdout.trim(), '');
+  assertSilent(r);
   const state = readState(stateDir, 's1');
   assert.strictEqual(state.enabled, true);
   assert.strictEqual(state.pendingRegistration, true);
@@ -185,7 +214,7 @@ test('首条用户消息送达注册行（含脚本与状态文件路径）；�
   assert.ok(out.hookSpecificOutput.additionalContext.startsWith('[advisor]'));
   assert.ok(out.hookSpecificOutput.additionalContext.includes('状态文件'));
   const r2 = runHook(['user-prompt-submit'], { session_id: 's2', transcript_path: transcript, prompt: '继续' }, env);
-  assert.strictEqual(r2.stdout.trim(), '');
+  assertSilent(r2);
 });
 
 test('门禁失败：注册行与门禁提示仍然投递（命令通道不失联）', (t) => {
@@ -247,21 +276,7 @@ test('角标链路提示随注册行投递：down/waiting 各一句、attached �
 test('注册行门禁按会话生效值评估：全局无可用服务商 + 本会话已覆盖 → 不误报门禁未满足', (t) => {
   const { transcript, stateDir } = setup(t);
   // 全局：只有官方内置通道（审查不使用）→ 全局解析必然失败
-  const zcodeCfg = path.join(stateDir, 'zcode-official-only.json');
-  fs.writeFileSync(zcodeCfg, JSON.stringify({
-    provider: {
-      'builtin:bigmodel': {
-        name: 'BigModel 官方', kind: 'openai',
-        options: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'sk-official' },
-        models: { 'glm-5.3': {} }
-      },
-      'prov-3p': {
-        name: '第三方网关', kind: 'openai-compatible',
-        options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-3p' },
-        models: { 'm-a': {} }
-      }
-    }
-  }));
+  const zcodeCfg = writeZcodeCfg(stateDir, 'zcode-official-only.json', OFFICIAL_PLUS_3P);
   const env = makeEnv(stateDir, { ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg });
   const stateFile = path.join(stateDir, 'sess-ov.json');
   runHook(['session-start'], { session_id: 'ov', transcript_path: transcript }, env);
@@ -300,7 +315,7 @@ test('sync 模式：stop_hook_active=true（含字符串变体）时不重审不
   for (const active of [true, 'true', 1]) {
     const r = runHook(['stop'], { session_id: 's4', transcript_path: transcript, stop_hook_active: active }, env);
     assert.strictEqual(r.status, 0);
-    assert.strictEqual(r.stdout.trim(), '');
+    assertSilent(r);
   }
   const state = readState(stateDir, 's4');
   assert.strictEqual(state.reviews, 0);
@@ -321,7 +336,7 @@ test('sync 模式：冷却期内的 concern 降级为顺延，下条消息送达
     ZCODE_ADVISOR_MOCK_FRAME: '{"severity":"concern","note":"这里有个实质风险"}'
   });
   const r2 = runHook(['stop'], { session_id: 's5', transcript_path: transcript }, envConcern);
-  assert.strictEqual(r2.stdout.trim(), '');
+  assertSilent(r2);
   let state = readState(stateDir, 's5');
   assert.strictEqual(state.pendingNotes.length, 1);
   assert.ok(state.pendingNotes[0].startsWith('[advisor:concern:deferred]'));
@@ -340,7 +355,7 @@ test('async 模式：Stop 立即返回，worker 完成审查入队，下条消�
   });
   const r1 = runHook(['stop'], { session_id: 's6', transcript_path: transcript }, env);
   assert.strictEqual(r1.status, 0);
-  assert.strictEqual(r1.stdout.trim(), '');
+  assertSilent(r1);
   assert.ok(fs.existsSync(path.join(stateDir, 'sess-s6.json.lock')));
 
   const rw = runHook(['review-worker', '--state', path.join(stateDir, 'sess-s6.json')], null, env);
@@ -382,7 +397,7 @@ test('mock 非法帧与生产同口径：计入 unparsed', (t) => {
   });
   const r = runHook(['stop'], { session_id: 's7m', transcript_path: transcript }, env);
   assert.strictEqual(r.status, 0);
-  assert.strictEqual(r.stdout.trim(), '');
+  assertSilent(r);
   const state = readState(stateDir, 's7m');
   assert.strictEqual(state.dropped.unparsed, 1);
   assert.ok(state.byteOffset > 0); // 审查尝试完成即推进
@@ -394,7 +409,7 @@ test('async 模式：已有新鲜锁时计 busy 不叠加', (t) => {
   runHook(['session-start'], { session_id: 's7', transcript_path: transcript }, env);
   fs.writeFileSync(path.join(stateDir, 'sess-s7.json.lock'), '999999', 'utf8'); // 新鲜锁
   const r = runHook(['stop'], { session_id: 's7', transcript_path: transcript }, env);
-  assert.strictEqual(r.stdout.trim(), '');
+  assertSilent(r);
   const state = readState(stateDir, 's7');
   assert.strictEqual((state.dropped.busy || 0), 1);
 });
@@ -404,7 +419,7 @@ test('async 模式：全局在飞 worker 达上限时计 global_busy', (t) => {
   const env = makeEnv(stateDir, { ZCODE_ADVISOR_MAX_GLOBAL_WORKERS: '1' });
   fs.writeFileSync(path.join(stateDir, 'sess-other.json.lock'), '111', 'utf8'); // 别的会话在飞
   const r = runHook(['stop'], { session_id: 's12', transcript_path: transcript }, env);
-  assert.strictEqual(r.stdout.trim(), '');
+  assertSilent(r);
   const state = readState(stateDir, 's12');
   assert.strictEqual((state.dropped.global_busy || 0), 1);
 });
@@ -442,7 +457,7 @@ test('P0 回归：审查在飞时 /advisor-off 不被 worker 旧快照回滚', a
 
   const r = runHook(['stop'], { session_id: 's11', transcript_path: transcript }, envSpawn);
   assert.strictEqual(r.status, 0);
-  assert.strictEqual(r.stdout.trim(), '');
+  assertSilent(r);
 
   // 先确认审查真的在飞，再执行 /advisor-off：worker 只有越过 enabled 门禁才会发起 HTTP 请求，
   // 所以这个等待把「off 抢在 worker 读状态之前」的交错在构造上排除掉——本用例要测的是
@@ -551,16 +566,13 @@ test('ctl：多会话并存时拒绝无 --state 的操作（防误伤）', (t) =
 test('ctl doctor：体检输出配置链/门禁（无网络）', (t) => {
   const { stateDir } = setup(t);
   // 0.2.17：审查目标由 ZCode 第三方服务商解析——造一份最小可用服务商配置
-  const zcodeCfg = path.join(stateDir, 'zcode-v2.json');
-  fs.writeFileSync(zcodeCfg, JSON.stringify({
-    provider: {
-      'prov-3p': {
-        name: '第三方网关', kind: 'openai-compatible',
-        options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-doctor-key' },
-        models: { 'glm-5.3-flash': {} }
-      }
+  const zcodeCfg = writeZcodeCfg(stateDir, 'zcode-v2.json', {
+    'prov-3p': {
+      name: '第三方网关', kind: 'openai-compatible',
+      options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-doctor-key' },
+      models: { 'glm-5.3-flash': {} }
     }
-  }));
+  });
   const env = makeEnv(stateDir, { ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg });
   // 清掉 env 逃生舱 key，验证「key 完全来自服务商解析」这条主路径
   delete env.ZCODE_ADVISOR_API_KEY;
@@ -586,7 +598,7 @@ test('parse_empty：转录有完整行但零解析产率时留信号', (t) => {
 
   const env = makeEnv(stateDir, { ZCODE_ADVISOR_REVIEW_MODE: 'sync' });
   const r = runHook(['stop'], { session_id: 'pe', transcript_path: transcript }, env);
-  assert.strictEqual(r.stdout.trim(), '');
+  assertSilent(r);
   const state = readState(stateDir, 'pe');
   assert.strictEqual(state.dropped.parse_empty, 1);
   assert.ok(state.byteOffset > 0);
@@ -697,6 +709,13 @@ test('快照清理：保留窗口不小于并发 worker 数（不删在飞快照
 
   const nowSnap = path.join(snapDir, 'keepme.jsonl');
   assert.ok(fs.existsSync(nowSnap), '本轮快照必须存在（绝不能被自己触发的清理删掉）');
+  // 保留窗口 keep = max(10, maxGlobalWorkers(默认 4) + 6) = 10：11 个快照裁到 10 个，
+  // 只删最旧的 old-9；窗口必须 ≥ 并发 worker 上限
+  const left = fs.readdirSync(snapDir).filter((n) => n.endsWith('.jsonl'));
+  assert.strictEqual(left.length, 10, `应恰好保留 10 个快照：${JSON.stringify(left)}`);
+  assert.ok(left.length >= 4, '保留窗口不得小于并发 worker 上限');
+  assert.ok(!left.includes('old-9.jsonl'), '最旧的快照应被清理');
+  for (let i = 0; i < 9; i++) assert.ok(left.includes(`old-${i}.jsonl`), `较新的 old-${i} 应保留`);
 });
 
 // ---------------- 4a 心跳健康告警：失败连击在对话内喊一声 ----------------
@@ -756,7 +775,7 @@ test('4a 健康告警：升级阶梯——1h 内不重发，1h/3h/6h/24h 档依�
 
   // 1h 档拒绝：刚刚提醒过 → 无输出（注册行已消费、无意见、阶梯未到）
   const r2 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
-  assert.strictEqual(r2.stdout.trim(), '');
+  assertSilent(r2);
 
   // 1h 档通过：距上次 2h ≥ 1h → 第 2 次提醒
   backdate(2 * 3600 * 1000);
@@ -767,7 +786,7 @@ test('4a 健康告警：升级阶梯——1h 内不重发，1h/3h/6h/24h 档依�
   // 3h 档拒绝：距上次 2h < 3h → 不重发
   backdate(2 * 3600 * 1000);
   const r4 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
-  assert.strictEqual(r4.stdout.trim(), '');
+  assertSilent(r4);
 
   // 3h 档通过：距上次 3.5h → 第 3 次提醒；同时把停摆起点拨回 5h 前验证"停摆约 X 小时"
   backdate(3.5 * 3600 * 1000, (raw) => {
@@ -781,7 +800,7 @@ test('4a 健康告警：升级阶梯——1h 内不重发，1h/3h/6h/24h 档依�
   // 6h 档拒绝：距上次 4h < 6h → 不重发
   backdate(4 * 3600 * 1000);
   const r6 = runHook(['user-prompt-submit'], { session_id: 'h1', transcript_path: transcript, prompt: '继续' }, env);
-  assert.strictEqual(r6.stdout.trim(), '');
+  assertSilent(r6);
 
   // 6h 档通过：距上次 7h → 第 4 次提醒
   backdate(7 * 3600 * 1000);
@@ -813,7 +832,7 @@ test('4a 健康告警：count=2 不发；enabled=false 不发', (t) => {
 
   // count=2 低于阈值：不告警（注册行已消费、无意见 → 无输出）
   const r = runHook(['user-prompt-submit'], { session_id: 'h2', transcript_path: transcript, prompt: '继续' }, env);
-  assert.strictEqual(r.stdout.trim(), '');
+  assertSilent(r);
   assert.strictEqual(readState(stateDir, 'h2').healthNotifiedAt, '');
 
   // enabled=false：不告警（先凑满 3 次失败，再停用）
@@ -822,7 +841,7 @@ test('4a 健康告警：count=2 不发；enabled=false 不发', (t) => {
   const off = runHook(['ctl', 'off', '--state', path.join(stateDir, 'sess-h2.json')], null, env);
   assert.ok(off.stdout.includes('已停用'));
   const r2 = runHook(['user-prompt-submit'], { session_id: 'h2', transcript_path: transcript, prompt: '继续' }, env);
-  assert.strictEqual(r2.stdout.trim(), '');
+  assertSilent(r2);
   assert.strictEqual(readState(stateDir, 'h2').healthNotifiedAt, '');
 });
 
@@ -850,7 +869,7 @@ test('4a 健康告警：sync 成功审查后 failStreak 重置为 null，不再�
   assert.strictEqual(readState(stateDir, 'h3').failStreak, null);
 
   const r = runHook(['user-prompt-submit'], { session_id: 'h3', transcript_path: transcript, prompt: '继续' }, envOk);
-  assert.strictEqual(r.stdout.trim(), '');
+  assertSilent(r);
 });
 
 test('4a 健康告警：async worker 成功审查后 failStreak 同样清零', (t) => {
@@ -959,7 +978,7 @@ test('4a 恢复信号：告警过的会话恢复后下一次 UPS 喊一声（一
 
   // 一次性：再一轮 UPS 不再发恢复消息
   const r3 = runHook(['user-prompt-submit'], { session_id: 'h6', transcript_path: transcript, prompt: '继续' }, envOk);
-  assert.strictEqual(r3.stdout.trim(), '');
+  assertSilent(r3);
 });
 
 test('4a 恢复信号：从未告警过的会话不发恢复消息', (t) => {
@@ -980,7 +999,7 @@ test('4a 恢复信号：从未告警过的会话不发恢复消息', (t) => {
   runHook(['stop'], { session_id: 'h7', transcript_path: transcript }, envOk);
   assert.strictEqual(readState(stateDir, 'h7').healthRecoveryPending, false);
   const r = runHook(['user-prompt-submit'], { session_id: 'h7', transcript_path: transcript, prompt: '继续' }, envOk);
-  assert.strictEqual(r.stdout.trim(), '');
+  assertSilent(r);
 });
 
 test('4a 恢复信号作废：告警后恢复置标志、再次连败到阈值 → 发告警不发恢复行', (t) => {
@@ -1068,7 +1087,14 @@ test('M4 告警：低于阈值不喊；停摆与降级各自独立计数', (t) =
     primaryFailStreak: { reason: 'unparsed', count: 2, sinceTs: new Date().toISOString() }
   });
   const r = runHook(['user-prompt-submit'], { session_id: 'd2', transcript_path: '/nonexistent', prompt: 'x' }, env);
-  assert.strictEqual(r.stdout.trim(), '', '未达阈值不应有任何注入');
+  assertSilent(r, '未达阈值不应有任何注入');
+  // 正对照：同一构造仅把 count 提到阈值 3 → 必须喊（证明上面的「不喊」不是因为 UPS 路径整体失效）
+  writeStateForAlert(stateDir, 'd2b', {
+    primaryFailStreak: { reason: 'unparsed', count: 3, sinceTs: new Date().toISOString() },
+    fallbackLastModel: 'fb-model'
+  });
+  const rPos = runHook(['user-prompt-submit'], { session_id: 'd2b', transcript_path: '/nonexistent', prompt: 'x' }, env);
+  assert.ok(JSON.parse(rPos.stdout).hookSpecificOutput.additionalContext.includes('降级告警'), '达阈值应注入降级告警');
 });
 
 test('M4 告警：同时停摆与降级时只报停摆（避免两条告警刷屏）', (t) => {
@@ -1098,6 +1124,15 @@ test('M4 告警：曾到阈值但从未真正降级过（fallbackLastModel 空�
   const line = r.stdout ? (JSON.parse(r.stdout).hookSpecificOutput.additionalContext || '') : '';
   assert.ok(!line.includes('降级告警'), '没有备用模型在兜，不得宣称已降级');
   assert.ok(!line.includes('由备用模型'), '不得出现「由备用模型维持」的假安慰');
+  // 正对照：同样的连击，只要 fallbackLastModel 有值 → 必须出现「由备用模型维持」
+  writeStateForAlert(stateDir, 'd5b', {
+    primaryFailStreak: { reason: 'llm_http_404', count: 5, sinceTs: new Date().toISOString() },
+    fallbackLastModel: 'fb-model',
+    failStreak: null
+  });
+  const rPos = runHook(['user-prompt-submit'], { session_id: 'd5b', transcript_path: '/nonexistent', prompt: 'x' }, env);
+  const linePos = JSON.parse(rPos.stdout).hookSpecificOutput.additionalContext;
+  assert.ok(linePos.includes('降级告警') && linePos.includes('由备用模型'), `真正降级过时应喊降级：${linePos}`);
 });
 
 test('M4 告警：旧形状 state（无 M4 字段）升级后不炸', (t) => {
@@ -1117,21 +1152,7 @@ test('M4 告警：旧形状 state（无 M4 字段）升级后不炸', (t) => {
 test('ctl doctor --state：按会话生效值评估门禁（与 /advisor-status 同口径）', (t) => {
   const { transcript, stateDir } = setup(t);
   // 全局只有官方内置通道 → 全局体检必然报门禁未满足
-  const zcodeCfg = path.join(stateDir, 'zcode-official-only.json');
-  fs.writeFileSync(zcodeCfg, JSON.stringify({
-    provider: {
-      'builtin:bigmodel': {
-        name: 'BigModel 官方', kind: 'openai',
-        options: { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'sk-official' },
-        models: { 'glm-5.3': {} }
-      },
-      'prov-3p': {
-        name: '第三方网关', kind: 'openai-compatible',
-        options: { baseURL: 'http://10.0.0.8:8088/v1', apiKey: 'sk-3p' },
-        models: { 'm-a': {} }
-      }
-    }
-  }));
+  const zcodeCfg = writeZcodeCfg(stateDir, 'zcode-official-only.json', OFFICIAL_PLUS_3P);
   const env = makeEnv(stateDir, {
     ZCODE_ADVISOR_ZCODE_CONFIG: zcodeCfg,
     // 全局显式指向不可用的官方内置通道 → 全局解析必然失败（否则自动选择会挑中 prov-3p）

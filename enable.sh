@@ -85,10 +85,9 @@ printf '%s\n' "$UPDATE_OUT" | tail -1
 
 # 5) 安装插件（从刷新后的市场缓存安装）
 echo "── 安装插件 ──"
-if ! run_cli plugins install zcode-advisor 2>&1 | tail -2; then
-  echo "错误：插件安装失败（见上方输出）" >&2
-  exit 1
-fi
+INSTALL_OUT="$(run_cli plugins install zcode-advisor 2>&1)"; INSTALL_RC=$?
+printf '%s\n' "$INSTALL_OUT" | tail -2
+[ "$INSTALL_RC" -eq 0 ] || fail_step "插件安装（plugins install）"
 
 # 5) 启用（写入宿主 config.json 的 plugins 段）
 echo "── 启用插件 ──"
@@ -99,8 +98,13 @@ printf '%s\n' "$ENABLE_OUT" | tail -1
 # 6) 验证：宿主应报告 hooks(3)/mcp(config-bridge)/commands 已加载
 #    （若 cache 与源目录 md5 不一致，说明市场缓存未刷新成功）
 echo "── 验证 ──"
-run_cli plugins list 2>&1 | grep -A2 "zcode-advisor@" | head -3 || \
+# 先整体捕获再截取：管道里 `| head -3` 提前关闭会让上游 SIGPIPE，pipefail 下误报警告。
+LIST_HIT="$(run_cli plugins list 2>&1 | grep -A2 "zcode-advisor@")"
+if [ -n "$LIST_HIT" ]; then
+  printf '%s\n' "$LIST_HIT" | sed -n '1,3p'
+else
   echo "警告：未能从 plugins list 确认（请手动运行 plugins list 核对）" >&2
+fi
 
 # 7) 用户级行为配置模板（若尚无）；凭据由 ZCode 第三方服务商配置维护。
 CFG="$HOME/.zcode/advisor.config.json"

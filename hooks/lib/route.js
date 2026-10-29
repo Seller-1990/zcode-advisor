@@ -35,7 +35,7 @@ function decideAction(frame, state, cfg) {
 // 冷却语义（与 sync 的差异如实声明）：sync 在 block 真正发出时进入冷却；
 // async 在"入队成功"时进入冷却——入队后若会话终止未送达，冷却已消耗，
 // 这是无投递回执下的近似。deferred（冷却期内的 concern）不算送达、不进冷却。
-function decideActionAsync(frame, state, cfg) {
+function decideActionAsync(frame, state) {
   const severity = frame.severity;
   if (severity === 'none') return { deliver: 'none' };
 
@@ -63,12 +63,23 @@ function applyDeliveryToState(state, delivered, cfg) {
   }
 }
 
+// 意见正文自带严重级前缀（prefixFor 产出 `[advisor:<sev>]` / `[advisor:<sev>:deferred]`），
+// 据此识别 nit，无需另存严重级字段。
+const NIT_PREFIX_RE = /^\[advisor:nit(?::deferred)?\]/;
+const URGENT_PREFIX_RE = /^\[advisor:(?:concern|blocker)(?::deferred)?\]/;
+
 // 顺延入队。返回 false 表示队列已满被丢弃（调用方不得将其计为 steer/deferred）。
+// 队列满且新意见是 concern/blocker 时，挤掉最旧的一条 nit 给它让位（被挤掉的 nit 计 queue_overflow）；
+// 没有 nit 可挤或新意见本身不紧急时，照旧丢弃新意见。
 function enqueueNote(state, note, cfg, bumpDrop) {
   state.pendingNotes = Array.isArray(state.pendingNotes) ? state.pendingNotes : [];
   if (state.pendingNotes.length >= (cfg.pendingNotesCap || 5)) {
+    const evictAt = URGENT_PREFIX_RE.test(String(note))
+      ? state.pendingNotes.findIndex((n) => NIT_PREFIX_RE.test(String(n)))
+      : -1;
     if (typeof bumpDrop === 'function') bumpDrop('queue_overflow');
-    return false;
+    if (evictAt === -1) return false;
+    state.pendingNotes.splice(evictAt, 1);
   }
   state.pendingNotes.push(note);
   return true;

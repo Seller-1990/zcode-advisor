@@ -207,7 +207,7 @@ function writeUserConfig(guiValues, file, opts) {
         error: `配置文件内容不是 JSON 对象，拒绝自动写入以免丢失已有配置；请修复或删除该文件：${target}`
       };
     }
-    const merged = mergeUserConfig(existing || {}, values, Object.assign({}, opts, { conflicts, overwrites }));
+    const merged = mergeUserConfig(existing, values, Object.assign({}, opts, { conflicts, overwrites }));
     // 0.2.17：端点/key 只来自 ZCode 服务商，插件配置里的手动残留（apiKey/baseUrl/apiSource/
     // zcodeModel）写入时一并清除——留着会让用户误以为它们还在生效，且明文 key 是纯风险。
     for (const legacy of ['apiKey', 'baseUrl', 'apiSource', 'zcodeModel']) {
@@ -215,7 +215,7 @@ function writeUserConfig(guiValues, file, opts) {
     }
     // 无实际变化就不落盘：桥接进程每次会话启动都跑一遍，无谓改写会污染 mtime
     // 并让用户误以为配置被改动（排查 401 时正是靠 mtime 定位到本缺陷）。
-    if (JSON.stringify(merged) === JSON.stringify(existing || {})) {
+    if (JSON.stringify(merged) === JSON.stringify(existing)) {
       return { changed: false, file: target, conflicts, overwrites };
     }
     writeJsonAtomic(target, JSON.stringify(merged, null, 2));
@@ -289,6 +289,8 @@ function serveMcp() {
     }
   });
   process.stdin.on('end', () => process.exit(0));
+  // 宿主先关管道时 write 会异步抛 EPIPE：无监听器即未捕获异常，进程崩溃。
+  process.stdout.on('error', () => {});
 
   function send(obj) {
     try { process.stdout.write(JSON.stringify(obj) + '\n'); } catch (_) {}

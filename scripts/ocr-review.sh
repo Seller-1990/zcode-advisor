@@ -244,12 +244,16 @@ else
 fi
 # === 降级链区块结束 ===
 
-# 时间预算：防"建连后永久挂起"把整条链卡死（本机无 GNU timeout，见 run_with_deadline）。
+# 时间预算：防"建连后永久挂起"把整条链卡死（GNU timeout 可用则用，否则进程组兜底，见 run_with_deadline）。
 #   HOP_TIMEOUT  单跳上限。完整评审实测 5–15 分钟，900s 覆盖正常耗时，只掐挂起。
 #   TOTAL_BUDGET 整条链最长耗时。公开链条目多，按 6 跳封顶——再长会把
 #                .git/ocr-review.lock 占用到之后每次推送都被误判"已有评审在进行"。
 HOP_TIMEOUT="${OCR_REVIEW_HOP_TIMEOUT:-900}"
 TOTAL_BUDGET="${OCR_REVIEW_TOTAL_BUDGET:-5400}"
+# 非正整数（如 "15m"、空串、0）会让 run_with_deadline 的算术比较失效 → 等于没有超时。
+# 一律回落默认值并提示，不让一个手滑的环境变量把挂起保护悄悄关掉。
+case "$HOP_TIMEOUT" in ''|*[!0-9]*|0) echo "（OCR_REVIEW_HOP_TIMEOUT=${HOP_TIMEOUT} 非正整数，改用 900）" >&2; HOP_TIMEOUT=900 ;; esac
+case "$TOTAL_BUDGET" in ''|*[!0-9]*|0) echo "（OCR_REVIEW_TOTAL_BUDGET=${TOTAL_BUDGET} 非正整数，改用 5400）" >&2; TOTAL_BUDGET=5400 ;; esac
 CHAIN_START="$(date +%s)"
 
 # 上游限流与资产噪音的稳定参数（都是实测踩出来的教训，不是默认值拍脑袋）：
@@ -394,8 +398,8 @@ PYCHECK
 
 # hard deadline：给一条命令套"最多 secs 秒"的上限，超时整组终止（含孙进程）。
 #
-# 为什么不用 `timeout`：本机是 macOS + bash 3.2，没有 GNU coreutils 的 timeout，
-# 也没有 gtimeout（防止某天被装进来）。
+# 为什么不只用 `timeout`：macOS + bash 3.2 默认没有 GNU coreutils 的 timeout/gtimeout；
+# 有 GNU timeout 时优先用它（见下方探测），否则走下面的进程组兜底实现。
 # 为什么不用 `perl -e 'alarm N; exec @ARGV'`：alarm 只杀 perl 自己变出的那个进程，
 # ocr 派生的子进程会漏成孤儿。这里改用"自成进程组 + 整组 signale"：
 #   set -m 让后台任务成为组长（PGID == PID），超时时 kill -TERM -- -PID 全组带走。

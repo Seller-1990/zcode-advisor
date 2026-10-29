@@ -8,11 +8,22 @@ const path = require('path');
 
 process.env.NODE_ENV = 'test';
 process.env.ZCODE_ADVISOR_PANEL_NO_OPEN = '1';
-process.env.ZCODE_ADVISOR_PANEL_PORT = '8799';
+// 不用固定端口（并行/本机占用会撞车）：子进程临时 listen(0) 让内核分配空闲端口再交给面板。
+// setup-server 把 PORT=0 当成「未设置」回落默认值，故不能直接传 0；此处存在极小的
+// 释放→重绑竞态，面板自身的 EADDRINUSE 重试兜底，测试一律按 server.address() 取实际端口。
+process.env.ZCODE_ADVISOR_PANEL_PORT = require('child_process').execFileSync(process.execPath, ['-e',
+  "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port));s.close();})"
+], { encoding: 'utf8' }).trim();
 process.env.ZCODE_ADVISOR_USER_CONFIG = path.join(os.tmpdir(), `zcadv-panel-${Date.now()}`, 'advisor.config.json');
 
 const { guiValuesFromEnv, mergeUserConfig, writeUserConfig, USER_CONFIG } = require('../tools/config-bridge');
 const panelServer = require('../tools/setup-server.js');
+
+// 实际监听端口（重试后可能与请求端口不同）；listen 尚未完成时退回请求端口
+function base() {
+  const addr = panelServer.address();
+  return `http://127.0.0.1:${addr && addr.port ? addr.port : process.env.ZCODE_ADVISOR_PANEL_PORT}`;
+}
 
 test.after(() => {
   try {
@@ -144,7 +155,7 @@ test('配置面板 HTTP：页面与保存接口', async (t) => {
   // 先清掉可能存在的用户级配置，保证断言确定性
   try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
 
-  const baseUrl = 'http://127.0.0.1:8799';
+  const baseUrl = base();
   let up = false;
   for (let i = 0; i < 50 && !up; i++) {
     try {
@@ -154,7 +165,7 @@ test('配置面板 HTTP：页面与保存接口', async (t) => {
       await new Promise((r2) => setTimeout(r2, 100));
     }
   }
-  assert.ok(up, '面板应在 8799 端口就绪');
+  assert.ok(up, '面板应在测试端口就绪');
 
   const html = await (await fetch(baseUrl + '/')).text();
   assert.ok(html.includes('zcode-advisor 配置面板'));
@@ -186,7 +197,7 @@ test('配置面板 HTTP：一次保存恰好一次原子落盘（单次 RMW，�
     return origRename.call(fs, a, b);
   };
   try {
-    const saveRes = await (await fetch('http://127.0.0.1:8799/api/save', {
+    const saveRes = await (await fetch(base() + '/api/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: 'glm-5.3', maxTokens: 4096 })
@@ -213,7 +224,7 @@ test('guiValuesFromEnv：旧版端点/来源环境变量一律忽略（0.2.17 �
 
 test('配置面板 HTTP：只接受白名单键，旧版 apiSource/zcodeModel 被丢弃', async () => {
   try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
-  const res = await (await fetch('http://127.0.0.1:8799/api/save', {
+  const res = await (await fetch(base() + '/api/save', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ apiSource: 'zcode', zcodeProvider: 'prov-1', zcodeModel: 'm-1', apiSourceBad: 'x' })
@@ -236,7 +247,7 @@ test('配置面板 HTTP：/api/zcode-models 返回服务商模型清单（不含
   const origEnv = process.env.ZCODE_ADVISOR_ZCODE_CONFIG;
   process.env.ZCODE_ADVISOR_ZCODE_CONFIG = v2file;
   try {
-    const r = await (await fetch('http://127.0.0.1:8799/api/zcode-models', {
+    const r = await (await fetch(base() + '/api/zcode-models', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ providerId: 'prov1' })
@@ -253,7 +264,7 @@ test('配置面板 HTTP：/api/zcode-models 返回服务商模型清单（不含
 });
 
 test('配置面板页面：只有服务商/模型区，没有 API 来源分段', async () => {
-  const html = await (await fetch('http://127.0.0.1:8799/')).text();
+  const html = await (await fetch(base() + '/')).text();
   for (const marker of ['zcodeProvider', 'zcodeModel', '启用', '审查模式']) {
     assert.ok(html.includes(marker), `页面应包含 ${marker}`);
   }
@@ -266,7 +277,7 @@ test('配置面板页面：只有服务商/模型区，没有 API 来源分段',
 // —— 延期项 D1：/api/clear-key ——
 
 async function postJson(url, body) {
-  return fetch('http://127.0.0.1:8799' + url, {
+  return fetch(base() + url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body || {})
@@ -275,7 +286,7 @@ async function postJson(url, body) {
 
 test('配置面板 HTTP：clear-key 端点保留（清理旧版残留 key，幂等）', async () => {
   try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
-  const post = (url, body, origin) => fetch('http://127.0.0.1:8799' + url, {
+  const post = (url, body, origin) => fetch(base() + url, {
     method: 'POST',
     headers: Object.assign({ 'Content-Type': 'application/json' }, origin ? { Origin: origin } : {}),
     body: JSON.stringify(body || {})
@@ -283,7 +294,7 @@ test('配置面板 HTTP：clear-key 端点保留（清理旧版残留 key，幂�
 
   // 0.2.17：本插件不再维护 key，页面上没有「清除 key」按钮；
   // 端点保留只为清理历史遗留残留（升级用户的旧配置里可能还有明文 key）。
-  const html = await (await fetch('http://127.0.0.1:8799/')).text();
+  const html = await (await fetch(base() + '/')).text();
   assert.ok(!html.includes('id="apiKey"'), '页面不应再有 key 输入框');
 
   const r1 = await (await post('/api/clear-key', {})).json();
@@ -300,7 +311,7 @@ test('配置面板 HTTP：clear-key 端点保留（清理旧版残留 key，幂�
 });
 
 test('配置面板 HTTP：clear-key 拒绝非本机来源（403 JSON）', async () => {
-  const r = await fetch('http://127.0.0.1:8799/api/clear-key', {
+  const r = await fetch(base() + '/api/clear-key', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' },
     body: '{}'
@@ -314,7 +325,7 @@ test('配置面板 HTTP：clear-key 拒绝非本机来源（403 JSON）', async 
 test('配置面板 HTTP：clear-key 拒绝非 JSON body（400，不执行删除）', async () => {
   try { fs.unlinkSync(USER_CONFIG); } catch (_) {}
   fs.writeFileSync(USER_CONFIG, JSON.stringify({ apiKey: 'keep-me' }), 'utf8');
-  const r = await fetch('http://127.0.0.1:8799/api/clear-key', {
+  const r = await fetch(base() + '/api/clear-key', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: 'not-json{{'
@@ -361,7 +372,7 @@ test('配置面板页面：已保存的服务商不可用时显式提示（不�
   try {
     fs.mkdirSync(path.dirname(USER_CONFIG), { recursive: true });
     fs.writeFileSync(USER_CONFIG, JSON.stringify({ zcodeProvider: 'no-key' }), 'utf8');
-    const html = await (await fetch('http://127.0.0.1:8799/')).text();
+    const html = await (await fetch(base() + '/')).text();
     assert.ok(html.includes('no-key'), `应点名那个不可用的服务商：\n${html.slice(0, 500)}`);
     assert.ok(/缺 key|不可用/.test(html), '应说明原因（缺 key / 不可用）');
     assert.ok(/保存.*换|换成列表/.test(html), '应警示"不改动就保存会替换选择"');

@@ -99,7 +99,8 @@ function extractJsonObjectsLenient(text) {
 
 // 取文本中**最后一个**合法帧（normalizeFrame 校验：severity ∈ SEVERITIES，none 允许空 note）。
 // 主扫描无合法帧时走宽松回退。返回 normalizeFrame 结果或 null。
-function findLastFrame(text, maxNoteChars) {
+// objs 可由调用方传入已提取的主扫描结果（parseFrameDetailed 复用，免二次扫描）。
+function findLastFrame(text, maxNoteChars, objs) {
   const pick = (objs) => {
     for (let i = objs.length - 1; i >= 0; i--) {
       const f = normalizeFrame(objs[i], maxNoteChars);
@@ -107,7 +108,7 @@ function findLastFrame(text, maxNoteChars) {
     }
     return null;
   };
-  return pick(extractJsonObjects(text)) || pick(extractJsonObjectsLenient(text));
+  return pick(objs || extractJsonObjects(text)) || pick(extractJsonObjectsLenient(text));
 }
 
 // 返回 {frame, truncated} 或 null。truncated = note 因超上限被截断（失控信号，
@@ -121,8 +122,9 @@ function normalizeFrame(obj, maxNoteChars) {
   // 单条建议统一码点上限：JSON 帧路径此前无任何截断，失控模型可向主会话注入超长内容。
   let truncated = false;
   if (note) {
-    const chars = Array.from(note);
-    if (chars.length > maxNoteChars) { note = `${chars.slice(0, maxNoteChars).join('')}…`; truncated = true; }
+    const clipped = truncateCodePoints(note, maxNoteChars);
+    truncated = clipped !== note;
+    note = clipped;
   }
   return { frame: { severity, note }, truncated };
 }
@@ -159,12 +161,13 @@ function parseFrameDetailed(text, proseFallback, opts) {
   // 从包裹文本中提取全部候选帧，取**最后一个**合法帧（模型自我纠正语义；
   // max-of-N 会放大转录注入面，见安全复审）。
   // 不取 severity 最高者——max-of-N 会保证转录中注入的对抗帧必然压过模型真实判定。
-  const last = findLastFrame(raw, maxNoteChars);
+  const embedded = extractJsonObjects(raw); // 只扫描一次：取帧与「有 JSON 形状」判定共用
+  const last = findLastFrame(raw, maxNoteChars, embedded);
   if (last) {
     return { frame: last.frame, from: 'json-embedded', truncated: last.truncated };
   }
   // 有 JSON 形状的内容但全部非法：判定 unparsed，不做散文救回（半截 JSON 不注入会话）。
-  if (extractJsonObjects(raw).length > 0 || /^\s*[[{]/.test(raw)) return { frame: null, from: null, truncated: false };
+  if (embedded.length > 0 || /^\s*[[{]/.test(raw)) return { frame: null, from: null, truncated: false };
 
   if (proseFallback) {
     const f = salvageProse(raw, maxNoteChars);
@@ -195,9 +198,16 @@ function salvageProse(text, noteChars) {
   return { severity: 'nit', note };
 }
 
+// 按 Unicode 码点截断（不劈开 emoji/代理对）。超过上限时追加 …。
+// 每个码点至多 2 个 UTF-16 单元：length <= max 必不超限（快路径）；
+// 否则只对前 2*max+2 个单元做 Array.from，避免超长文本整体展开（失败路径性能）。
 function truncateCodePoints(text, max) {
-  const chars = Array.from(String(text || ''));
-  if (chars.length <= max) return chars.join('');
+  const s = String(text || '');
+  if (s.length <= max) return s;
+  // 前 2*max+2 个单元至少含 max+1 个码点；末尾若劈开代理对，该残片位于下标 >= max，不会被保留。
+  const head = s.length > 2 * max + 2 ? s.slice(0, 2 * max + 2) : s;
+  const chars = Array.from(head);
+  if (chars.length <= max) return s; // 仅 head === s 时可达
   return `${chars.slice(0, max).join('')}…`;
 }
 
@@ -305,6 +315,9 @@ const ANTHROPIC_VERSION = '2023-06-01';
 // 预算（见 callReviewer 内注释），只有 Anthropic 通道用到该值；配置缺省时的兜底。
 const ANTHROPIC_DEFAULT_MAX_TOKENS = 4096;
 
+// 响应体上限：被劫持/失控端点可回传无界 body，整块进内存再 JSON.parse 会拖垮 hook 进程。
+const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+
 // Anthropic /v1/messages 响应解析：正文在 content[] 的 text 块里，
 // 与 OpenAI 的 choices[0].message.content 完全不同（不解析会 100% 空响应）。
 //
@@ -387,7 +400,7 @@ function normalizeFinishReason(raw) {
 // 重试只使用剩余预算，否则 sync 模式下"首次响应慢 + 重试全额"会突破 Stop hook 的 320s 硬限，
 // 复活"强杀→指针不推进→每轮重审"的停滞循环。
 async function callReviewer(params) {
-  const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, signal, protocol, deadline: deadlineParam } = params;
+  const { baseUrl, model, apiKey, systemPrompt, userContent, maxTokens, temperature, timeoutMs, protocol, deadline: deadlineParam } = params;
   const endpoint = normalizeChatEndpoint(baseUrl);
 
   // 截止时间可由调用方传入：一轮审查内的多次调用（尤其"空响应重试"）必须共享同一预算。
@@ -402,20 +415,24 @@ async function callReviewer(params) {
   // 慢滴流的 body 读取不受 deadline 约束 → 单轮突破预算 → worker 锁被判陈旧 → 同会话双开
   // （A2 同族停滞）。body 消费统一经 consumeBody：超时中止归类 llm_timeout，用完即拆定时器。
   let bodyGuard = null;
+  let lastController = null; // disarm 后仍可判定「是否被我们的截止定时器中止」
   const armGuard = (budgetMs) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), Math.max(1000, budgetMs));
-    if (signal) signal.addEventListener('abort', () => controller.abort(), { once: true });
     bodyGuard = { timer, controller };
+    lastController = controller;
   };
   const disarmGuard = () => {
     if (bodyGuard) { clearTimeout(bodyGuard.timer); bodyGuard = null; }
   };
+  // 超时判定看中止信号/截止时间本身，不看错误文本（String(err).includes('abort') 会把
+  // 含 abort 字样的普通网络错误误归 llm_timeout）。
+  const timedOut = () => Boolean(lastController && lastController.signal.aborted) || remaining() <= 0;
   const consumeBody = async (promise) => {
     try {
       return { ok: true, value: await promise };
     } catch (err) {
-      if (err && (err.name === 'AbortError' || String(err).includes('abort'))) return { ok: false };
+      if (timedOut()) return { ok: false };
       throw err;
     } finally {
       disarmGuard();
@@ -496,9 +513,7 @@ async function callReviewer(params) {
     try {
       resp = await attempt(remaining());
     } catch (err) {
-      if (err && (err.name === 'AbortError' || String(err).includes('abort'))) {
-        return { error: 'llm_timeout' };
-      }
+      if (timedOut()) return { error: 'llm_timeout' };
       return { error: 'llm_error', detail: String(err).slice(0, 200) };
     }
     if ((resp.status === 429 || resp.status >= 500) && tries === 0) {
@@ -518,10 +533,29 @@ async function callReviewer(params) {
     return { error: `llm_http_${resp.status}`, detail: String(r.value).slice(0, 200) };
   }
 
+  // 响应体大小上限：失控/被劫持端点可回超大 body 撑爆内存。content-length 超限直接拒；
+  // 否则读 text 后按长度复核（无 content-length / 分块传输时兜底）。
+  const lenHeader = resp.headers && typeof resp.headers.get === 'function' ? Number(resp.headers.get('content-length')) : NaN;
+  if (Number.isFinite(lenHeader) && lenHeader > MAX_RESPONSE_BYTES) {
+    if (bodyGuard) bodyGuard.controller.abort(); // 不读的 body 中止，释放连接
+    disarmGuard();
+    return { error: 'llm_error', detail: `response_too_large: content-length=${lenHeader}` };
+  }
+
   try {
-    const parsed = await consumeBody(resp.json());
-    if (!parsed.ok) return { error: 'llm_timeout' };
-    const data = parsed.value;
+    let data;
+    if (typeof resp.text === 'function') {
+      const r = await consumeBody(resp.text());
+      if (!r.ok) return { error: 'llm_timeout' };
+      const raw = String(r.value == null ? '' : r.value);
+      if (raw.length > MAX_RESPONSE_BYTES) return { error: 'llm_error', detail: `response_too_large: length=${raw.length}` };
+      data = JSON.parse(raw);
+    } else {
+      // 仅测试桩可能缺 text()；真实 fetch Response 必有。
+      const parsed = await consumeBody(resp.json());
+      if (!parsed.ok) return { error: 'llm_timeout' };
+      data = parsed.value;
+    }
     // Anthropic 响应结构与 OpenAI 完全不同（content[] 文本块 + stop_reason/input_tokens），
     // 交给专门的分支解析——走 OpenAI 分支会 100% 判成空响应。
     if (anthropic) return extractAnthropicResult(data);
@@ -634,8 +668,7 @@ function classifyProbeResult(res, cfg) {
   }
   const det = parseFrameDetailed(res.text, cfg.proseFallback !== false, { maxNoteChars: cfg.maxNoteChars });
   if (!det.frame) return { ok: false, reason: 'unparsed', severity: '' };
-  if (!SEVERITIES.includes(det.frame.severity)) return { ok: false, reason: 'bad_severity', severity: '' };
-  if (det.frame.severity !== 'none' && !String(det.frame.note || '').trim()) return { ok: false, reason: 'empty_note', severity: det.frame.severity };
+  // 判据 3/4（severity 合法、非 none 时 note 非空）由 normalizeFrame / salvageProse 保证，无需重复判定。
   if (det.truncated) return { ok: false, reason: 'note_truncated', severity: det.frame.severity };
   if (det.from === 'prose') return { ok: false, reason: 'prose_only', severity: det.frame.severity };
   return { ok: true, reason: '', severity: det.frame.severity };

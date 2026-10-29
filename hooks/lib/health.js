@@ -13,6 +13,7 @@
 // - **原子写**：tmp + rename，防读到半截 JSON；目录 0700 / 文件 0600（含会话 id 与模型名）。
 // - **绝不抛错**：信标是辅助功能，任何失败只静默返回，绝不影响主流程（与 history 同纪律）。
 
+const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -26,10 +27,14 @@ function resolveHealthDir(env) {
   return path.join(os.homedir(), '.zcode');
 }
 
+// 与 state.js sanitizeSessionId 同一规则：干净 id 原样，被改写/截断时追加 8 位 sha1 防碰撞。
 function sanitizeId(sessionId) {
   const s = String(sessionId || '').trim();
-  const cleaned = s.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 80);
-  return cleaned || 'default';
+  if (!s) return 'default';
+  const cleaned = s.replace(/[^A-Za-z0-9_-]/g, '-');
+  if (cleaned === s && s.length <= 80) return s;
+  const hash = crypto.createHash('sha1').update(s).digest('hex').slice(0, 8);
+  return `${cleaned.slice(0, 71)}-${hash}`;
 }
 
 function beaconPath(dir, sessionId) {
@@ -48,18 +53,24 @@ function readBeaconFile(file) {
 // worker 再写 result，若 result 用整对象覆盖会丢掉 attempt（反之亦然）。
 // rename 在 Windows 上可能被索引器/杀毒临时占用（EPERM），故做有限重试（与 state.js 同策略）；
 // 写 tmp 失败时 unlink 残留 tmp，避免反复失败累积垃圾文件。
+const tightenedDirs = new Set();
+
 function mergeBeacon(file, patch) {
   const dir = path.dirname(file);
   try {
     // 目录存在则跳过 mkdir（热路径：每次写都 mkdir 无谓损耗）；不存在再建并补 0700。
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    } else {
-      try { fs.chmodSync(dir, 0o700); } catch (_) {} // 历史目录可能是 0755，补正（文件名含会话 id）
+      tightenedDirs.add(dir);
+    } else if (!tightenedDirs.has(dir)) {
+      // 历史目录可能是 0755，每进程补正一次即可（文件名含会话 id）
+      tightenedDirs.add(dir);
+      try { fs.chmodSync(dir, 0o700); } catch (_) {}
     }
     const prev = readBeaconFile(file) || {};
     const next = Object.assign({}, prev, patch);
-    const tmp = `${file}.tmp-${process.pid}`;
+    // 唯一 tmp 名：保证 mode 0600 在新建时生效（rename 后无需再 chmod）。
+    const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
     try {
       fs.writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
     } catch (e) {
@@ -70,12 +81,11 @@ function mergeBeacon(file, patch) {
     for (let i = 0; i < 4; i++) {
       try { fs.renameSync(tmp, file); lastErr = null; break; } catch (e) {
         lastErr = e;
-        // 忙等退避：Atomic 的 sleepSync 优先，退回同步自旋（不与主流程引入异步）
-        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); } catch (_) {}
+        // 同步退避（Node>=22 主线程 Atomics.wait 恒可用；不与主流程引入异步）
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
       }
     }
     if (lastErr) { try { fs.unlinkSync(tmp); } catch (_) {} return null; }
-    try { fs.chmodSync(file, 0o600); } catch (_) {}
     return next;
   } catch (_) {
     return null;
@@ -177,6 +187,14 @@ function pruneBeacons(dir, maxAgeDays, keep) {
   for (const e of kept.slice(limitKeep)) {
     try { fs.unlinkSync(e.full); } catch (_) {}
   }
+  // 崩溃/rename 失败残留的 tmp 旁文件：超过 1 天必然无人在写，回收。
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (!/^advisor-health-.*\.json\.tmp-/.test(f)) continue;
+      const full = path.join(dir, f);
+      try { if (now - fs.statSync(full).mtimeMs > 24 * 3600 * 1000) fs.unlinkSync(full); } catch (_) {}
+    }
+  } catch (_) {}
 }
 
 // 陈旧阈值：一个正常运行的慢审查最坏生命周期 = reviewBudgetMs，取 2× 与 10 分钟的下界，

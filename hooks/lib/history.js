@@ -41,9 +41,14 @@ function appendHistory(event) {
     const record = Object.assign({ ts: new Date().toISOString() }, event);
     // 目录 0o700 / 文件 0o600：历史含意见正文（可能引用源码片段），仅属主可读。
     // 与转录快照同等级别处理（快照已 0o600，历史曾遗漏——安全复审指出）。
-    fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true, mode: 0o700 });
+    // mkdir + 收紧权限每进程一次即可（热路径不重复 syscall）。
+    if (!prepared) {
+      fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(HISTORY_FILE, '', { encoding: 'utf8', mode: 0o600 });
+      try { fs.chmodSync(HISTORY_FILE, 0o600); } catch (_) {} // 历史遗留宽权限文件补正
+      prepared = true;
+    }
     fs.appendFileSync(HISTORY_FILE, JSON.stringify(record) + '\n', { encoding: 'utf8', mode: 0o600 });
-    try { fs.chmodSync(HISTORY_FILE, 0o600); } catch (_) {}
     trimIfNeeded();
     return true;
   } catch (_) {
@@ -60,8 +65,13 @@ function appendHistory(event) {
 //   2) 再从「裁剪前读到的字节数」偏移处，把期间被并发追加的尾巴补读并 append 到临时文件；
 //   3) rename 原子替换（与 state.js 的写盘口径一致）。
 // 残余窗口（如实披露，未声称竞态已消除）：最后一次补读与 rename 之间新追加的记录仍会丢。
+let prepared = false;
+// 最短记录 `{"ts":"<24 字符 ISO>"}\n` = 33 字节：文件小于 上限×33 时行数不可能超限，免读全文件。
+const TRIM_MIN_BYTES = HISTORY_MAX_LINES * 33;
+
 function trimIfNeeded() {
   try {
+    if (fs.statSync(HISTORY_FILE).size <= TRIM_MIN_BYTES) return;
     const raw = fs.readFileSync(HISTORY_FILE, 'utf8');
     const lines = raw.split('\n').filter(Boolean);
     if (lines.length <= HISTORY_MAX_LINES) return;

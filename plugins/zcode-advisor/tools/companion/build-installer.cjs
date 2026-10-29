@@ -336,7 +336,10 @@ function runNsisInChildProcess(o) {
     process.stdout.write(JSON.stringify(r));
   `;
   try {
-    const out = execFileSync(process.execPath, ['-e', runner], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    // 宽松超时（15 分钟，大于子进程内 makensis 自身的 10 分钟）：防止 makensis 挂起拖死整个构建。
+    const out = execFileSync(process.execPath, ['-e', runner], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15 * 60 * 1000, killSignal: 'SIGKILL',
+    });
     return JSON.parse(out.trim() || '{}');
   } catch (err) {
     const stderr = String((err && err.stderr) || '').trim().slice(0, 200);
@@ -669,7 +672,10 @@ async function main() {
         if (fs.existsSync(to)) fs.rmSync(to, { recursive: true, force: true }); // 覆盖上上次同名产物
         fs.renameSync(from, to);
         moved++;
-      } catch (_) { /* 跨设备或占用：跳过，不阻断构建 */ }
+      } catch (err) {
+        // 跨设备或占用：跳过，不阻断构建，但要让人看见（否则旧产物会残留在 dist/ 混入本次结果）
+        warn(`无法移入 dist/.previous/：${f}（${String(err && err.message).slice(0, 120)}）`);
+      }
     }
     if (moved > 0) log(`上次产物 ${moved} 项已移入 dist/.previous/`);
   }
