@@ -315,7 +315,8 @@ details summary:hover{color:#e6e8ec}
     btn.setAttribute('data-zca-wired', '1');
     btn.addEventListener('click', () => {
       // 索引从自身 id 末位解析，而非闭包捕获——列表重排后仍指向当前那一条。
-      const m = /(\d+)$/.exec(String(btn.id || ''));
+      // 注意：本脚本位于反引号模板字面量内，单反斜杠转义会被吞（反斜杠+d 变成 d），故用 [0-9]。
+      const m = /([0-9]+)$/.exec(String(btn.id || ''));
       submitUserAction(m ? parseInt(m[1], 10) : -1, action);
     });
   }

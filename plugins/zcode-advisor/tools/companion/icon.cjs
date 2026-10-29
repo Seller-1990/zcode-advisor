@@ -262,8 +262,9 @@ function makeIco() {
   let off = 6 + entries.length * 16;
   entries.forEach((e, i) => {
     const base = 6 + i * 16;
-    dir[base] = e.size % 256; dir[base + 1] = 0;      // 宽（256 记为 0）
-    dir[base + 2] = e.size % 256; dir[base + 3] = 0;  // 高
+    dir[base] = e.size % 256;                          // 宽（256 记为 0）
+    dir[base + 1] = e.size % 256;                      // 高（256 记为 0）
+    dir[base + 2] = 0; dir[base + 3] = 0;              // colorCount（32bpp 无调色板）/ 保留
     dir.writeUInt16LE(1, base + 4);                    // 调色板数
     dir.writeUInt16LE(32, base + 6);                   // bitcount
     dir.writeUInt32LE(e.data.length, base + 8);

@@ -111,8 +111,26 @@ Section "Uninstall"
   DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ZCodeAdvisor"
   DeleteRegKey HKCU "Software\\ZCodeAdvisor"
   ; 卸载保留用户级配置 %USERPROFILE%\\.zcode\\advisor.config.json（含 API key，不静默删除）
-  RMDir /r "$INSTDIR"
+  ; 递归删除仅限以 \\ZCodeAdvisor 结尾的目录：MUI_PAGE_DIRECTORY 允许手输任意路径，
+  ; 旧版无条件 RMDir /r 会把用户手输的既有目录（如 D:\\Tools）整个删掉。
+  StrCpy $0 "$INSTDIR" "" -13
+  StrCmp $0 "\\ZCodeAdvisor" zca_rm_tree zca_rm_safe
+  zca_rm_tree:
+    RMDir /r "$INSTDIR"
+    Goto zca_rm_done
+  zca_rm_safe:
+    Delete "$INSTDIR\\uninstall.exe"
+    RMDir "$INSTDIR"
+  zca_rm_done:
 SectionEnd
+
+; 安装目录必须以 \\ZCodeAdvisor 结尾（不满足时「下一步」不可用）：
+; 保证卸载的递归删除永远只落在本产品专属目录上。
+Function .onVerifyInstDir
+  StrCpy $0 "$INSTDIR" "" -13
+  StrCmp $0 "\\ZCodeAdvisor" +2 0
+    Abort
+FunctionEnd
 `;
 }
 

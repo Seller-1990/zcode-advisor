@@ -104,10 +104,15 @@ function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
         s.transcriptPath = transcriptPath;
         s.byteOffset = 0;
         s.lastHeadHash = '';
-      });
+      }, { sessionId, transcriptPath, startEnabled });
       return { state: updated || state, file, created: false };
     }
     return { state, file, created: false };
+  }
+  if (current.status === 'error') {
+    // IO 错误（EACCES/EBUSY 等）：盘上很可能是一份完好的真实状态（含「关闭」与计数），
+    // 绝不以空状态覆盖——与 mutateStateExclusive 同口径。只返回内存态供流程继续，不落盘。
+    return { state: freshState(sessionId, transcriptPath, startEnabled), file, created: false, readError: current.detail || 'error' };
   }
   if (current.status === 'corrupt') {
     // 损坏的 state：先留尸（保留排查线索），再重建。
@@ -115,11 +120,14 @@ function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
       fs.renameSync(file, `${file}.corrupt-${Date.now()}`);
     } catch (_) {}
   }
-  // status === 'missing'（existsSync 之后被对手删掉）或 'error'（读错误）：重建，
-  // 失败则由 saveState 抛出，由调用方降级。
+  // status === 'missing'（existsSync 之后被对手删掉）或 'corrupt'（已留尸）：同样走排他创建，
+  // 窗口内对手先建则采纳对手的状态；写失败由 createStateExclusive 抛出，由调用方降级。
   const state = freshState(sessionId, transcriptPath, startEnabled);
-  saveState(file, state);
-  return { state, file, created: true };
+  if (createStateExclusive(file, state)) return { state, file, created: true };
+  const theirs = loadStateDetailed(file);
+  if (theirs.status === 'ok') return { state: theirs.state, file, created: false };
+  // 对手的文件也读不出来：不再重试/覆盖，内存态兜底。
+  return { state, file, created: false, readError: theirs.status };
 }
 
 function loadState(file) {
@@ -253,7 +261,11 @@ function withExclusiveLock(lockFile, fn, opts) {
       fs.writeFileSync(lockFile, myPid, { flag: 'wx' });
       got = true;
       break;
-    } catch (_) {
+    } catch (err) {
+      // 只有 EEXIST（锁被他人持有）值得重试；ENOENT（目录不存在）/EACCES 等重试也不会好转，
+      // 空转 retries×25ms≈1s 只会拖慢 hook——直接失败，由调用方降级。
+      // EPERM/EBUSY 例外：Windows 下锁文件「删除挂起」期间 'wx' 会短暂报这两个码，属可恢复竞争。
+      if (!err || !['EEXIST', 'EPERM', 'EBUSY'].includes(err.code)) return null;
       // 陈旧判定 = mtime 超 staleMs（原规则）**或属主进程已死**（R24：崩溃/被 KILL 的持锁者残留）。
       // 只看 mtime 会让残留锁把随后 staleMs(默认 10s) 内的所有写挡在门外，而重试预算只有
       // retries×25ms≈1s ⇒ 写全部返回 null 被静默丢弃（实测：属主已死的残留锁 1140ms 后丢写、
@@ -302,16 +314,32 @@ function withExclusiveLock(lockFile, fn, opts) {
 // 写前后都校验锁属主：慢持有者（杀毒/索引器拖慢 IO）被对手按陈旧抢锁后，
 // 原持有者不得再写回（否则双写者复活，丢更新回归）。
 // 拿不到锁/属主丢失返回 null，由调用方决定降级（意见保留到下一轮）。
+// opts 除锁参数外可带 { sessionId, transcriptPath, startEnabled }：文件缺失/损坏需重建时使用。
+// 未给 sessionId 时从文件名 sess-<id>.json 反推；未给 startEnabled 时沿用旧默认（启用）——
+// 调用方应传 cfg.startEnabled，否则被 prune 掉的会话会以「启用」复活。
+function sessionIdFromFile(file) {
+  const m = /^sess-(.*)\.json$/.exec(path.basename(file));
+  return m ? m[1] : '';
+}
+
+// 进程级重建默认值：hook 每个进程只服务一份配置，入口 loadConfig 后调用一次，
+// 免得 30 处调用点逐个透传 startEnabled。
+let rebuildStartEnabled;
+function setRebuildDefaults({ startEnabled } = {}) { rebuildStartEnabled = startEnabled; }
+
 function mutateStateExclusive(file, fn, opts) {
+  const o = opts || {};
+  const startEnabled = o.startEnabled !== undefined ? o.startEnabled : rebuildStartEnabled;
+  const rebuild = () => freshState(o.sessionId || sessionIdFromFile(file), o.transcriptPath || '', startEnabled);
   return withExclusiveLock(`${file}.wrlock`, (ownLock) => {
     const r = loadStateDetailed(file);
     let state;
     if (r.status === 'ok') state = r.state;
-    else if (r.status === 'missing') state = freshState('', '', true);
+    else if (r.status === 'missing') state = rebuild();
     else if (r.status === 'corrupt') {
       // 与 ensureState 同口径：留尸后重建，不清空真实数据还不留痕迹。
       try { fs.renameSync(file, `${file}.corrupt-${Date.now()}`); } catch (_) {}
-      state = freshState('', '', true);
+      state = rebuild();
     } else {
       return null; // IO 错误：绝不以空状态覆盖
     }
@@ -514,5 +542,5 @@ function countLocks(stateDir, staleMs) {
 module.exports = {
   ensureState, loadState, loadStateDetailed, saveState, mutateStateExclusive, withExclusiveLock, latestStatePath, listStatePaths, stateFilePath,
   sanitizeSessionId, pruneStates, bumpDrop, bumpPrimaryFailStreak, isFailStreakReason, freshState, createLock, clearLock, clearLockIfOwner,
-  lockPathFor, countLocks, admitGlobalWorker, sleepSync, lockOwnerAlive, readLockOwner
+  lockPathFor, countLocks, admitGlobalWorker, sleepSync, lockOwnerAlive, readLockOwner, setRebuildDefaults
 };

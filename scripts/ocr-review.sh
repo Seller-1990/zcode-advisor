@@ -73,13 +73,19 @@ release_lock() {
   if [ -z "$LOCK_OWNER" ] || [ "$LOCK_OWNER" = "$$" ]; then
     rm -rf "$LOCK_DIR"
   fi
+  # 幂等：释放过一次就不再碰锁目录（避免二次调用误删之后别人新建的锁）。
+  LOCK_ACQUIRED=""
 }
 # OCR_REVIEW_FORCE=1 可绕过（需要并行评审时显式指定）
 if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     LOCK_ACQUIRED=1
     printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
-    trap release_lock EXIT INT TERM
+    # EXIT 与信号分开：`trap f EXIT INT TERM` 时 bash 收到 INT/TERM 只跑 f 然后**继续执行**
+    # 后续脚本（bash 3.2 实测 rc=0）。信号处理只负责以 128+N 退出，清理统一交给 EXIT trap。
+    trap release_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
   else
     HOLD_PID=""
     [ -f "$LOCK_INFO" ] && HOLD_PID="$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)"
@@ -93,7 +99,11 @@ if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
     echo "[ocr-review] 发现陈旧锁（pid ${HOLD_PID:-未知} 已退出），接管"
     LOCK_ACQUIRED=1
     printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
-    trap release_lock EXIT INT TERM
+    # EXIT 与信号分开：`trap f EXIT INT TERM` 时 bash 收到 INT/TERM 只跑 f 然后**继续执行**
+    # 后续脚本（bash 3.2 实测 rc=0）。信号处理只负责以 128+N 退出，清理统一交给 EXIT trap。
+    trap release_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
   fi
 fi
 
@@ -283,7 +293,11 @@ ATTEMPT_LOG=""
 #   - `$CHOSEN` 非空 = 确有一跳产出完整评审。**不能**只看 OUT_JSON 非空：链全失败时
 #     OUT_JSON 里留着最后一跳的 partial/无效输出，照拷会把上一份好结论覆盖成半成品。
 #   - 命中锁而提前退出的进程根本走不到这里（锁检查在 OUT_JSON 创建之前）。
+CLEANUP_DONE=""
 cleanup() {
+  # 幂等：只执行一次（信号 → exit → EXIT trap 的链路下也不会重复发布/删除）。
+  [ -z "$CLEANUP_DONE" ] || return 0
+  CLEANUP_DONE=1
   if [ -n "${OCR_REVIEW_RAW_OUT:-}" ] && [ -n "${CHOSEN:-}" ]; then
     # 这里不再检查 OUT_JSON 非空：$CHOSEN 只在 valid_output 通过后赋值，而 valid_output
     # 首行就是 [ -s "$OUT_JSON" ]，故「CHOSEN 非空」已蕴含「有完整评审可拷」。
@@ -329,7 +343,10 @@ cleanup() {
   # 只看 LOCK_ACQUIRED 则会在「已被接管」时误删接管者的锁。
   release_lock
 }
-trap cleanup EXIT INT TERM
+# 同上：信号只负责以 130/143 退出，cleanup 由 EXIT trap 执行恰好一次。
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # 判定一次尝试是否真正成功：退出码为 0 **且** 评审确实完整完成。
 #

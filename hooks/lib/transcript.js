@@ -120,9 +120,20 @@ function readDelta(transcriptPath, byteOffset, opts) {
     }
     while (true) {
       const nl = buf.indexOf(10, pos);
-      if (nl === -1) break; // 残行：不消费
-      let lineBuf = buf.subarray(pos, nl);
-      pos = nl + 1;
+      let lineBuf;
+      if (nl === -1) {
+        // 残行默认不消费。options.final（快照模式：文件已写完、不会再追加）时，
+        // 末行无换行但可完整解析 JSON 的视为完整行消费——否则最新一条回复永远审不到。
+        if (!options.final || pos >= buf.length) break;
+        const tail = buf.subarray(pos).toString('utf8').replace(/^\uFEFF/, '').trim();
+        if (!tail) break;
+        try { JSON.parse(tail); } catch (_) { break; }
+        lineBuf = buf.subarray(pos);
+        pos = buf.length;
+      } else {
+        lineBuf = buf.subarray(pos, nl);
+        pos = nl + 1;
+      }
       consumed++;
       if (lineBuf.length > 0 && lineBuf[lineBuf.length - 1] === 13) {
         lineBuf = lineBuf.subarray(0, lineBuf.length - 1); // CRLF

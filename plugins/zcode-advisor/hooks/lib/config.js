@@ -386,11 +386,27 @@ function readConfigFile(file, problems, label) {
 // 只拷贝 DEFAULTS 里登记的键：旧版配置残留（apiSource/baseUrl/apiKey/zcodeModel 等）
 // 自动失效、不再参与解析——0.2.17 起端点/key 一律来自 ZCode 服务商，插件配置里的旧值
 // 若继续生效会造成"key 与端点交叉"（手动 key 发往服务商端点）。
+// 键判定用 Object.hasOwn：`k in DEFAULTS` 会放行 __proto__/constructor 等原型链键。
+// 类型与 env 层同口径：手写 JSON 常把布尔/数字写成字符串（"startEnabled": "false" 是真值）。
+// maxTokens 不在此转换——它有专用守卫（接受字符串数字、0 哨兵、垃圾值登记回退）。
 function applyLayer(cfg, raw, problems) {
   if (!raw || typeof raw !== 'object') return;
   for (const [k, v] of Object.entries(raw)) {
-    if (!(k in DEFAULTS)) continue;
-    cfg[k] = v;
+    if (!Object.hasOwn(DEFAULTS, k)) continue;
+    if (BOOL_KEYS.includes(k) && typeof v !== 'boolean') {
+      const b = toBool(v, null);
+      if (b === null) {
+        if (problems) problems.push(`config_normalized: ${k}=${JSON.stringify(v)} 不是布尔值，已忽略（保持 ${cfg[k]}）`);
+        continue;
+      }
+      cfg[k] = b;
+    } else if (INT_KEYS.includes(k) && k !== 'maxTokens' && typeof v === 'string') {
+      cfg[k] = toInt(v, NaN); // 非数字串 → NaN，交由下方范围守卫登记并回退默认
+    } else if (FLOAT_KEYS.includes(k) && typeof v === 'string') {
+      cfg[k] = toFloat(v, cfg[k]);
+    } else {
+      cfg[k] = v;
+    }
   }
 }
 
@@ -405,12 +421,12 @@ function loadConfig(pluginRoot, env) {
 
   const pluginCfg = readConfigFile(path.join(pluginRoot, 'advisor.config.json'), problems, '插件目录 advisor.config.json');
   if (pluginCfg) {
-    applyLayer(cfg, pluginCfg);
+    applyLayer(cfg, pluginCfg, problems);
     sources.push('plugin:advisor.config.json');
   }
   const userCfg = readConfigFile(userConfigPath(env), problems, '用户级 ~/.zcode/advisor.config.json');
   if (userCfg) {
-    applyLayer(cfg, userCfg);
+    applyLayer(cfg, userCfg, problems);
     sources.push('user:~/.zcode/advisor.config.json');
   }
 

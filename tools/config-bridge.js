@@ -126,8 +126,10 @@ function withConfigLock(target, fn) {
       try { holder = fs.readFileSync(lock, 'utf8').trim(); } catch (_) {}
       let stale = true;
       try { stale = Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch (_) {}
-      const pid = parseInt(holder, 10);
-      let alive = false;
+      // 只认纯数字 pid：'wx' 建锁与写入 pid 之间有空窗，此刻读到的空/非数字内容
+      // 不是「死属主」，按活处理、交给 mtime 规则（同 hooks/lib/state.js readLockOwner）。
+      const pid = /^\d+$/.test(holder) ? Number(holder) : 0;
+      let alive = true;
       if (pid > 0) {
         // 只有 ESRCH 算已死；EPERM/EACCES（Windows access denied 映射 EACCES）等一律算活。
         // 判错方向不对称：判活最多多等一次 mtime 兜底，判死会删掉活持有者的锁 → 双写者。
@@ -389,6 +391,7 @@ function main() {
   serveMcp();
 }
 
-module.exports = { guiValuesFromEnv, mergeUserConfig, writeUserConfig, removeUserConfigKeys, bridgeStatus, USER_CONFIG };
+module.exports = { guiValuesFromEnv, mergeUserConfig, writeUserConfig, removeUserConfigKeys, bridgeStatus, USER_CONFIG,
+  _internal: { withConfigLock } };
 
 if (require.main === module) main();

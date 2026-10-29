@@ -261,6 +261,22 @@ const log = (...a) => {
     fs.appendFileSync(LOG_FILE, line + '\n');
   } catch (_) {}
 };
+// 启动时日志截断（每次 main() 一次）：stdout 被 launchd/nohup 重定向到日志文件时，
+// log() 走提前返回、上面的 1MB 截断永不执行 → 日志无限增长。这里在启动点统一截断。
+// 用 truncate 原地清空而非 rename：重定向持有的是 O_APPEND fd，原地截断后它继续从
+// 文件尾（=0）追加；rename 会让 fd 跟着旧 inode 走，新日志全写进被轮转掉的文件。
+const LOG_MAX_BYTES = 1e6;
+function rotateLogIfLarge(file, maxBytes) {
+  const target = file || LOG_FILE;
+  const limit = Number.isFinite(maxBytes) ? maxBytes : LOG_MAX_BYTES;
+  try {
+    if (fs.statSync(target).size > limit) {
+      fs.truncateSync(target, 0);
+      return true;
+    }
+  } catch (_) { /* 不存在/不可写：无需截断 */ }
+  return false;
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const maskKey = (k) => { const s = String(k || ''); return s.length <= 8 ? '****' : `${s.slice(0, 4)}…${s.slice(-4)}`; };
 
@@ -322,6 +338,18 @@ function shouldLogWait(now) {
   } catch (_) { /* 无戳文件 = 从未落盘，允许打印 */ }
   try { fs.writeFileSync(WAIT_STAMP_FILE, String(at), 'utf8'); } catch (_) { /* 打印兜底 */ }
   return true;
+}
+
+// 空/损坏锁（读得到文件但解析不出 pid）是否已陈旧到可接管：按 mtime 超过 TTL 判定。
+// 年轻的空锁可能是 O_EXCL 兜底路径刚建、尚未写完的活锁，不能动；
+// 只有超过 TTL 仍是垃圾内容，才是崩溃残留（否则 acquireLock 会永久 EEXIST 失败）。
+function isGarbageLockStale(lockFile, nowMs) {
+  try {
+    const st = fs.statSync(lockFile);
+    return (Number.isFinite(nowMs) ? nowMs : Date.now()) - st.mtimeMs > LOCK_TTL_MS;
+  } catch (_) {
+    return false; // 不存在/不可读：不是「待清理的垃圾锁」
+  }
 }
 
 function readLockInfo(lockFile) {
@@ -406,15 +434,37 @@ function createLockExclusive(lockFile, cdpPort) {
 }
 
 let lockHeartbeat = null;
+// 心跳决策（纯函数，便于单测）：
+//   renew   = 锁仍是自己的 → 续租
+//   lost    = 锁属于另一个 pid → 已被接管，本进程必须退场（否则成为继续 rescan/注入/
+//             占 API 端口的「幽灵 controller」，与新主人双实例并存）
+//   unknown = 读不到 pid（瞬时 IO 错误/锁文件被删）→ 本拍跳过；连续两拍仍如此按 lost 处理
+function heartbeatDecision(curPid, myPid, prevUnknown) {
+  if (curPid === myPid) return 'renew';
+  if (curPid > 0) return 'lost';
+  return prevUnknown ? 'lost' : 'unknown';
+}
+
 // 持锁者心跳：续租（刷新 started）并把当前 CDP 端口写进租约——证明服务确实可用。
 function startLockHeartbeat(cdpPortRef) {
   if (lockHeartbeat) clearInterval(lockHeartbeat);
+  let prevUnknown = false;
   lockHeartbeat = setInterval(() => {
+    let decision = 'renew';
     try {
       const cur = readLockInfo(LOCK_FILE);
-      if (cur.pid !== process.pid) { clearInterval(lockHeartbeat); lockHeartbeat = null; return; } // 已被接管，停止续租
-      writeLock(LOCK_FILE, cdpPortRef.value);
+      decision = heartbeatDecision(cur.pid, process.pid, prevUnknown);
+      prevUnknown = decision === 'unknown';
+      if (decision === 'renew') writeLock(LOCK_FILE, cdpPortRef.value);
     } catch (_) {}
+    if (decision === 'lost') {
+      clearInterval(lockHeartbeat);
+      lockHeartbeat = null;
+      // 租约已失：让位退出。走 retry 语义——受监督退 3（launchd 稍后重启，新实例会
+      // 在 acquireLock 处让位给现任主人）；未受监督退 0（与「已有实例→静默让位」一致）。
+      log('单实例锁已被其他实例接管，本实例退出（避免双 controller）');
+      exitRetryable(0, '');
+    }
   }, LOCK_HEARTBEAT_MS);
   if (lockHeartbeat.unref) lockHeartbeat.unref();
 }
@@ -488,7 +538,34 @@ function acquireLock() {
       } else if (now.pid && !isStale(now)) {
         won = false; // 等闸门期间主人又活了（心跳回来）→ 让给它
       } else if (!now.pid) {
-        won = createLockExclusive(LOCK_FILE, 0);
+        // 无 pid：要么锁不存在（直接排他创建），要么是空/损坏内容的垃圾锁。
+        // 垃圾锁年轻 → 可能是 O_EXCL 兜底刚建未写完的活锁，让出；超 TTL → 崩溃残留，
+        // 隔离后核对仍无 pid 才删除并创建（否则 link 永远 EEXIST，acquireLock 永久失败）。
+        if (!fs.existsSync(LOCK_FILE)) {
+          won = createLockExclusive(LOCK_FILE, 0);
+        } else if (isGarbageLockStale(LOCK_FILE)) {
+          log('检测到空/损坏且已超时的 companion 锁——接管');
+          const quarantine = `${LOCK_FILE}.stale-${process.pid}-${Date.now()}`;
+          try {
+            fs.renameSync(LOCK_FILE, quarantine);
+          } catch (e) {
+            if (!e || e.code !== 'ENOENT') throw e;
+          }
+          const moved = readLockInfo(quarantine);
+          if (moved.pid) {
+            // 隔离期间被写成了真锁：放回原位，本轮不接管
+            try {
+              fs.linkSync(quarantine, LOCK_FILE);
+              fs.unlinkSync(quarantine);
+            } catch (_) {}
+            won = false;
+          } else {
+            try { fs.unlinkSync(quarantine); } catch (_) {}
+            won = createLockExclusive(LOCK_FILE, 0);
+          }
+        } else {
+          won = false;
+        }
       } else {
         log(`检测到陈旧的 companion 锁（pid ${now.pid}：心跳超时 / 进程不存在 / 长期无 CDP）——接管`);
         // 移走而不是直接删：rename 是原子替换，闸门保证这期间没有第三方改写 LOCK，
@@ -687,6 +764,22 @@ const CDP_SELFHEAL_GRACE_MS = 30 * 1000;
 // 自愈节流：两次重建尝试的最小间隔，防止 ZCode 起不来时高频 spawn。
 const CDP_SELFHEAL_COOLDOWN_MS = 60 * 1000;
 let lastSelfHealAt = 0;
+// 本进程是否曾成功附着过 CDP（ZCode 曾在跑）。未受监督模式下用它区分
+// 「启动时 ZCode 没开 → 代启」与「用过之后用户退出 ZCode → 跟着退场」。
+let cdpSeen = false;
+
+// CDP 消失后的决策（纯函数，便于单测）：
+//   wait     = 仍在宽限期内（覆盖 ZCode 闪退/重启），本轮不动作
+//   exit     = 只附着模式；或未受监督、曾附着过、且宿主进程已不在（用户退出了 ZCode）
+//              → 外挂随之退出、释放锁，绝不把 ZCode 再拽起来（2026-10 用户拍板）
+//   selfheal = 其余（宿主还在但端口没了等）→ 走原有 ensureCdp 自愈
+// hostRunning 是惰性 thunk：只在宽限期过后、确实需要判定时才执行（ps/tasklist 有开销）。
+function cdpLostDecision({ attachOnly, cdpSeen: seen, lostForMs, graceMs, hostRunning }) {
+  if (!(lostForMs > graceMs)) return 'wait';
+  if (attachOnly) return 'exit';
+  if (seen && !(typeof hostRunning === 'function' ? hostRunning() : hostRunning)) return 'exit';
+  return 'selfheal';
+}
 
 // 全端口段重扫：与 zcode-plus 等其他 CDP 外挂共存的关键。
 // CDP 允许多客户端同时附着同一实例（✨ 与 🛡️ 在同一页面共存）；
@@ -706,6 +799,7 @@ async function rescan() {
     }
     cdpPortRef.value = p;
     cdpLostSince = 0;
+    cdpSeen = true;
     for (const t of targets) {
       if (t.type === 'page' && t.webSocketDebuggerUrl) attachTarget(t);
     }
@@ -734,7 +828,21 @@ async function rescan() {
   const now = Date.now();
   if (cdpLostSince === 0) cdpLostSince = now;
   const lostFor = now - cdpLostSince;
-  if (lostFor > CDP_SELFHEAL_GRACE_MS && now - lastSelfHealAt > CDP_SELFHEAL_COOLDOWN_MS) {
+  // 未受监督（双击/nohup/vbs）且曾附着过：用户退出 ZCode 后外挂跟着退出，不再代启。
+  // 只有启动那一刻 ZCode 没开才允许代启（main 里的 ensureCdp）；见文件头 ATTACH_ONLY 注释。
+  const decision = cdpLostDecision({
+    attachOnly: false,
+    cdpSeen,
+    lostForMs: lostFor,
+    graceMs: CDP_SELFHEAL_GRACE_MS,
+    hostRunning: () => hostInstanceRunning(findZcodePath().path || '')
+  });
+  if (decision === 'exit') {
+    log('ZCode 已退出，外挂随之退出（不代为重新拉起 ZCode；下次打开「ZCode Advisor」即恢复角标）');
+    exitPermanent(0, '');
+    return;
+  }
+  if (decision === 'selfheal' && now - lastSelfHealAt > CDP_SELFHEAL_COOLDOWN_MS) {
     lastSelfHealAt = now;
     log(`CDP 已消失 ${Math.round(lostFor / 1000)}s，尝试重建调试通道…`);
     try {
@@ -938,8 +1046,10 @@ function withConfigLock(target, fn) {
       try { holder = fs.readFileSync(lock, 'utf8').trim(); } catch (_) {}
       let stale = true;
       try { stale = Date.now() - fs.statSync(lock).mtimeMs > 10000; } catch (_) {}
-      const pid = parseInt(holder, 10);
-      let alive = false;
+      // 只认纯数字 pid：'wx' 建锁与写入 pid 之间有空窗，此刻读到的空/非数字内容
+      // 不是「死属主」，按活处理、交给 mtime 规则（同 hooks/lib/state.js readLockOwner）。
+      const pid = /^\d+$/.test(holder) ? Number(holder) : 0;
+      let alive = true;
       if (pid > 0) {
         // 只有 ESRCH 算已死；EPERM/EACCES（Windows access denied 映射 EACCES）等一律算活。
         // 与 tools/config-bridge.js 的同名协议保持一致（test/static-guards.test.js 会拦漂移）。
@@ -1907,6 +2017,37 @@ async function pickApiPort() {
   throw new Error(`API 端口 ${API_PORT_RANGE[0]}-${API_PORT_RANGE[1]} 全部占用`);
 }
 
+// 异步运行 node 脚本并收集输出（不阻塞事件循环）。超时 SIGTERM，status=null（同 spawnSync 语义）。
+const AUTO_ENABLE_TIMEOUT_MS = 150000;
+function runNodeScript(script, env, timeoutMs) {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (status, error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status, stdout, stderr, error });
+    };
+    let child;
+    try {
+      child = spawn(process.execPath, [script], { env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    } catch (e) {
+      resolve({ status: null, stdout: '', stderr: '', error: e });
+      return;
+    }
+    const timer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch (_) {}
+      finish(null, new Error('timeout'));
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.once('error', (e) => finish(null, e));
+    child.once('close', (code) => finish(code, null));
+  });
+}
+
 async function main() {
   // 版本守卫：依赖全局 WebSocket（Node 22+ 默认提供，v21 需 --experimental-websocket）。
   // 放在这里而非模块顶层，使 require（冒烟校验/单测）不受影响。
@@ -1932,6 +2073,8 @@ async function main() {
   // 若等 ensureCdp 之后才起心跳，慢启动期间租约看起来是死的，hook 会 kickstart
   // 出第二个 controller 抢锁，两个进程各自 auto-enable/attach。
   startLockHeartbeat(cdpPortRef);
+  // 启动点截断一次超限日志（stdout 重定向到日志时 log() 内的截断走不到）。
+  rotateLogIfLarge();
   injectSource = fs.readFileSync(path.join(__dirname, 'inject.js'), 'utf8');
   log('zcode-advisor 输入框角标外挂启动');
 
@@ -1943,7 +2086,9 @@ async function main() {
     if (fs.existsSync(autoEnable)) {
       const env2 = Object.assign({}, process.env);
       delete env2.ELECTRON_RUN_AS_NODE;
-      const r = spawnSync(process.execPath, [autoEnable], { env: env2, timeout: 150000 });
+      // 异步子进程：spawnSync 会阻塞事件循环最长 150s，期间锁心跳（20s 一拍）跳不动，
+      // 60s TTL 的租约看起来已死 → 第二个 controller 可接管。改 await 异步执行，心跳照常续租。
+      const r = await runNodeScript(autoEnable, env2, AUTO_ENABLE_TIMEOUT_MS);
       const out = String((r.stdout || '') + (r.stderr || '')).trim();
       for (const line of out.split('\n').filter((l) => l.includes('✓') || l.includes('✗'))) log(line.replace(/^.*\[(auto-enable)\] /, '[$1] '));
       if (r.status !== 0) log(`自动启用未完全成功（status=${r.status}），详见 ${LOG_FILE}`);
@@ -1951,6 +2096,7 @@ async function main() {
   } catch (_) { /* 自动启用失败不阻断外挂 */ }
 
   const cdpPort = await ensureCdp();
+  cdpSeen = true;
   clearStandby();
   // 风控告知（issue #7）：此刻已确定工作实例处于 CDP 调试模式（无论是本次 spawn 的，
   // 还是附着到已在运行的调试实例）——两者都是同一风险面，故在汇合点统一告知，
@@ -1989,4 +2135,5 @@ module.exports = { findZcodePath, normalizeChatEndpoint, normalizeMessagesEndpoi
   enqueueUserNote, appendHistoryRecord, composeUserNote, truncateByCodepoint, queueLimits, warnCdpRisk,
   CDP_RISK_NOTICE, USER_ACTIONS, HISTORY_MAX_LINES,
   // 供单测直接验证单实例锁与主实例探测（不启动进程）
-  _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, exitCodeFor, classifySpawnError, RETRY_EXIT_CODE, SUPERVISED, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS } };
+  _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, exitCodeFor, classifySpawnError, RETRY_EXIT_CODE, SUPERVISED, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS,
+    isGarbageLockStale, heartbeatDecision, rotateLogIfLarge, runNodeScript, cdpLostDecision, withConfigLock } };

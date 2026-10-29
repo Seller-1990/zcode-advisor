@@ -164,12 +164,11 @@ async function fetchEmbeddedNodeBinary(platform, arch) {
   if (!/^v\d+\.\d+\.\d+$/.test(version)) throw new Error(`无效的 Node 版本：${version}`);
   const key = `${version}-${platform}-${arch}`;
   const cachePath = path.join(CACHE_DIR, `node-${key}`);
-  if (fs.existsSync(cachePath)) {
-    const binary = fs.readFileSync(cachePath);
-    if (binary.length > 0) {
-      log(`复用缓存的 Node 运行时（${key}）`);
-      return binary;
-    }
+  // 缓存复用必须过 .sha256 旁注校验：只看「长度>0」会复用被截断/篡改的二进制。
+  const cached = readVerifiedCache(cachePath);
+  if (cached) {
+    log(`复用缓存的 Node 运行时（${key}）`);
+    return cached;
   }
 
   const fileName = platform === 'win'
@@ -180,14 +179,61 @@ async function fetchEmbeddedNodeBinary(platform, arch) {
 
   log(`下载官方 Node 运行时：${url}`);
   const buf = await download(url);
+  // 对照官方 SHASUMS256.txt（同一 base URL）校验发行包，不匹配直接失败，不进缓存。
+  const sums = (await download(`${NODE_DIST_MIRROR}/${version}/SHASUMS256.txt`)).toString('utf8');
+  verifyAgainstShasums(buf, fileName, sums);
   const binary = platform === 'win' ? extractFromZip(buf, innerPath) : extractFromTarGz(buf, innerPath);
   if (!binary || binary.length === 0) {
     throw new Error(`从 ${fileName} 中未取到 ${innerPath}`);
   }
   stageDir(CACHE_DIR);
-  fs.writeFileSync(cachePath, binary);
-  log(`已提取 ${innerPath}（${(binary.length / 1048576).toFixed(1)} MB）`);
+  writeCacheAtomic(cachePath, binary);
+  log(`已提取 ${innerPath}（${(binary.length / 1048576).toFixed(1)} MB，SHA256 已校验）`);
   return binary;
+}
+
+function sha256Hex(buf) {
+  return require('crypto').createHash('sha256').update(buf).digest('hex');
+}
+
+// SHASUMS256.txt 每行 "<64hex>  <fileName>"；找不到条目或哈希不符都抛错。
+function verifyAgainstShasums(buf, fileName, sumsText) {
+  let expected = null;
+  for (const line of String(sumsText).split(/\r?\n/)) {
+    const m = /^([0-9a-fA-F]{64})\s+\*?(\S+)\s*$/.exec(line);
+    if (m && m[2] === fileName) { expected = m[1].toLowerCase(); break; }
+  }
+  if (!expected) throw new Error(`SHASUMS256.txt 中没有 ${fileName} 的条目`);
+  const actual = sha256Hex(buf);
+  if (actual !== expected) throw new Error(`${fileName} SHA256 不匹配：期望 ${expected}，实得 ${actual}`);
+  return actual;
+}
+
+// 缓存与 .sha256 旁注都经 tmp+rename 原子落盘；旁注后写，崩溃时最多丢缓存不会留下半截文件。
+function writeCacheAtomic(cachePath, binary) {
+  const atomic = (file, data) => {
+    const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, file);
+  };
+  atomic(cachePath, binary);
+  atomic(`${cachePath}.sha256`, sha256Hex(binary) + '\n');
+}
+
+// 只有旁注存在且与内容哈希一致时才返回缓存；否则视为未命中（重新下载覆盖）。
+function readVerifiedCache(cachePath) {
+  try {
+    const binary = fs.readFileSync(cachePath);
+    const want = fs.readFileSync(`${cachePath}.sha256`, 'utf8').trim().toLowerCase();
+    if (binary.length > 0 && /^[0-9a-f]{64}$/.test(want) && sha256Hex(binary) === want) return binary;
+  } catch (_) { /* 缺文件即未命中 */ }
+  return null;
+}
+
+// DMG 是否必须含 Node：跟随「是否请求内嵌」，而非「是否取到」——
+// 请求了内嵌却没取到时，verifyDmg 必须失败，不能悄悄放行无 Node 的 DMG。
+function dmgExpectNode(opts) {
+  return !!(opts && opts.embedNode);
 }
 
 async function resolveLatestLtsVersion() {
@@ -383,7 +429,7 @@ async function buildMac(arch, opts) {
         });
         if (r.ok) {
           log(`产物：${path.basename(dmgPath)}（${(r.bytes / 1048576).toFixed(1)} MB，DMG 安装包）`);
-          results.push({ path: dmgPath, kind: 'dmg', expectNode: !!nodeEntry });
+          results.push({ path: dmgPath, kind: 'dmg', expectNode: dmgExpectNode(opts) });
         } else {
           warn(`跳过 DMG：${r.reason}`);
         }
@@ -664,4 +710,4 @@ if (require.main === module) main().catch((err) => {
   process.exit(1);
 });
 
-module.exports = { fetchEmbeddedNodeBinary };
+module.exports = { fetchEmbeddedNodeBinary, verifyAgainstShasums, readVerifiedCache, writeCacheAtomic, dmgExpectNode, sha256Hex };

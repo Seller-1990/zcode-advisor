@@ -243,8 +243,12 @@ test('reviewTurn：unparsed/llm_truncated 终局自动留样本（含响应头�
 
 const EFF = { model: 'm-404', providerName: 'p' };
 
-test('applyReviewOutcome：llm_http_404 终局 → halted + history；fallback 救回的不停机', () => {
+test('applyReviewOutcome：主模型连续 3 次 llm_http_404 → halted + history；单次不停机；fallback 救回的不停机', () => {
   const s = { sessionId: 's1', dropped: {}, droppedAt: {}, halted: null };
+  applyReviewOutcome(s, { error: 'llm_http_404' }, EFF, mkCfg());
+  assert.ok(!s.halted, '单次 404 不能直接停机');
+  applyReviewOutcome(s, { error: 'llm_http_404' }, EFF, mkCfg());
+  assert.ok(!s.halted, '连续 2 次 404 仍不停机');
   applyReviewOutcome(s, { error: 'llm_http_404' }, EFF, mkCfg());
   assert.ok(s.halted === true && s.haltedReason === 'llm_http_404' && s.haltedModel === 'm-404', '404 终局必须停机');
   const hist = fs.readFileSync(process.env.ZCODE_ADVISOR_HISTORY, 'utf8').trim().split('\n').map((l) => JSON.parse(l));

@@ -58,6 +58,58 @@ function extractJsonObjects(text) {
   return objs;
 }
 
+// 宽松回退（独立起点）：extractJsonObjects 的全局 inString 状态会被前文散文里的
+// 奇数个 `"` 翻转（例：`He said "hi. Then {"severity":...}`），后面的真帧随之丢失。
+// 主扫描找不到合法帧时，对**最后** LENIENT_MAX_STARTS 个 '{' 各自从全新状态独立配对，
+// 每个起点最多扫 LENIENT_MAX_SPAN 字符——总成本有界（≤64×16K），不回到 O(n²)。
+// 只在帧层使用（结果经 normalizeFrame 过滤），不改变 extractJsonObjects 的语义锁。
+const LENIENT_MAX_STARTS = 64;
+const LENIENT_MAX_SPAN = 16384;
+function extractJsonObjectsLenient(text) {
+  const s = String(text || '');
+  const starts = [];
+  for (let i = s.lastIndexOf('{'); i !== -1 && starts.length < LENIENT_MAX_STARTS; i = i > 0 ? s.lastIndexOf('{', i - 1) : -1) {
+    starts.push(i);
+  }
+  starts.reverse();
+  const objs = [];
+  for (const start of starts) {
+    const limit = Math.min(s.length, start + LENIENT_MAX_SPAN);
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < limit; i++) {
+      const ch = s[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}' && --depth === 0) {
+        try { objs.push(JSON.parse(s.slice(start, i + 1))); } catch (_) { /* 非法：丢弃 */ }
+        break;
+      }
+    }
+  }
+  return objs;
+}
+
+// 取文本中**最后一个**合法帧（normalizeFrame 校验：severity ∈ SEVERITIES，none 允许空 note）。
+// 主扫描无合法帧时走宽松回退。返回 normalizeFrame 结果或 null。
+function findLastFrame(text, maxNoteChars) {
+  const pick = (objs) => {
+    for (let i = objs.length - 1; i >= 0; i--) {
+      const f = normalizeFrame(objs[i], maxNoteChars);
+      if (f) return f;
+    }
+    return null;
+  };
+  return pick(extractJsonObjects(text)) || pick(extractJsonObjectsLenient(text));
+}
+
 // 返回 {frame, truncated} 或 null。truncated = note 因超上限被截断（失控信号，
 // 探针据「截断即失控」判失败，见 M3 判据 5）。
 function normalizeFrame(obj, maxNoteChars) {
@@ -106,13 +158,9 @@ function parseFrameDetailed(text, proseFallback, opts) {
 
   // 从包裹文本中提取全部候选帧，取**最后一个**合法帧（模型自我纠正语义；
   // max-of-N 会放大转录注入面，见安全复审）。
-  const candidates = extractJsonObjects(raw)
-    .map((obj) => normalizeFrame(obj, maxNoteChars))
-    .filter(Boolean);
-  if (candidates.length > 0) {
-    // 取**最后一个**合法帧（模型自我纠正语义：后帧覆盖前帧）。
-    // 不取 severity 最高者——max-of-N 会保证转录中注入的对抗帧必然压过模型真实判定。
-    const last = candidates[candidates.length - 1];
+  // 不取 severity 最高者——max-of-N 会保证转录中注入的对抗帧必然压过模型真实判定。
+  const last = findLastFrame(raw, maxNoteChars);
+  if (last) {
     return { frame: last.frame, from: 'json-embedded', truncated: last.truncated };
   }
   // 有 JSON 形状的内容但全部非法：判定 unparsed，不做散文救回（半截 JSON 不注入会话）。
@@ -134,7 +182,8 @@ function salvageProse(text, noteChars) {
   // 说明模型想输出帧但失败了；把半截 JSON 注入会话比丢弃更糟。
   if (raw.startsWith('{') || raw.startsWith('[')) return null;
   if (!bracesBalanced(raw)) return null;
-  if (/["']?note["']?\s*:/.test(raw)) return null;
+  // note 键特征：带引号的键，或前面不是英文单词的裸 note:（放过 "Please note:" 这类散文）。
+  if (/["']note["']\s*:/.test(raw) || /(?:^|[^A-Za-z\s])\s*\bnote\s*:/m.test(raw)) return null;
 
   const cleaned = cleanProse(raw);
   // 守门二：过短内容没有建议价值。
@@ -291,9 +340,9 @@ function extractAnthropicResult(data) {
     else if (b.type === 'thinking' && typeof b.thinking === 'string') thinking += b.thinking;
   }
   if (!text.trim() && thinking.trim()) {
-    const objs = extractJsonObjects(thinking);
-    const frameObj = objs.reverse().find((o) => o && typeof o === 'object' && o.severity && o.note);
-    if (frameObj) text = JSON.stringify(frameObj);
+    // 与 parseFrame 同一校验（normalizeFrame），取最后一个合法帧；不截断，交给 parseFrame。
+    const found = findLastFrame(thinking, Infinity);
+    if (found) text = JSON.stringify(found.frame);
     else return { error: 'llm_empty_response', reasoningText: thinking.slice(0, 4000) };
   }
   if (!text.trim()) {
@@ -494,9 +543,9 @@ async function callReviewer(params) {
     if (!text.trim() && typeof message.reasoning_content === 'string' && message.reasoning_content.trim()) {
       const reasoning = message.reasoning_content;
       // 与 parseFrame 同源的提取逻辑：只要能找到含 severity/note 的 JSON 对象就采用
-      const objs = extractJsonObjects(reasoning);
-      const frameObj = objs.reverse().find((o) => o && typeof o === 'object' && o.severity && o.note);
-      if (frameObj) text = JSON.stringify(frameObj);
+      // 校验与 parseFrame 一致（normalizeFrame）：接受 none+空 note，拒绝回显的 schema 模板。
+      const found = findLastFrame(reasoning, Infinity);
+      if (found) text = JSON.stringify(found.frame);
       else if (reasoning.trim()) {
         // 推理文本里没有 JSON 帧：把原文带回给上层，重试时可作为上下文回灌，
         // 让模型"基于已完成的分析直接给出结论"——比单纯重复请求成功率高。
@@ -686,7 +735,7 @@ async function probeModel(target, opts, deps) {
     aborted,
     batchMs: batchCap,
     passed,
-    failed: n - passed,
+    failed: ran - passed,
     passRate: n > 0 ? passed / n : 0,
     ms: { min: sorted[0] || 0, median: percentile(sorted, 50), p90: percentile(sorted, 90), max: sorted[sorted.length - 1] || 0 },
     failures,
