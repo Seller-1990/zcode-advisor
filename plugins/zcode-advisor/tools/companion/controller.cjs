@@ -114,28 +114,19 @@ function deriveHealth(beacon, opts) {
 // 读全部信标，取「最近活动」的一个（多会话并存时；不按 mtime 猜当前会话——
 // controller 无从得知用户在哪个会话，故返回该条并附 sessionId 供 UI 标注）。
 // 上限 cap：读取侧只关心最近活动，没必要解析上千个历史信标（该 handler 每 5s 被轮询）。
-// 信标清单（按 mtime 降序的 {full, mtime}）的进程内短缓存：/api/health 与 /api/session
-// 每 5s 各轮询一次，原先每次都 readdir + 逐个 stat。缓存只省清单，文件内容仍每次现读；
-// 额外以目录 mtime 作校验——信标是 tmp+rename 落盘，新增/改写/删除都会改目录 mtime，
-// 因此缓存命中期间的变化不会被吞掉。
-const BEACON_LIST_TTL_MS = 2000;
-let beaconListCache = null; // { at, dirMtime, list }
+// 信标清单（按 mtime 降序的 {full, mtime}）。不做缓存：曾以目录 mtime 校验的短缓存在
+// Windows/NTFS 上不可靠（rename 后目录 mtime 不一定立刻变化），会返回陈旧清单导致
+// 找不到会话；信标数量很少，每次 readdir + stat 的开销可以忽略。
 function listBeaconFiles() {
-  let dirMtime;
-  try { dirMtime = fs.statSync(HEALTH_DIR).mtimeMs; } catch (_) { beaconListCache = null; return null; }
-  const now = Date.now();
-  if (beaconListCache && beaconListCache.dirMtime === dirMtime && now - beaconListCache.at < BEACON_LIST_TTL_MS) {
-    return beaconListCache.list;
-  }
-  const files = fs.readdirSync(HEALTH_DIR).filter((f) => /^advisor-health-.*\.json$/.test(f));
-  const list = files.map((f) => {
+  let files;
+  try { files = fs.readdirSync(HEALTH_DIR); } catch (_) { return null; }
+  files = files.filter((f) => /^advisor-health-.*\.json$/.test(f));
+  return files.map((f) => {
     const full = path.join(HEALTH_DIR, f);
     let mtime = 0;
     try { mtime = fs.statSync(full).mtimeMs; } catch (_) {}
     return { full, mtime };
   }).sort((a, b) => b.mtime - a.mtime);
-  beaconListCache = { at: now, dirMtime, list };
-  return list;
 }
 
 function readHealth(reviewBudgetMs, cap) {
