@@ -52,6 +52,7 @@ const ocrSrc = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'ocr-review
 const start = ocrSrc.indexOf('HOP_TIMEOUT="${OCR_REVIEW_HOP_TIMEOUT');
 const end = ocrSrc.indexOf('CHAIN_START=');
 const budgetBlock = ocrSrc.slice(start, end);
+const POSIX_ONLY = process.platform === 'win32' ? 'bash 脚本仅供 macOS/POSIX' : false;
 
 function evalBudget(hop, total) {
   const env = { ...process.env };
@@ -68,17 +69,17 @@ test('ocr-review 预算：区块可定位', () => {
   assert.ok(start > 0 && end > start);
 });
 
-test('ocr-review 预算：全零值被拒绝回落默认', () => {
+test('ocr-review 预算：全零值被拒绝回落默认', { skip: POSIX_ONLY }, () => {
   assert.strictEqual(evalBudget('00', '000'), '900 5400');
   assert.strictEqual(evalBudget('0', '0'), '900 5400');
 });
 
-test('ocr-review 预算：前导零按十进制归一化（08/09 不再八进制报错）', () => {
+test('ocr-review 预算：前导零按十进制归一化（08/09 不再八进制报错）', { skip: POSIX_ONLY }, () => {
   assert.strictEqual(evalBudget('08', '09'), '8 9');
   assert.strictEqual(evalBudget('0900', '05400'), '900 5400');
 });
 
-test('ocr-review 预算：非法值回落，合法值与默认值不变', () => {
+test('ocr-review 预算：非法值回落，合法值与默认值不变', { skip: POSIX_ONLY }, () => {
   assert.strictEqual(evalBudget('15m', ''), '900 5400');
   assert.strictEqual(evalBudget('120', '600'), '120 600');
   assert.strictEqual(evalBudget(undefined, undefined), '900 5400');

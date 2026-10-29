@@ -95,6 +95,8 @@ function copyBlock() {
   return sh.slice(a, b);
 }
 
+const POSIX_ONLY = process.platform === 'win32' ? 'bash 脚本仅供 macOS/POSIX' : false;
+
 function runInstall(prelude) {
   const root = fs.mkdtempSync(path.join(fixture, 'inst-'));
   const src = path.join(root, 'src.app');
@@ -108,7 +110,7 @@ function runInstall(prelude) {
   return { r, dst, root };
 }
 
-test('首装脚本：替换旧版后不嵌套、不残留 .old', () => {
+test('首装脚本：替换旧版后不嵌套、不残留 .old', { skip: POSIX_ONLY }, () => {
   const { r, dst, root } = runInstall('');
   assert.strictEqual(r.status, 0, r.stderr);
   assert.strictEqual(fs.readFileSync(path.join(dst, 'marker'), 'utf8'), 'new');
@@ -119,7 +121,7 @@ test('首装脚本：替换旧版后不嵌套、不残留 .old', () => {
   void root;
 });
 
-test('首装脚本：新版就位失败 → 恢复旧版并 exit 1，不报成功', () => {
+test('首装脚本：新版就位失败 → 恢复旧版并 exit 1，不报成功', { skip: POSIX_ONLY }, () => {
   // 让「把 .installing 挪到目标」这一步失败，其余 mv 照常
   const prelude = 'mv() { case "$1" in *.installing.*) return 1;; esac; command mv "$@"; }';
   const { r, dst } = runInstall(prelude);
@@ -131,7 +133,7 @@ test('首装脚本：新版就位失败 → 恢复旧版并 exit 1，不报成�
   assert.deepStrictEqual(left, []);
 });
 
-test('首装脚本语法有效', () => {
+test('首装脚本语法有效', { skip: POSIX_ONLY }, () => {
   const r = spawnSync('bash', ['-n'], { input: T.MAC_FIRST_INSTALL('9.9.9'), encoding: 'utf8' });
   assert.strictEqual(r.status, 0, r.stderr);
 });
