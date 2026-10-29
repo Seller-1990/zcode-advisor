@@ -64,19 +64,40 @@ function main() {
     }
   }
 
-  fs.writeFileSync(FILE, icon.encodePng(width, out));
+  const png = icon.encodePng(width, out);
 
-  // 自检：四角透明、中心不透明
-  const rt = icon.decodePng(fs.readFileSync(FILE));
-  const alphaAt = (x, y) => rt.rgba[(y * width + x) * 4 + 3];
-  const corners = [alphaAt(0, 0), alphaAt(width - 1, 0), alphaAt(0, height - 1), alphaAt(width - 1, height - 1)];
-  if (!corners.every((a) => a === 0) || alphaAt(width >> 1, height >> 1) !== 255) {
-    console.error('[icon-alpha] 自检失败：', { corners, center: alphaAt(width >> 1, height >> 1) });
+  // 自检**先于写盘**：对编码后的缓冲区解码校验四角透明、中心不透明；
+  // 失败时原 assets/icon.png 保持不动（曾经先写后检，exit(1) 会留下坏文件）。
+  const check = selfCheck(png);
+  if (!check.ok) {
+    console.error('[icon-alpha] 自检失败（未写入）：', { corners: check.corners, center: check.center });
     process.exit(1);
   }
+  writeAtomic(FILE, png);
   console.log(`[icon-alpha] 已写入 ${FILE}（${width}×${height}，四角透明自检通过）`);
+}
+
+// 解码 PNG 缓冲区并检查：四角 alpha 全 0、中心 alpha 为 255。
+function selfCheck(png) {
+  const { width, height, rgba } = icon.decodePng(png);
+  const alphaAt = (x, y) => rgba[(y * width + x) * 4 + 3];
+  const corners = [alphaAt(0, 0), alphaAt(width - 1, 0), alphaAt(0, height - 1), alphaAt(width - 1, height - 1)];
+  const center = alphaAt(width >> 1, height >> 1);
+  return { ok: corners.every((a) => a === 0) && center === 255, corners, center };
+}
+
+// 同目录临时文件 + rename：写入中途失败也不会留下截断的目标文件。
+function writeAtomic(file, buf) {
+  const tmp = `${file}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(tmp, buf);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch (_) { /* ignore */ }
+    throw err;
+  }
 }
 
 if (require.main === module) main();
 
-module.exports = { DARK_THRESHOLD, FEATHER, LUM_SPAN };
+module.exports = { DARK_THRESHOLD, FEATHER, LUM_SPAN, selfCheck, writeAtomic };

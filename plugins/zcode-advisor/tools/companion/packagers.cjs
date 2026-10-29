@@ -17,9 +17,12 @@ const T = require('./install-templates.cjs');
 
 // ---------------- Windows：NSIS ----------------
 
-// 版本号补成 4 段数字，满足 VIProductVersion 的 x.x.x.x 要求
+// 版本号补成 4 段数字，满足 VIProductVersion 的 x.x.x.x 要求。
+// 只取开头的纯数字段（'0.2.24-rc.1' → 0.2.24.0，预发布/构建后缀丢弃）；
+// 每段上限 65535（VIProductVersion 每段是 16 位），超出则钳制，避免 makensis 报错。
 function version4(v) {
-  const parts = String(v).split('.').map((p) => parseInt(p, 10)).filter((n) => Number.isFinite(n));
+  const m = /^\s*v?(\d+(?:\.\d+){0,3})/.exec(String(v));
+  const parts = m ? m[1].split('.').map((p) => Math.min(parseInt(p, 10), 0xffff)) : [];
   while (parts.length < 4) parts.push(0);
   return parts.slice(0, 4).join('.');
 }
@@ -111,8 +114,49 @@ Section "Uninstall"
   DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\ZCodeAdvisor"
   DeleteRegKey HKCU "Software\\ZCodeAdvisor"
   ; 卸载保留用户级配置 %USERPROFILE%\\.zcode\\advisor.config.json（含 API key，不静默删除）
-  RMDir /r "$INSTDIR"
+  ; 递归删除仅限以 \\ZCodeAdvisor 结尾的目录：MUI_PAGE_DIRECTORY 允许手输任意路径，
+  ; 旧版无条件 RMDir /r 会把用户手输的既有目录（如 D:\\Tools）整个删掉。
+  ; 比较前去掉末尾反斜杠（C:\\X\\ZCodeAdvisor\\ 也算合法），StrCmp 本身不区分大小写。
+  StrCpy $1 "$INSTDIR"
+  StrCpy $0 "$1" "" -1
+  StrCmp $0 "\\" 0 +2
+    StrCpy $1 "$1" -1
+  StrCpy $0 "$1" "" -13
+  StrCmp $0 "\\ZCodeAdvisor" zca_rm_tree zca_rm_safe
+  zca_rm_tree:
+    RMDir /r "$1"
+    Goto zca_rm_done
+  zca_rm_safe:
+    Delete "$INSTDIR\\uninstall.exe"
+    RMDir "$INSTDIR"
+    ; 不再静默：明确告知用户其余文件未删除，需手动清理
+    DetailPrint "安装目录不以 \\ZCodeAdvisor 结尾，为安全起见未递归删除：$INSTDIR"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "安装目录 $INSTDIR 不是 ZCode Advisor 专属目录（不以 \\ZCodeAdvisor 结尾），为避免误删其中的其它文件，卸载程序未递归删除。$\\r$\\n请手动删除该目录中残留的 ZCode Advisor 文件。" /SD IDOK
+  zca_rm_done:
 SectionEnd
+
+; 升级兼容：旧版注册表里保存的 InstallDir（InstallDirRegKey）可能不以 \\ZCodeAdvisor 结尾，
+; 否则 .onVerifyInstDir 会让「下一步」永远灰掉。这里去掉末尾反斜杠并补上 \\ZCodeAdvisor 子目录。
+Function .onInit
+  StrCpy $0 "$INSTDIR" "" -1
+  StrCmp $0 "\\" 0 +2
+    StrCpy $INSTDIR "$INSTDIR" -1
+  StrCpy $0 "$INSTDIR" "" -13
+  StrCmp $0 "\\ZCodeAdvisor" +2 0
+    StrCpy $INSTDIR "$INSTDIR\\ZCodeAdvisor"
+FunctionEnd
+
+; 安装目录必须以 \\ZCodeAdvisor 结尾（不满足时「下一步」不可用）：
+; 保证卸载的递归删除永远只落在本产品专属目录上。末尾反斜杠先去掉再比较。
+Function .onVerifyInstDir
+  StrCpy $1 "$INSTDIR"
+  StrCpy $0 "$1" "" -1
+  StrCmp $0 "\\" 0 +2
+    StrCpy $1 "$1" -1
+  StrCpy $0 "$1" "" -13
+  StrCmp $0 "\\ZCodeAdvisor" +2 0
+    Abort
+FunctionEnd
 `;
 }
 
@@ -154,9 +198,12 @@ function buildNsisInstaller(opts) {
     return { ok: false, reason: 'makensis 不可用（Windows 建议 choco install nsis；CI 用 windows-2022 预装版）' };
   }
 
+  // 先删旧产物：否则 makensis 失败/未写出时，下面的 existsSync 会把上次构建的 exe 当成本次成功
+  if (fs.existsSync(outFile)) fs.unlinkSync(outFile);
+
   try {
-    // 以 .nsi 所在目录为工作目录运行（与脚本内相对路径的定义一致）
-    execFileSync('makensis', ['-V2', nsiPath], { stdio: 'pipe', cwd: path.dirname(nsiPath) });
+    // 以 .nsi 所在目录为工作目录运行（与脚本内相对路径的定义一致）；超时防止挂死的 makensis 卡住构建
+    execFileSync('makensis', ['-V2', nsiPath], { stdio: 'pipe', cwd: path.dirname(nsiPath), timeout: 10 * 60 * 1000 });
   } catch (err) {
     // 已知现象一：部分平台/版本的 makensis 二进制自身崩溃（如 macOS Homebrew 3.12 的
     // std::bad_alloc → SIGABRT）。此时 stderr 只有 libc++abi 提示，需要转成可读原因。
@@ -325,7 +372,7 @@ function buildDmg(opts) {
       fs.writeFileSync(path.join(stageDir, '安装说明.txt'), T.MAC_DMG_README(version), { encoding: 'utf8', mode: 0o644 });
     } catch (err) {
       // 放不进去不阻断 DMG 制作：拖拽仍可用（只是用户需手动处理 Gatekeeper）
-      if (typeof warn === 'function') warn(`安装引导文件写入失败：${String(err && err.message).slice(0, 120)}`);
+      console.warn(`安装引导文件写入失败：${String(err && err.message).slice(0, 120)}`);
     }
   }
 

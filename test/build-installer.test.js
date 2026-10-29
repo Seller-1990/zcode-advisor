@@ -1,6 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -27,12 +28,25 @@ function fixture(t, version = 'v22.1.0', root = fs.mkdtempSync(path.join(os.tmpd
       return realRequire(spec);
     },
     async fetch(url) {
-      requests.push(url);
       const selected = url.includes('index.json') ? 'v24.1.0' : url.match(/\/(v\d+\.\d+\.\d+)\//)[1];
+      // buildZip/buildTarGz are deterministic, so SHASUMS256.txt can be computed from the same bytes.
+      const zip = () => buildZip([{ path: `node-${selected}-win-x64/node.exe`, data: Buffer.from(selected) }]);
+      const tgz = arch => buildTarGz([{ path: `node-${selected}-darwin-${arch}/bin/node`, data: Buffer.from(selected) }]);
       let bytes;
-      if (url.endsWith('index.json')) bytes = Buffer.from(JSON.stringify([{ version: selected, lts: 'Test' }]));
-      else if (url.endsWith('.zip')) bytes = buildZip([{ path: `node-${selected}-win-x64/node.exe`, data: Buffer.from(selected) }]);
-      else bytes = buildTarGz([{ path: `node-${selected}-darwin-arm64/bin/node`, data: Buffer.from(selected) }]);
+      if (url.endsWith('SHASUMS256.txt')) {
+        // Checksum requests are not counted: the assertions below track binary/index downloads only.
+        const h = b => crypto.createHash('sha256').update(b).digest('hex');
+        bytes = Buffer.from([
+          `${h(zip())}  node-${selected}-win-x64.zip`,
+          `${h(tgz('arm64'))}  node-${selected}-darwin-arm64.tar.gz`,
+          `${h(tgz('x64'))}  node-${selected}-darwin-x64.tar.gz`
+        ].join('\n'));
+      } else {
+        requests.push(url);
+        if (url.endsWith('index.json')) bytes = Buffer.from(JSON.stringify([{ version: selected, lts: 'Test' }]));
+        else if (url.endsWith('.zip')) bytes = zip();
+        else bytes = tgz(url.includes('darwin-x64') ? 'x64' : 'arm64');
+      }
       return { ok: true, async arrayBuffer() { return bytes; } };
     }
   };

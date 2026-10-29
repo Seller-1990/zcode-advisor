@@ -303,15 +303,14 @@ test('inject.js：样式表被真实注入文档（回归：曾只定义 css 常
 });
 
 test('inject.js：样式注入幂等（重复执行不产生多个 style）', () => {
-  const dom = runInject();
-  // 模拟脚本被再次注入：重置标志后重跑
-  const fn = new Function(
-    'document', 'window', 'setTimeout', 'console', 'fetch', '__API_PORT__', '__TOKEN__', INJECT_SRC
-  );
-  dom.window.__zcodeAdvisorInjected = false;
-  fn(dom.document, dom.window, dom.setTimeout, dom.console, dom.fetch, 9420, 't');
+  // 真幂等：同一页面、同一令牌再注入一次（令牌变化分支见下方「令牌变化时重建注入」）
+  const dom = runInject({ token: 'same-token' });
+  const createdBefore = dom.created.length;
+  runInject({ reuse: dom, token: 'same-token' });
+  assert.strictEqual(dom.created.length, createdBefore, '同令牌重复注入不应再创建任何元素');
   const styles = dom.created.filter((e) => e.tagName === 'STYLE' && e.id === 'zca-style');
   assert.strictEqual(styles.length, 1, '同一文档只应有一个 zca-style');
+  assert.strictEqual(dom.window.__zcodeAdvisorToken, 'same-token');
 });
 
 // ---------------- 角标本身 ----------------

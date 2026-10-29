@@ -73,13 +73,19 @@ release_lock() {
   if [ -z "$LOCK_OWNER" ] || [ "$LOCK_OWNER" = "$$" ]; then
     rm -rf "$LOCK_DIR"
   fi
+  # 幂等：释放过一次就不再碰锁目录（避免二次调用误删之后别人新建的锁）。
+  LOCK_ACQUIRED=""
 }
 # OCR_REVIEW_FORCE=1 可绕过（需要并行评审时显式指定）
 if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
   if mkdir "$LOCK_DIR" 2>/dev/null; then
     LOCK_ACQUIRED=1
     printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
-    trap release_lock EXIT INT TERM
+    # EXIT 与信号分开：`trap f EXIT INT TERM` 时 bash 收到 INT/TERM 只跑 f 然后**继续执行**
+    # 后续脚本（bash 3.2 实测 rc=0）。信号处理只负责以 128+N 退出，清理统一交给 EXIT trap。
+    trap release_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
   else
     HOLD_PID=""
     [ -f "$LOCK_INFO" ] && HOLD_PID="$(sed -n 's/^pid=//p' "$LOCK_INFO" 2>/dev/null)"
@@ -93,7 +99,11 @@ if [ -z "${OCR_REVIEW_FORCE:-}" ]; then
     echo "[ocr-review] 发现陈旧锁（pid ${HOLD_PID:-未知} 已退出），接管"
     LOCK_ACQUIRED=1
     printf 'pid=%s\nstarted=%s\n' "$$" "$(date +%s)" > "$LOCK_INFO"
-    trap release_lock EXIT INT TERM
+    # EXIT 与信号分开：`trap f EXIT INT TERM` 时 bash 收到 INT/TERM 只跑 f 然后**继续执行**
+    # 后续脚本（bash 3.2 实测 rc=0）。信号处理只负责以 128+N 退出，清理统一交给 EXIT trap。
+    trap release_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
   fi
 fi
 
@@ -234,12 +244,20 @@ else
 fi
 # === 降级链区块结束 ===
 
-# 时间预算：防"建连后永久挂起"把整条链卡死（本机无 GNU timeout，见 run_with_deadline）。
+# 时间预算：防"建连后永久挂起"把整条链卡死（GNU timeout 可用则用，否则进程组兜底，见 run_with_deadline）。
 #   HOP_TIMEOUT  单跳上限。完整评审实测 5–15 分钟，900s 覆盖正常耗时，只掐挂起。
 #   TOTAL_BUDGET 整条链最长耗时。公开链条目多，按 6 跳封顶——再长会把
 #                .git/ocr-review.lock 占用到之后每次推送都被误判"已有评审在进行"。
 HOP_TIMEOUT="${OCR_REVIEW_HOP_TIMEOUT:-900}"
 TOTAL_BUDGET="${OCR_REVIEW_TOTAL_BUDGET:-5400}"
+# 非正整数（如 "15m"、空串、0）会让 run_with_deadline 的算术比较失效 → 等于没有超时。
+# 一律回落默认值并提示，不让一个手滑的环境变量把挂起保护悄悄关掉。
+# 全零（"00"）也拒：GNU timeout 把 0 当"不限时"。合法值再用 10# 归一化去前导零——
+# 否则 "08"/"09" 在 bash 算术里按八进制解析直接报错。
+case "$HOP_TIMEOUT" in ''|*[!0-9]*|*[!0]*) ;; *) HOP_TIMEOUT=0 ;; esac
+case "$HOP_TIMEOUT" in ''|*[!0-9]*|0) echo "（OCR_REVIEW_HOP_TIMEOUT=${OCR_REVIEW_HOP_TIMEOUT:-} 非正整数，改用 900）" >&2; HOP_TIMEOUT=900 ;; *) HOP_TIMEOUT=$((10#$HOP_TIMEOUT)) ;; esac
+case "$TOTAL_BUDGET" in ''|*[!0-9]*|*[!0]*) ;; *) TOTAL_BUDGET=0 ;; esac
+case "$TOTAL_BUDGET" in ''|*[!0-9]*|0) echo "（OCR_REVIEW_TOTAL_BUDGET=${OCR_REVIEW_TOTAL_BUDGET:-} 非正整数，改用 5400）" >&2; TOTAL_BUDGET=5400 ;; *) TOTAL_BUDGET=$((10#$TOTAL_BUDGET)) ;; esac
 CHAIN_START="$(date +%s)"
 
 # 上游限流与资产噪音的稳定参数（都是实测踩出来的教训，不是默认值拍脑袋）：
@@ -283,7 +301,11 @@ ATTEMPT_LOG=""
 #   - `$CHOSEN` 非空 = 确有一跳产出完整评审。**不能**只看 OUT_JSON 非空：链全失败时
 #     OUT_JSON 里留着最后一跳的 partial/无效输出，照拷会把上一份好结论覆盖成半成品。
 #   - 命中锁而提前退出的进程根本走不到这里（锁检查在 OUT_JSON 创建之前）。
+CLEANUP_DONE=""
 cleanup() {
+  # 幂等：只执行一次（信号 → exit → EXIT trap 的链路下也不会重复发布/删除）。
+  [ -z "$CLEANUP_DONE" ] || return 0
+  CLEANUP_DONE=1
   if [ -n "${OCR_REVIEW_RAW_OUT:-}" ] && [ -n "${CHOSEN:-}" ]; then
     # 这里不再检查 OUT_JSON 非空：$CHOSEN 只在 valid_output 通过后赋值，而 valid_output
     # 首行就是 [ -s "$OUT_JSON" ]，故「CHOSEN 非空」已蕴含「有完整评审可拷」。
@@ -329,7 +351,10 @@ cleanup() {
   # 只看 LOCK_ACQUIRED 则会在「已被接管」时误删接管者的锁。
   release_lock
 }
-trap cleanup EXIT INT TERM
+# 同上：信号只负责以 130/143 退出，cleanup 由 EXIT trap 执行恰好一次。
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # 判定一次尝试是否真正成功：退出码为 0 **且** 评审确实完整完成。
 #
@@ -377,8 +402,8 @@ PYCHECK
 
 # hard deadline：给一条命令套"最多 secs 秒"的上限，超时整组终止（含孙进程）。
 #
-# 为什么不用 `timeout`：本机是 macOS + bash 3.2，没有 GNU coreutils 的 timeout，
-# 也没有 gtimeout（防止某天被装进来）。
+# 为什么不只用 `timeout`：macOS + bash 3.2 默认没有 GNU coreutils 的 timeout/gtimeout；
+# 有 GNU timeout 时优先用它（见下方探测），否则走下面的进程组兜底实现。
 # 为什么不用 `perl -e 'alarm N; exec @ARGV'`：alarm 只杀 perl 自己变出的那个进程，
 # ocr 派生的子进程会漏成孤儿。这里改用"自成进程组 + 整组 signale"：
 #   set -m 让后台任务成为组长（PGID == PID），超时时 kill -TERM -- -PID 全组带走。

@@ -56,37 +56,45 @@ test('plugins/zcode-advisor 含插件运行必需文件', () => {
   }
 });
 
-test('同步脚本能发现「源已删除、副本残留」的幽灵文件（0.2.17 删除 advisor-api 的教训）', () => {
-  // 回归：diffTree 原先只做单向比对（源→目标），源里删掉的文件在副本里永远不会被报出来，
-  // 宿主按目录拷贝就会把旧命令文档一起装进去。这里用临时幽灵文件验证反向检查已生效。
-  const dest = path.join(ROOT, 'plugins', 'zcode-advisor');
-  const ghost = path.join(dest, 'commands', '__ghost-test__.md');
-  const orphanDirs = () => fs.readdirSync(dest).filter((n) => n.startsWith('.orphan-'));
-  const before = new Set(orphanDirs());
-  const run = () => {
+// 独立 fixture：源/副本各一份最小一致的树，经 ZCODE_ADVISOR_SYNC_ROOT/DEST 指给同步脚本。
+// 幽灵文件类用例必须在这里造，绝不写进真实 plugins/ 树（会与并行测试/工作区互相污染）。
+function syncFixture(t, prefix) {
+  const fx = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const fxRoot = path.join(fx, 'src');
+  const fxDest = path.join(fx, 'dest');
+  t.after(() => { try { fs.rmSync(fx, { recursive: true, force: true }); } catch (_) {} });
+  for (const base of [fxRoot, fxDest]) {
+    fs.mkdirSync(path.join(base, 'commands'), { recursive: true });
+    fs.writeFileSync(path.join(base, 'commands', 'keep.md'), 'keep\n', 'utf8');
+  }
+  const env = Object.assign({}, process.env, { ZCODE_ADVISOR_SYNC_ROOT: fxRoot, ZCODE_ADVISOR_SYNC_DEST: fxDest });
+  const run = (args) => {
     try {
-      execFileSync(process.execPath, [SYNC, '--check'], { encoding: 'utf8', stdio: 'pipe' });
-      return 0;
+      return { code: 0, out: execFileSync(process.execPath, [SYNC, ...args], { encoding: 'utf8', stdio: 'pipe', env }) };
     } catch (err) {
-      return err.status;
+      return { code: err.status, out: String(err.stdout || '') + String(err.stderr || '') };
     }
   };
-  try {
-    fs.writeFileSync(ghost, '# ghost\n', 'utf8');
-    assert.notStrictEqual(run(), 0, '副本里的幽灵文件必须让 --check 失败');
-    // 走同步：应把幽灵文件隔离到 .orphan-*（不是直接删）
-    execFileSync(process.execPath, [SYNC], { encoding: 'utf8', stdio: 'pipe' });
-    assert.ok(!fs.existsSync(ghost), '同步应把幽灵文件移出插件目录');
-    assert.strictEqual(run(), 0, '隔离后应恢复无漂移');
-  } finally {
-    // 本次测试自己造的隔离目录不留痕：移到系统临时目录（等价回收站，不直接删）
-    try { if (fs.existsSync(ghost)) fs.unlinkSync(ghost); } catch (_) {}
-    const trash = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-orphan-'));
-    for (const name of orphanDirs()) {
-      if (before.has(name)) continue;
-      try { fs.renameSync(path.join(dest, name), path.join(trash, name)); } catch (_) {}
-    }
-  }
+  return { fxRoot, fxDest, run };
+}
+
+test('同步脚本能发现「源已删除、副本残留」的幽灵文件（0.2.17 删除 advisor-api 的教训）', (t) => {
+  // 回归：diffTree 原先只做单向比对（源→目标），源里删掉的文件在副本里永远不会被报出来，
+  // 宿主按目录拷贝就会把旧命令文档一起装进去。这里用幽灵文件验证反向检查已生效。
+  const { fxDest, run } = syncFixture(t, 'zcadv-ghost-');
+  // 正向对照：一致的 fixture 本身必须无漂移，否则下面的「失败」断言可能是 fixture 坏了
+  assert.strictEqual(run(['--check']).code, 0, '一致的 fixture 不应报漂移');
+  const ghost = path.join(fxDest, 'commands', '__ghost-test__.md');
+  fs.writeFileSync(ghost, '# ghost\n', 'utf8');
+  assert.notStrictEqual(run(['--check']).code, 0, '副本里的幽灵文件必须让 --check 失败');
+  // 走同步：应把幽灵文件隔离到 .orphan-*（不是直接删）
+  const synced = run([]);
+  assert.strictEqual(synced.code, 0, `同步应成功：\n${synced.out}`);
+  assert.ok(!fs.existsSync(ghost), '同步应把幽灵文件移出插件目录');
+  assert.strictEqual(run(['--check']).code, 0, '隔离后应恢复无漂移');
+  const orphans = fs.readdirSync(fxDest).filter((n) => n.startsWith('.orphan-'));
+  assert.strictEqual(orphans.length, 1, '应恰好产生一个隔离目录');
+  assert.ok(fs.existsSync(path.join(fxDest, orphans[0], 'commands', '__ghost-test__.md')), '幽灵文件应可在隔离目录里回捞');
 });
 
 test('四处版本号必须一致（2cd7e42 只提镜像版本号 → 装出「版本号新、内容旧」）', () => {
@@ -158,35 +166,18 @@ test('同步清单覆盖 plugin.json 声明的全部组件（防再漏 tools/ �
     `副本目录缺少 plugin.json 声明的组件：${missing.join(', ')}（同步清单漏项会让插件功能失效）`);
 });
 
-test('同步脚本：目录内残留（walk 分支）被检出并隔离', () => {
-  // 反向比对的基本情形：副本里多出一个源侧不存在的子项。
-  const dest = path.join(ROOT, 'plugins', 'zcode-advisor');
-  const run = () => {
-    try {
-      execFileSync(process.execPath, [SYNC, '--check'], { encoding: 'utf8', stdio: 'pipe' });
-      return 0;
-    } catch (err) {
-      return err.status;
-    }
-  };
-  const orphanDirs = () => fs.readdirSync(dest).filter((n) => n.startsWith('.orphan-'));
-  const before = new Set(orphanDirs());
-  const ghostSub = path.join(dest, 'commands', '__ghost-dir__');
-  try {
-    fs.mkdirSync(ghostSub, { recursive: true });
-    fs.writeFileSync(path.join(ghostSub, 'x.md'), '# x\n', 'utf8');
-    assert.notStrictEqual(run(), 0, '目录内残留必须让 --check 失败');
-    execFileSync(process.execPath, [SYNC], { encoding: 'utf8', stdio: 'pipe' });
-    assert.ok(!fs.existsSync(ghostSub), '同步应隔离该残留');
-    assert.strictEqual(run(), 0, '隔离后应恢复无漂移');
-  } finally {
-    try { fs.rmSync(ghostSub, { recursive: true, force: true }); } catch (_) {}
-    const trash = fs.mkdtempSync(path.join(os.tmpdir(), 'zcadv-orphan2-'));
-    for (const name of orphanDirs()) {
-      if (before.has(name)) continue;
-      try { fs.renameSync(path.join(dest, name), path.join(trash, name)); } catch (_) {}
-    }
-  }
+test('同步脚本：目录内残留（walk 分支）被检出并隔离', (t) => {
+  // 反向比对的基本情形：副本里多出一个源侧不存在的子目录。
+  const { fxDest, run } = syncFixture(t, 'zcadv-ghostdir-');
+  assert.strictEqual(run(['--check']).code, 0, '一致的 fixture 不应报漂移');
+  const ghostSub = path.join(fxDest, 'commands', '__ghost-dir__');
+  fs.mkdirSync(ghostSub, { recursive: true });
+  fs.writeFileSync(path.join(ghostSub, 'x.md'), '# x\n', 'utf8');
+  assert.notStrictEqual(run(['--check']).code, 0, '目录内残留必须让 --check 失败');
+  const synced = run([]);
+  assert.strictEqual(synced.code, 0, `同步应成功：\n${synced.out}`);
+  assert.ok(!fs.existsSync(ghostSub), '同步应隔离该残留');
+  assert.strictEqual(run(['--check']).code, 0, '隔离后应恢复无漂移');
 });
 
 test('同步脚本：源侧整个 ITEM 消失 → 副本里的整块残留被 --check 报出并被隔离（顶层分支）', (t) => {
@@ -298,8 +289,8 @@ test('同步脚本：副本里的 __pycache__ 不被当作"残留"隔离', (t) =
     ZCODE_ADVISOR_SYNC_ROOT: fxRoot,
     ZCODE_ADVISOR_SYNC_DEST: fxDest
   });
-  const out = execFileSync(process.execPath, [SYNC, '--check'], { encoding: 'utf8', stdio: 'pipe', env });
-  assert.ok(true, out);
+  // --check 抛错即测试失败（execFileSync 非零退出会 throw）——副本里的 __pycache__ 不得算漂移
+  execFileSync(process.execPath, [SYNC, '--check'], { encoding: 'utf8', stdio: 'pipe', env });
   // 副本里的 __pycache__ 不应算漂移，也不该被隔离
   execFileSync(process.execPath, [SYNC], { encoding: 'utf8', stdio: 'pipe', env });
   const orphans = fs.readdirSync(fxDest).filter((n) => n.startsWith('.orphan-'));

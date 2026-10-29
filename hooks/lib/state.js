@@ -1,21 +1,24 @@
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+// Node>=22：Atomics.wait 在主线程恒可用（engines 已声明），无需忙等兜底。
 function sleepSync(ms) {
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch (_) {
-    const end = Date.now() + ms;
-    while (Date.now() < end) { /* 忙等兜底（极老 Node 才会走到） */ }
-  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// 已是干净 id（只含 [A-Za-z0-9_-] 且 ≤80）原样返回——既有文件名不变、无需迁移。
+// 被改写或截断时追加 8 位 sha1：否则 `a/b`、`a.b`、`a b` 都映射到 `a-b`，不同会话共用一个状态文件。
+// ⚠️ tools/companion/controller.cjs 的 sanitizeSessionIdForState 必须保持同一规则。
 function sanitizeSessionId(sessionId) {
   const s = String(sessionId || '').trim();
-  const cleaned = s.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 80);
-  return cleaned || 'default';
+  if (!s) return 'default';
+  const cleaned = s.replace(/[^A-Za-z0-9_-]/g, '-');
+  if (cleaned === s && s.length <= 80) return s;
+  const hash = crypto.createHash('sha1').update(s).digest('hex').slice(0, 8);
+  return `${cleaned.slice(0, 71)}-${hash}`;
 }
 
 function stateFilePath(stateDir, sessionId) {
@@ -80,11 +83,15 @@ function freshState(sessionId, transcriptPath, startEnabled) {
 }
 
 // 找不到就创建（幂等）。所有调用方都必须拿到一个可用 state，保证流程可继续。
+const tightenedDirs = new Set();
 function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
   fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   // 目录已存在时 mkdirSync 的 mode 不生效：state 目录含会话转录路径与审查计数，
-  // 历史遗留的宽权限目录在此收紧（失败不阻断——只读文件系统下尽力而为）。
-  try { fs.chmodSync(stateDir, 0o700); } catch (_) {}
+  // 历史遗留的宽权限目录在此收紧——每进程每目录一次即可（失败不阻断，尽力而为）。
+  if (!tightenedDirs.has(stateDir)) {
+    tightenedDirs.add(stateDir);
+    try { fs.chmodSync(stateDir, 0o700); } catch (_) {}
+  }
   const file = stateFilePath(stateDir, sessionId);
   if (!fs.existsSync(file)) {
     const created = freshState(sessionId, transcriptPath, startEnabled);
@@ -104,10 +111,15 @@ function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
         s.transcriptPath = transcriptPath;
         s.byteOffset = 0;
         s.lastHeadHash = '';
-      });
+      }, { sessionId, transcriptPath, startEnabled });
       return { state: updated || state, file, created: false };
     }
     return { state, file, created: false };
+  }
+  if (current.status === 'error') {
+    // IO 错误（EACCES/EBUSY 等）：盘上很可能是一份完好的真实状态（含「关闭」与计数），
+    // 绝不以空状态覆盖——与 mutateStateExclusive 同口径。只返回内存态供流程继续，不落盘。
+    return { state: freshState(sessionId, transcriptPath, startEnabled), file, created: false, readError: current.detail || 'error' };
   }
   if (current.status === 'corrupt') {
     // 损坏的 state：先留尸（保留排查线索），再重建。
@@ -115,11 +127,14 @@ function ensureState(stateDir, sessionId, transcriptPath, startEnabled) {
       fs.renameSync(file, `${file}.corrupt-${Date.now()}`);
     } catch (_) {}
   }
-  // status === 'missing'（existsSync 之后被对手删掉）或 'error'（读错误）：重建，
-  // 失败则由 saveState 抛出，由调用方降级。
+  // status === 'missing'（existsSync 之后被对手删掉）或 'corrupt'（已留尸）：同样走排他创建，
+  // 窗口内对手先建则采纳对手的状态；写失败由 createStateExclusive 抛出，由调用方降级。
   const state = freshState(sessionId, transcriptPath, startEnabled);
-  saveState(file, state);
-  return { state, file, created: true };
+  if (createStateExclusive(file, state)) return { state, file, created: true };
+  const theirs = loadStateDetailed(file);
+  if (theirs.status === 'ok') return { state: theirs.state, file, created: false };
+  // 对手的文件也读不出来：不再重试/覆盖，内存态兜底。
+  return { state, file, created: false, readError: theirs.status };
 }
 
 function loadState(file) {
@@ -163,10 +178,7 @@ function saveState(file, state) {
     try {
       // state 含会话转录路径与审查计数：0600 落盘，不依赖 umask（历史版本曾含明文 key）。
       fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
-      fs.renameSync(tmp, file);
-      // rename 后文件 inode 来自 tmp（恒 0600）；此 chmod 是针对异常文件系统的
-      // 纵深防御（正常 POSIX 下为 no-op，失败静默不影响主流程）。
-      try { fs.chmodSync(file, 0o600); } catch (_) {}
+      fs.renameSync(tmp, file); // rename 后 inode 来自 tmp（唯一名新建，恒 0600），无需再 chmod
       return;
     } catch (err) {
       lastErr = err;
@@ -195,7 +207,7 @@ function createStateExclusive(file, state) {
       // 目标文件系统不支持硬链接（少数挂载/网络盘）：退回独占打开，语义相同。
       let fd = null;
       try {
-        fd = fs.openSync(file, 'wx');
+        fd = fs.openSync(file, 'wx', 0o600);
         fs.writeSync(fd, JSON.stringify(state, null, 2));
         created = true;
       } catch (err2) {
@@ -214,8 +226,7 @@ function createStateExclusive(file, state) {
   } finally {
     try { fs.unlinkSync(tmp); } catch (_) {}
   }
-  if (created) { try { fs.chmodSync(file, 0o600); } catch (_) {} }
-  return created;
+  return created; // link 继承 tmp 的 0600；wx 回退同样以 0600 创建
 }
 
 // 锁属主是否仍活着：**只有 ESRCH（进程不存在）算已死**，其余 errno 一律保守算活。
@@ -253,7 +264,11 @@ function withExclusiveLock(lockFile, fn, opts) {
       fs.writeFileSync(lockFile, myPid, { flag: 'wx' });
       got = true;
       break;
-    } catch (_) {
+    } catch (err) {
+      // 只有 EEXIST（锁被他人持有）值得重试；ENOENT（目录不存在）/EACCES 等重试也不会好转，
+      // 空转 retries×25ms≈1s 只会拖慢 hook——直接失败，由调用方降级。
+      // EPERM/EBUSY 例外：Windows 下锁文件「删除挂起」期间 'wx' 会短暂报这两个码，属可恢复竞争。
+      if (!err || !['EEXIST', 'EPERM', 'EBUSY'].includes(err.code)) return null;
       // 陈旧判定 = mtime 超 staleMs（原规则）**或属主进程已死**（R24：崩溃/被 KILL 的持锁者残留）。
       // 只看 mtime 会让残留锁把随后 staleMs(默认 10s) 内的所有写挡在门外，而重试预算只有
       // retries×25ms≈1s ⇒ 写全部返回 null 被静默丢弃（实测：属主已死的残留锁 1140ms 后丢写、
@@ -302,16 +317,32 @@ function withExclusiveLock(lockFile, fn, opts) {
 // 写前后都校验锁属主：慢持有者（杀毒/索引器拖慢 IO）被对手按陈旧抢锁后，
 // 原持有者不得再写回（否则双写者复活，丢更新回归）。
 // 拿不到锁/属主丢失返回 null，由调用方决定降级（意见保留到下一轮）。
+// opts 除锁参数外可带 { sessionId, transcriptPath, startEnabled }：文件缺失/损坏需重建时使用。
+// 未给 sessionId 时从文件名 sess-<id>.json 反推；未给 startEnabled 时沿用旧默认（启用）——
+// 调用方应传 cfg.startEnabled，否则被 prune 掉的会话会以「启用」复活。
+function sessionIdFromFile(file) {
+  const m = /^sess-(.*)\.json$/.exec(path.basename(file));
+  return m ? m[1] : '';
+}
+
+// 进程级重建默认值：hook 每个进程只服务一份配置，入口 loadConfig 后调用一次，
+// 免得 30 处调用点逐个透传 startEnabled。
+let rebuildStartEnabled;
+function setRebuildDefaults({ startEnabled } = {}) { rebuildStartEnabled = startEnabled; }
+
 function mutateStateExclusive(file, fn, opts) {
+  const o = opts || {};
+  const startEnabled = o.startEnabled !== undefined ? o.startEnabled : rebuildStartEnabled;
+  const rebuild = () => freshState(o.sessionId || sessionIdFromFile(file), o.transcriptPath || '', startEnabled);
   return withExclusiveLock(`${file}.wrlock`, (ownLock) => {
     const r = loadStateDetailed(file);
     let state;
     if (r.status === 'ok') state = r.state;
-    else if (r.status === 'missing') state = freshState('', '', true);
+    else if (r.status === 'missing') state = rebuild();
     else if (r.status === 'corrupt') {
       // 与 ensureState 同口径：留尸后重建，不清空真实数据还不留痕迹。
       try { fs.renameSync(file, `${file}.corrupt-${Date.now()}`); } catch (_) {}
-      state = freshState('', '', true);
+      state = rebuild();
     } else {
       return null; // IO 错误：绝不以空状态覆盖
     }
@@ -363,31 +394,52 @@ function listStatePaths(stateDir) {
   return entries.map((e) => e.full);
 }
 
+// 旁文件（留尸 .corrupt-* / 崩溃残留 .tmp-* / 残留锁 .wrlock、.lock）超过该龄即回收。
+// 1 天远超锁的陈旧阈值（wrlock 10s、审查锁 10min），不会误删活持有者；.corrupt-* 可能
+// 含 0.2.17 前的明文 key（stripLegacySecrets 只作用于正常读取路径），不能永久留盘。
+const SIDECAR_MAX_AGE_MS = 24 * 3600 * 1000;
+const SIDECAR_RE = /^sess-.*\.json\.(?:corrupt-\d+|tmp-.+|wrlock|lock)$/;
+
+// 写者正持有新鲜 .wrlock 的状态文件不删：否则 mutateStateExclusive 写回会让刚删的会话复活，
+// 或删在其读-改-写中途。
+function hasFreshWrLock(file, now) {
+  try { return now - fs.statSync(`${file}.wrlock`).mtimeMs <= 10000; } catch (_) { return false; }
+}
+
 // 家务清理：状态文件是纯计数器，过期即可删。
 function pruneStates(stateDir, maxAgeDays, keep) {
   const limitAge = (maxAgeDays || 7) * 24 * 3600 * 1000;
   const limitKeep = keep || 50;
-  let entries = [];
+  let names = [];
   try {
-    entries = fs.readdirSync(stateDir)
-      .filter((f) => /^sess-.*\.json$/.test(f))
-      .map((f) => {
-        const full = path.join(stateDir, f);
-        let mtime = 0;
-        try { mtime = fs.statSync(full).mtimeMs; } catch (_) {}
-        return { full, mtime };
-      });
+    names = fs.readdirSync(stateDir);
   } catch (_) {
     return;
   }
   const now = Date.now();
+  const mtimeOf = (full) => { try { return fs.statSync(full).mtimeMs; } catch (_) { return 0; } };
+  for (const f of names) {
+    if (!SIDECAR_RE.test(f)) continue;
+    const full = path.join(stateDir, f);
+    const mtime = mtimeOf(full);
+    if (mtime && now - mtime > SIDECAR_MAX_AGE_MS) {
+      try { fs.unlinkSync(full); } catch (_) {}
+    }
+  }
+  const entries = names
+    .filter((f) => /^sess-.*\.json$/.test(f))
+    .map((f) => {
+      const full = path.join(stateDir, f);
+      return { full, mtime: mtimeOf(full) };
+    });
   for (const e of entries) {
-    if (now - e.mtime > limitAge) {
+    if (now - e.mtime > limitAge && !hasFreshWrLock(e.full, now)) {
       try { fs.unlinkSync(e.full); } catch (_) {}
     }
   }
   const kept = entries.filter((e) => fs.existsSync(e.full)).sort((a, b) => b.mtime - a.mtime);
   for (const e of kept.slice(limitKeep)) {
+    if (hasFreshWrLock(e.full, now)) continue;
     try { fs.unlinkSync(e.full); } catch (_) {}
   }
 }
@@ -514,5 +566,5 @@ function countLocks(stateDir, staleMs) {
 module.exports = {
   ensureState, loadState, loadStateDetailed, saveState, mutateStateExclusive, withExclusiveLock, latestStatePath, listStatePaths, stateFilePath,
   sanitizeSessionId, pruneStates, bumpDrop, bumpPrimaryFailStreak, isFailStreakReason, freshState, createLock, clearLock, clearLockIfOwner,
-  lockPathFor, countLocks, admitGlobalWorker, sleepSync, lockOwnerAlive, readLockOwner
+  lockPathFor, countLocks, admitGlobalWorker, sleepSync, lockOwnerAlive, readLockOwner, setRebuildDefaults
 };

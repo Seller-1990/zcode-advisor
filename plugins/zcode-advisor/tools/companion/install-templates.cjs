@@ -130,6 +130,9 @@ if [ -f "$SRC/bin/node" ]; then
   chmod +x "$SUPPORT/bin/node" || { echo "[错误] 设置执行位失败" >&2; exit 1; }
 elif command -v node >/dev/null 2>&1; then
   SYSTEM_NODE="$(command -v node)"
+  # 版本校验：角标外挂依赖全局 WebSocket（Node >= 22），旧版 node 复制过去只会运行时才崩。
+  "$SYSTEM_NODE" -e 'process.exit(typeof WebSocket==="function"?0:1)' >/dev/null 2>&1 \\
+    || { echo "[错误] 系统 Node 版本过旧（缺少全局 WebSocket）：$SYSTEM_NODE。请安装 Node >= 22 后重试。" >&2; exit 1; }
   cp -f "$SYSTEM_NODE" "$SUPPORT/bin/node" || { echo "[错误] 复制系统 Node 失败：$SYSTEM_NODE" >&2; exit 1; }
   chmod +x "$SUPPORT/bin/node" || { echo "[错误] 设置执行位失败" >&2; exit 1; }
   echo "[提示] 包内未内嵌 Node，已使用系统 Node：$SYSTEM_NODE"
@@ -248,13 +251,51 @@ if [ ! -d "$APP_SRC" ]; then
 fi
 
 # ── 拷贝到 /Applications（覆盖旧版）──
-if [ -d "$APP_DST" ]; then
-  echo "检测到已安装的旧版本，正在替换…"
-  rm -rf "$APP_DST"
-fi
-if cp -R "$APP_SRC" "$APP_DST" 2>/dev/null; then
+# 先复制到同目录临时位置、成功后再替换：直接 rm -rf 旧版再 cp，复制失败会让用户两头落空。
+APP_TMP="$APP_DST.installing.$$"
+rm -rf "$APP_TMP"
+if cp -R "$APP_SRC" "$APP_TMP" 2>/dev/null; then
+  # 旧版先整体挪到旁边（同目录 rename，原子），新版就位后再删；新版就位失败则把旧版放回。
+  # 不能直接 rm -rf 旧版：删到一半失败会留下残目录，随后 mv 会把新包挪进旧包**里面**
+  # （mv 目标是已存在目录时语义变成「移入」），脚本却照样报告安装成功。
+  APP_OLD=""
+  if [ -e "$APP_DST" ] || [ -L "$APP_DST" ]; then
+    echo "检测到已安装的旧版本，正在替换…"
+    APP_OLD="$APP_DST.old.$$"
+    rm -rf "$APP_OLD" 2>/dev/null || true
+    if ! mv "$APP_DST" "$APP_OLD" 2>/dev/null; then
+      APP_OLD=""
+      # 挪不走旧版：退回直接删除（新版已在临时位置备好），但必须确认删干净才继续。
+      rm -rf "$APP_DST" 2>/dev/null || true
+      if [ -e "$APP_DST" ] || [ -L "$APP_DST" ]; then
+        rm -rf "$APP_TMP" 2>/dev/null || true
+        echo "[错误] 无法移除 /Applications 中的旧版本（可能没有写权限或应用正在运行）。" >&2
+        read -r -p "按回车关闭…" _ || true
+        exit 1
+      fi
+    fi
+  fi
+  if ! mv "$APP_TMP" "$APP_DST" 2>/dev/null; then
+    rm -rf "$APP_TMP" 2>/dev/null || true
+    if [ -n "$APP_OLD" ]; then
+      rm -rf "$APP_DST" 2>/dev/null || true
+      if mv "$APP_OLD" "$APP_DST" 2>/dev/null; then
+        echo "[错误] 新版本就位失败，已恢复原有版本。" >&2
+      else
+        echo "[错误] 新版本就位失败，且旧版本未能放回；旧版本保留在：$APP_OLD" >&2
+      fi
+    else
+      echo "[错误] 替换 /Applications 中的旧版本失败。" >&2
+    fi
+    read -r -p "按回车关闭…" _ || true
+    exit 1
+  fi
+  if [ -n "$APP_OLD" ]; then
+    rm -rf "$APP_OLD" 2>/dev/null || echo "[提示] 旧版本残留未能清理：$APP_OLD（可手动删除）" >&2
+  fi
   echo "已安装到 /Applications"
 else
+  rm -rf "$APP_TMP" 2>/dev/null || true
   echo "[错误] 复制到 /Applications 失败（可能没有写权限）。" >&2
   echo "        请改用拖拽方式把 .app 拖进「应用程序」，然后手动执行：" >&2
   echo "        xattr -dr com.apple.quarantine \\"$APP_DST\\"" >&2

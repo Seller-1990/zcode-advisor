@@ -40,6 +40,11 @@ on:
 permissions:
   contents: read
 
+# 同一 ref 只保留最新一次运行；tag 发布不被取消（避免半截 Release）。
+concurrency:
+  group: build-installers-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   # ---------- 确定性检查（不依赖网络/模型，作为发布前置门禁） ----------
   test:
@@ -48,6 +53,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15, windows-2022]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -66,6 +72,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: windows-2022
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -107,13 +114,17 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       arches: ${{ steps.pick.outputs.arches }}
     steps:
       - id: pick
+        # 输入经 env 传入，不直接插值进脚本（防注入；choice 类型也按此惯例）。
+        env:
+          WANT_ARCH: ${{ github.event_name == 'workflow_dispatch' && inputs.mac_arch || 'both' }}
         run: |
           set -euo pipefail
-          want='${{ github.event_name == 'workflow_dispatch' && inputs.mac_arch || 'both' }}'
+          want="$WANT_ARCH"
           case "$want" in
             x64)   echo 'arches=["x64"]' >> "$GITHUB_OUTPUT" ;;
             arm64) echo 'arches=["arm64"]' >> "$GITHUB_OUTPUT" ;;
@@ -134,6 +145,7 @@ jobs:
           - arch: arm64
             runner: macos-15         # Apple Silicon
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -196,6 +208,7 @@ jobs:
       contents: write
     needs: [windows, macos]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -208,7 +221,7 @@ jobs:
         run: find artifacts -type f | sort
 
       - name: 发布 Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             artifacts/*.zip

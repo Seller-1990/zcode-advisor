@@ -26,7 +26,7 @@ const {
 } = require('./lib/config');
 const {
   ensureState, latestStatePath, listStatePaths, pruneStates, bumpDrop, bumpPrimaryFailStreak, loadState, mutateStateExclusive,
-  clearLock, clearLockIfOwner, lockPathFor, sanitizeSessionId, admitGlobalWorker
+  clearLock, clearLockIfOwner, lockPathFor, sanitizeSessionId, admitGlobalWorker, setRebuildDefaults
 } = require('./lib/state');
 const {
   readDelta, renderDelta
@@ -232,8 +232,9 @@ function effectiveApi(cfg, apiKeyInfo, state) {
 // 门禁按会话生效值评估的统一入口：gate() 检查第一参的 baseUrl/model 字段，
 // 传全局 cfg 会在「全局服务商解析失败 + 会话已覆盖」时误报 missing。
 // 所有 gate 调用点（stop/sync/worker/status/on）必须走这里，防止逐点手搓漏改。
-function gateWithSession(cfg, apiKeyInfo, state) {
-  const eff = resolveTarget(cfg, state, process.env);
+// 已解析过生效值的调用方传入 resolved，避免同一事件内重复读 ZCode 服务商配置。
+function gateWithSession(cfg, state, resolved) {
+  const eff = resolved || resolveTarget(cfg, state, process.env);
   // gate() 的 key 参数读的是 .key（历史字段名），resolveTarget 产出的是 .apiKey——
   // 直接传 eff 会让门禁恒报 missing:apiKey（所有会话静默不审查）。
   return { eff, reasons: gate({ baseUrl: eff.baseUrl, model: eff.model }, { key: eff.apiKey, source: eff.keySource }) };
@@ -334,6 +335,34 @@ const FALLBACK_TRIGGER_REASONS = new Set(['llm_empty_response', 'unparsed', 'llm
 // 命中即停机：会话进入 halted 态（原因写进 status 可见），/advisor-on 重建恢复。
 // 429/5xx/timeout/empty/unparsed 都是暂态或「换配置能治」，**不**在此列。
 const HALT_ERROR_RE = /^llm_http_(401|403)$/;
+// 404 停机阈值：主模型**连续** N 次 404 才停机（计数 state.primary404Streak，成功/其它错清零）。
+// 单次 404 可能是网关瞬时路由错误，一次即永久停机代价过高。
+const HALT_404_STREAK = 3;
+
+// 快照模式意见去重：环形容量与归一化哈希（空白折叠 + 小写；与严重度前缀无关）。
+const NOTE_DEDUPE_RING = 20;
+function noteDedupeHash(note) {
+  return hashId(String(note || '').replace(/\s+/g, ' ').trim().toLowerCase());
+}
+// 被 enqueueNote 挤掉的意见从未送达：撤回其去重哈希，允许下一轮快照重审时重新入队。
+// 入参是带严重级前缀的完整意见（`[advisor:<sev>[:deferred]] 正文`），哈希只按正文算。
+function forgetNoteHash(s, fullNote) {
+  if (!Array.isArray(s.deliveredNoteHashes)) return;
+  const h = noteDedupeHash(String(fullNote || '').replace(/^\[advisor:[^\]]*\]/, ''));
+  s.deliveredNoteHashes = s.deliveredNoteHashes.filter((x) => x !== h);
+}
+
+// 清停机（成功审查 / ctl on / model set|provider|reset 共用）。真正从停机态恢复时
+// bump haltEpoch：在飞 worker 据此识别「派发后发生过停机/恢复」并丢弃过期结果。
+function clearHalt(s) {
+  if (s.halted) s.haltEpoch = (s.haltEpoch || 0) + 1;
+  s.halted = false;
+  s.haltedReason = '';
+  s.haltedAt = '';
+  s.haltedModel = '';
+  s.haltNotifiedAt = '';
+  s.primary404Streak = 0;
+}
 
 // 备用模型的目标解析：只看全局 cfg.fallbackModel。
 // 0.2.17 起**没有**会话级备用模型——唯一的写入方（旧 /advisor-api 的 fallback: 覆盖）已随该命令删除，
@@ -351,7 +380,7 @@ function resolveFallbackModel(cfg) {
 //   注意只覆盖**模型**（服务商仍是全局那个）时凭据边界没变（同 provider = 同端点/key），
 //   降级照常可用——按 hasOverride 一刀切会把这种常见场景的降级能力白丢掉。
 function fallbackEligibility(cfg, state, eff) {
-  const model = resolveFallbackModel(cfg, state);
+  const model = resolveFallbackModel(cfg);
   if (!model) return { ok: false, reason: 'no_fallback_model' };
   if (cfg.reviewMode === 'sync') return { ok: false, reason: 'fallback_skipped:sync_mode' };
   // sessionProvider 可以是 id 或名称（面板/命令都容忍写名称），而 cfg.providerId 恒为 id——
@@ -526,10 +555,14 @@ async function reviewTurn(cfg, target, userContent, allowMock, opts) {
         ms: meta.ms
       });
     }
+    // 最终错误是否来自备用模型（主模型先失败、备用也失败）：停机只看主模型的错，
+    // 备用模型的 401/404 不得让**主模型**停机（haltedModel 记的是主模型）。
+    const fromFallback = fallbackSkipped.startsWith('fallback_failed:');
     return {
       error: attempt.error, usage, hint: remainingHint,
       // 确定性错误（401/403）：halt 语义随结果上抛，由 applyReviewOutcome 落盘
-      halt: HALT_ERROR_RE.test(attempt.error),
+      halt: !fromFallback && HALT_ERROR_RE.test(attempt.error),
+      fromFallback,
       primaryFailure: primaryFailure || (FALLBACK_TRIGGER_REASONS.has(attempt.error) ? attempt.error : ''),
       fallbackSkipped
     };
@@ -574,27 +607,35 @@ function applyReviewOutcome(s, result, eff, cfg) {
     // 停机状态只保留一种形状：布尔 + haltedReason/haltedAt/haltedModel。v0.2.23 已按此
     // 落盘，改成对象会让存量停机会话读不出原因；两条停机来源（401/403 与 404 终局）
     // 写同一组字段，一次性告知交给 UPS 的 haltNotifiedAt。
-    if (result.halt || (result.error === 'llm_http_404' && !result.usedFallback)) {
-      if (!s.halted) {
-        s.halted = true;
-        s.haltedReason = result.halt ? result.error : 'llm_http_404';
-        s.haltedAt = new Date().toISOString();
-        s.haltedModel = eff.model || '';
-        s.haltNotifiedAt = '';
-        appendHistory({ event: 'halted', sessionId: s.sessionId, reason: s.haltedReason, model: s.haltedModel });
-      }
+    // 只按**主模型**的错判停机：最终错误来自备用模型（fromFallback）时取主模型失败原因。
+    // 401/403 立即停机；404 需连续 HALT_404_STREAK 次（单次 404 可能是网关抖动）。
+    const primaryErr = result.fromFallback ? (result.primaryFailure || '') : result.error;
+    let haltReason = '';
+    if (result.halt || HALT_ERROR_RE.test(primaryErr)) {
+      haltReason = primaryErr || result.error;
+      s.primary404Streak = 0;
+    } else if (primaryErr === 'llm_http_404') {
+      s.primary404Streak = (s.primary404Streak || 0) + 1;
+      if (s.primary404Streak >= HALT_404_STREAK) haltReason = 'llm_http_404';
+    } else {
+      s.primary404Streak = 0;
+    }
+    if (haltReason && !s.halted) {
+      s.halted = true;
+      s.haltedReason = haltReason;
+      s.haltedAt = new Date().toISOString();
+      s.haltedModel = eff.model || '';
+      s.haltNotifiedAt = '';
+      s.haltEpoch = (s.haltEpoch || 0) + 1;
+      appendHistory({ event: 'halted', sessionId: s.sessionId, reason: s.haltedReason, model: s.haltedModel });
     }
     // 降级（M4）：主模型失败连击单独维护——即便这次 fallback 也失败，
     // 主模型劣化的证据仍要留下，供降级告警归因。
     if (result.primaryFailure) bumpPrimaryFailStreak(s, result.primaryFailure);
     return;
   }
-  // 审查成功即自然解除 halt（配置被修好后的第一次成功）：清停机标记。
-  s.halted = false;
-  s.haltedReason = '';
-  s.haltedAt = '';
-  s.haltedModel = '';
-  s.haltNotifiedAt = '';
+  // 审查成功即自然解除 halt（配置被修好后的第一次成功）：清停机标记与 404 连击。
+  clearHalt(s);
   // 降级成功：系统可用（清 failStreak），但主模型劣化未消（primaryFailStreak 不动）。
   if (result.usedFallback) {
     s.fallbackUsed = (s.fallbackUsed || 0) + 1;
@@ -649,7 +690,7 @@ function onSessionStart(ctx) {
 }
 
 function onUserPromptSubmit(ctx) {
-  const { stateDir, sessionId, transcriptPath, cfg, apiKeyInfo } = ctx;
+  const { stateDir, sessionId, transcriptPath, cfg } = ctx;
   const { file } = ensureState(stateDir, sessionId, transcriptPath, cfg.startEnabled);
 
   // 临界区 1：读取队列与注册标记，组装投递内容。
@@ -841,26 +882,19 @@ function onStopAsync(ctx) {
   }
 
   const current = loadState(file);
+  // 生效值每事件只解析一次（门禁与健康信标共用）。
+  const eff = effectiveApi(cfg, apiKeyInfo, current);
   // 门禁按会话级生效值评估：全局 key/端点/模型任一缺失但本会话已覆盖时照常审查。
-  const { reasons: gateReasons } = gateWithSession(cfg, apiKeyInfo, current);
-  // 确定性错误 halt：停机的会话不再发起审查（重试救不了 401/403），但保留
-  // lastActivity 更新——「会话还活着、审查不跑」要通过 /advisor-status 的 reason 可见。
+  const { reasons: gateReasons } = gateWithSession(cfg, current, eff);
+  // 确定性错误 halt（P1-⑤）：停机的会话不再派发 worker（重试救不了 401/403/404，每轮派发
+  // 只是白烧一次 spawn），但保留 lastActivity 更新——「会话还活着、审查不跑」要通过
+  // /advisor-status 的 reason 可见。恢复路径：/advisor-on 或 /advisor-model set（两处都清 halted）。
   if (!current || !current.enabled || gateReasons.length > 0 || current.halted) {
     mutateStateExclusive(file, (s) => {
       s.lastActivity = new Date().toISOString();
       if (s.enabled && gateReasons.length > 0) s.disabledReason = gateReasons.join(',');
     });
     // 门禁失败不推进指针：修复配置后可回看积压（受增量窗口与 backfill 上限截断）。
-    return;
-  }
-
-  // 确定性失败停机（P1-⑤）：halted 非空时不再派发 worker——模型对端点已确定性不可用
-  // （llm_http_404），每轮派发只是白烧一次 spawn + 复现同一个错误。恢复路径：/advisor-on
-  // 或 /advisor-model set（两处都清 halted）。UPS 侧有一次性告知行，status 持久可查。
-  if (current.halted) {
-    mutateStateExclusive(file, (s) => {
-      s.lastActivity = new Date().toISOString();
-    });
     return;
   }
 
@@ -877,19 +911,26 @@ function onStopAsync(ctx) {
     return;
   }
 
-  mutateStateExclusive(file, (s) => {
-    s.lastAction = 'spawned-review';
-    s.lastActivity = new Date().toISOString();
-  });
+  // 名额已取到：此后到 spawn 之间任何同步抛错都必须释放锁，否则会话审查停摆到 staleMs。
+  const releaseOnThrow = (fn) => {
+    try { return fn(); } catch (err) {
+      try { clearLock(file); } catch (_) {}
+      throw err;
+    }
+  };
 
-  // 健康信标（M1）：父进程必然会执行到此，记「本轮尝试了审查」。
-  // worker 被强杀时只有这条会更新，lastSuccessAt 停留 → 读取侧可判 down（而非假绿）。
-  {
-    const effAttempt = effectiveApi(cfg, apiKeyInfo, current);
+  releaseOnThrow(() => {
+    mutateStateExclusive(file, (s) => {
+      s.lastAction = 'spawned-review';
+      s.lastActivity = new Date().toISOString();
+    });
+
+    // 健康信标（M1）：父进程必然会执行到此，记「本轮尝试了审查」。
+    // worker 被强杀时只有这条会更新，lastSuccessAt 停留 → 读取侧可判 down（而非假绿）。
     health.writeAttempt(health.resolveHealthDir(process.env), sessionId, {
-      model: effAttempt.model, effectiveModel: effAttempt.model
+      model: eff.model, effectiveModel: eff.model
     }, stateDir);
-  }
+  });
 
   // —— 转录快照（ZCode 宿主契约适配）——
   // ZCode 给 hook 的 transcript_path 是**每轮临时快照**（/var/folders/.../T/zcode-*-hook-*/），
@@ -927,17 +968,22 @@ function onStopAsync(ctx) {
     snapshotPath = '';
   }
 
-  // 测试/调试钩子：跳过真实派生，由外部直接调 review-worker。
-  if (process.env.ZCODE_ADVISOR_NO_SPAWN === '1') return;
-
   const workerArgs = ['review-worker', '--state', file];
   if (snapshotPath) workerArgs.push('--transcript', snapshotPath);
-  const child = spawn(process.execPath, [__filename, ...workerArgs], {
+
+  // 测试钩子：把将要派生的 worker 参数写到文件（断言 --transcript 确实传给 worker）。
+  if (process.env.ZCODE_ADVISOR_SPAWN_ARGS_FILE) {
+    try { fs.writeFileSync(process.env.ZCODE_ADVISOR_SPAWN_ARGS_FILE, JSON.stringify(workerArgs), 'utf8'); } catch (_) {}
+  }
+  // 测试/调试钩子：跳过真实派生，由外部直接调 review-worker。
+  if (process.env.ZCODE_ADVISOR_NO_SPAWN === '1') return;
+  // 同步抛错（参数非法等）：锁已取得但无 worker 认领，立即释放而不是等 staleMs。
+  const child = releaseOnThrow(() => spawn(process.execPath, [__filename, ...workerArgs], {
     detached: true,
     stdio: 'ignore',
     cwd: PLUGIN_ROOT,
     windowsHide: true
-  });
+  }));
   // spawn 失败（EMFILE 等）走异步 error 事件：不挂监听会变 uncaughtException，
   // 且锁无人认领/清除，会话审查将停摆到 staleMs。尽力清锁并计数。
   child.on('error', () => {
@@ -955,7 +1001,7 @@ function onStopAsync(ctx) {
 // —— sync 模式：Stop 内联审查，concern/blocker 立即送达 ——
 async function onStopSync(ctx) {
   const { stateDir, sessionId, transcriptPath, cfg, apiKeyInfo, input } = ctx;
-  const { file, state: st } = ensureState(stateDir, sessionId, transcriptPath, cfg.startEnabled);
+  const { file } = ensureState(stateDir, sessionId, transcriptPath, cfg.startEnabled);
 
   // 续跑响应（由我们的 block 触发的那一轮）不重审、不推进指针：其内容并入下一次真实审查。
   if (isStopHookActive(input)) {
@@ -971,8 +1017,11 @@ async function onStopSync(ctx) {
   const current = loadState(file);
   if (!current || !current.enabled) return;
 
-  // 门禁按会话级生效值评估（与 async 路径同一口径）；halted 会话同样不审（见 HALT_ERROR_RE）。
-  const gateReasons = gateWithSession(cfg, apiKeyInfo, current).reasons;
+  // 生效值每事件只解析一次（门禁、健康信标与审查共用）。
+  const eff = effectiveApi(cfg, apiKeyInfo, current);
+  // 门禁按会话级生效值评估（与 async 路径同一口径）；halted 会话同样不审（见 HALT_ERROR_RE，
+  // 确定性失败停机 P1-⑤：与 async 同语义——halted 期间 sync 不发起内联审查）。
+  const gateReasons = gateWithSession(cfg, current, eff).reasons;
   if (gateReasons.length > 0 || current.halted) {
     mutateStateExclusive(file, (s) => {
       if (gateReasons.length > 0) s.disabledReason = gateReasons.join(',');
@@ -980,9 +1029,6 @@ async function onStopSync(ctx) {
     // 门禁失败不推进指针：修复配置后可回看积压（受增量窗口与 backfill 上限截断）。
     return;
   }
-
-  // 确定性失败停机（P1-⑤）：与 async 同语义——halted 期间 sync 不发起内联审查。
-  if (current.halted) return;
 
   const delta = readDelta(current.transcriptPath, current.byteOffset, {
     expectedHeadHash: current.lastHeadHash,
@@ -1022,7 +1068,6 @@ async function onStopSync(ctx) {
     return;
   }
 
-  const eff = effectiveApi(cfg, apiKeyInfo, current);
   const userContent = `以下是一轮对话增量（按时间顺序，可能被截断）。请按系统指令输出 JSON 判定。\n\n${rendered.text}`;
 
   // 健康信标（M1）：sync 路径无分发 worker，attempt 在审查发起前写。
@@ -1095,8 +1140,14 @@ async function onStopSync(ctx) {
   if (decision.deliver === 'queue') {
     let queued = false;
     mutateStateExclusive(file, (s) => {
+      // 与 block 分支同口径：审查期间 /advisor-off 的，不再入队。
+      if (s.enabled === false) {
+        applyDeliveryToState(s, false, cfg);
+        s.lastAction = `skipped_disabled:${frame.severity}`;
+        return;
+      }
       const note = `${prefix} ${frame.note}`;
-      queued = enqueueNote(s, note, cfg, (reason) => bumpDrop(s, reason));
+      queued = enqueueNote(s, note, cfg, (reason) => bumpDrop(s, reason), (ev) => forgetNoteHash(s, ev));
       if (queued && decision.deferred === true) s.deferred = (s.deferred || 0) + 1;
       // 队列满被丢弃时不计入 steer/deferred（不设"幻影冷却"）。
       applyDeliveryToState(s, false, cfg);
@@ -1153,6 +1204,7 @@ async function handleReviewWorker(args) {
   const transcriptOverride = snapIdx !== -1 ? args[snapIdx + 1] : '';
 
   const cfg = loadConfig(PLUGIN_ROOT, process.env);
+  setRebuildDefaults({ startEnabled: cfg.startEnabled });
   const apiKeyInfo = resolveApiKey(cfg, process.env);
   const myPid = String(process.pid);
   // 认领锁：把锁内容改写为自己的 pid，结束时只有锁仍是自己 pid 才清除。
@@ -1173,14 +1225,33 @@ async function handleReviewWorker(args) {
     //（/advisor-off 或 404 停机发生在锁认领之后）。
     if (state.halted) return;
     // 门禁按会话级生效值评估：全局 key 缺失但本会话已覆盖 key 时照常审查。
-    const gateReasons = gateWithSession(cfg, apiKeyInfo, state).reasons;
+    // 生效值只解析一次（门禁与审查共用）。
+    const eff = effectiveApi(cfg, apiKeyInfo, state);
+    const gateReasons = gateWithSession(cfg, state, eff).reasons;
     if (gateReasons.length > 0) {
       mutateStateExclusive(file, (s) => {
         s.disabledReason = gateReasons.join(',');
       });
       return;
     }
-    state.disabledReason = '';
+    // 门禁已放行：清掉上次门禁失败留下的原因。必须在临界区内改盘上状态——
+    // 改本地 state 副本不会落盘，后续 mutate 重读磁盘会把旧原因原样带回。
+    if (state.disabledReason) {
+      mutateStateExclusive(file, (s) => {
+        if (s.enabled === true) s.disabledReason = '';
+      });
+    }
+    // 派发时刻的审查目标与停机代次：最终落盘时与最新状态比对，审查期间被
+    // /advisor-off、model set/provider/reset、停机/恢复改过的，本次结果作废（见下方 isStale）。
+    const spawnSnap = {
+      sessionModel: state.sessionModel || '',
+      sessionProvider: state.sessionProvider || '',
+      haltEpoch: state.haltEpoch || 0
+    };
+    const isStale = (s) => s.enabled !== true || Boolean(s.halted)
+      || (s.sessionModel || '') !== spawnSnap.sessionModel
+      || (s.sessionProvider || '') !== spawnSnap.sessionProvider
+      || (s.haltEpoch || 0) !== spawnSnap.haltEpoch;
 
     // 快照模式：ZCode 每轮给 hook 的转录是**本轮完整快照**且每轮重写，
     // 因此用快照时从 0 全量读（byteOffset 是针对持续追加文件的指针，跨轮不适用）。
@@ -1192,7 +1263,9 @@ async function handleReviewWorker(args) {
       // 快照模式也应用 backfillLimitBytes：超长会话（数 MB 转录）不应整文件载入内存；
       // 超出上限时 readDelta 从尾部回读并丢弃首个残行，语义与持续文件路径一致。
       usingSnapshot
-        ? { backfillLimitBytes: cfg.backfillLimitBytes }
+        // final：快照是本轮完结后的完整拷贝，末行无换行也已写完——必须消费，
+        // 否则最新一条助手回复（恰是最该审的）永远落在「残行」里不被审。
+        ? { backfillLimitBytes: cfg.backfillLimitBytes, final: true }
         : {
             expectedHeadHash: state.lastHeadHash,
             backfillLimitBytes: cfg.backfillLimitBytes
@@ -1230,7 +1303,6 @@ async function handleReviewWorker(args) {
       return;
     }
 
-    const eff = effectiveApi(cfg, apiKeyInfo, state);
     const userContent = `以下是一轮对话增量（按时间顺序，可能被截断）。请按系统指令输出 JSON 判定。\n\n${rendered.text}`;
     const result = await reviewTurn(cfg, eff, userContent, mockAllowed(stateDir), { state });
 
@@ -1240,6 +1312,16 @@ async function handleReviewWorker(args) {
     // 若信标写在里面会连同本次成功的审查一起被丢弃（读取侧误判 down）。改为收集载荷、锁外写。
     let beaconPayload = null;
     mutateStateExclusive(file, (s) => {
+      // 过期结果作废：审查期间会话被停用、换了审查目标、或发生过停机/恢复——
+      // 本次结果属于旧配置，不入队、不停机/解除停机、不推进指针（新配置下重审）。
+      if (isStale(s)) {
+        s.lastAction = 'discarded_stale';
+        s.lastActivity = new Date().toISOString();
+        // 遥测照记（真实已消耗的 Token、失败原因），只是不产生审查结论。
+        accumulateUsage(s, result);
+        if (result.error) bumpDrop(s, result.error);
+        return;
+      }
       if (!usingSnapshot) {
         // 持续文件路径（Claude Code 同构宿主）：正常推进增量指针
         s.byteOffset = delta.nextOffset;
@@ -1274,7 +1356,7 @@ async function handleReviewWorker(args) {
         return;
       }
 
-      const decision = decideActionAsync(frame, s, cfg);
+      const decision = decideActionAsync(frame, s);
       if (decision.deliver === 'none') {
         applyDeliveryToState(s, false, cfg);
         return;
@@ -1282,7 +1364,20 @@ async function handleReviewWorker(args) {
 
       const prefix = prefixFor(frame.severity, decision.deferred === true);
       const note = `${prefix} ${frame.note}`;
-      const queued = enqueueNote(s, note, cfg, (reason) => bumpDrop(s, reason));
+      // 快照模式去重：每轮全量重审同一段转录，同一条意见会被反复产出。
+      // 已入队/送达过的意见（按归一化正文哈希，环形保留最近 NOTE_DEDUPE_RING 条）不再入队。
+      const noteHash = usingSnapshot ? noteDedupeHash(frame.note) : '';
+      if (noteHash && Array.isArray(s.deliveredNoteHashes) && s.deliveredNoteHashes.includes(noteHash)) {
+        applyDeliveryToState(s, false, cfg);
+        s.lastAction = `deduped:${frame.severity}`;
+        return;
+      }
+      const queued = enqueueNote(s, note, cfg, (reason) => bumpDrop(s, reason), (ev) => forgetNoteHash(s, ev));
+      if (queued && noteHash) {
+        const ring = Array.isArray(s.deliveredNoteHashes) ? s.deliveredNoteHashes : [];
+        ring.push(noteHash);
+        s.deliveredNoteHashes = ring.slice(-NOTE_DEDUPE_RING);
+      }
       if (queued) {
         if (decision.deferred === true) s.deferred = (s.deferred || 0) + 1;
         // 入队成功才计 steer/冷却；nit 不算 steer；冷却期内的 deferred concern 不算。
@@ -1325,6 +1420,7 @@ async function handleReviewWorker(args) {
 
 async function handleCtl(args) {
   const cfg = loadConfig(PLUGIN_ROOT, process.env);
+  setRebuildDefaults({ startEnabled: cfg.startEnabled });
   const sub = args[0] || 'status';
   const stateDir = resolveStateDir(cfg);
 
@@ -1387,8 +1483,7 @@ async function handleCtl(args) {
 
   if (sub === 'status') {
     const state = loadState(file);
-    const apiKeyInfo = resolveApiKey(cfg, process.env);
-    const { eff, reasons: gateReasons } = gateWithSession(cfg, apiKeyInfo, state);
+    const { eff, reasons: gateReasons } = gateWithSession(cfg, state);
     const lines = [];
     lines.push('advisor 状态');
     lines.push(`  会话: ${state.sessionId || '(未知)'}`);
@@ -1415,7 +1510,7 @@ async function handleCtl(args) {
     lines.push(`  Token 累计: 输入 ${state.tokensIn || 0} / 输出 ${state.tokensOut || 0}`);
     // 降级（M4）可见性：配了备用模型才展示；用 primaryFailStreak 说明"主模型是否在坏"。
     // 这是「不静默掩盖」在 status 侧的落点——即便降级在兜，用户也能看到主模型有问题。
-    const fbModel = resolveFallbackModel(cfg, state);
+    const fbModel = resolveFallbackModel(cfg);
     if (fbModel) {
       const pf = state.primaryFailStreak;
       const pfDesc = pf && pf.count
@@ -1468,7 +1563,7 @@ async function handleCtl(args) {
       hints.push('llm_timeout：审查超时 → 提高 reviewTimeoutMs（配置面板或 /advisor-setup；sync 模式上限 300s）');
     }
     if ((drops.llm_http_404 || 0) > 0) {
-      hints.push('llm_http_404：模型/端点不存在 → 连续 404 会停机（状态行「停机」），换模型后 /advisor-on 恢复');
+      hints.push(`llm_http_404：模型/端点不存在 → 主模型连续 ${HALT_404_STREAK} 次 404 会停机（状态行「停机」；备用模型的 404 不会让主模型停机），换模型后 /advisor-on 恢复`);
     }
     for (const h of hints) lines.push(`  提示: ${h}`);
 
@@ -1506,13 +1601,10 @@ async function handleCtl(args) {
       // 停机清除（P1-⑤）：这是唯一的人工恢复入口——用户按下它时已读过告知行/
       // 状态行，重置 halt 让 Stop 重新派发；审查本身会再次验证端点。
       wasHalted = s.halted === true;
-      s.halted = false;
-      s.haltedReason = '';
-      s.haltedAt = '';
-      s.haltedModel = '';
-      s.haltNotifiedAt = '';
+      clearHalt(s);
+      s.deliveredNoteHashes = []; // 重新启用：去重环一并重置（不在 clearHalt 里清——它每次成功审查都会调用）
       s.enabled = true;
-      const r = gateWithSession(cfg, resolveApiKey(cfg, process.env), s);
+      const r = gateWithSession(cfg, s);
       reasons = r.reasons;
       enabledModel = r.eff.model;
       s.disabledReason = reasons.length > 0 ? reasons.join(',') : '';
@@ -1561,11 +1653,8 @@ async function handleCtl(args) {
         if (provider) s.sessionProvider = provider;
         // 换审查目标 = 停机原因（旧模型对端点 404）多半不再成立：一并清除停机。
         // 若新目标同样 404，worker 会重新停机并再次告知——代价可控，不赌用户的判断。
-        s.halted = false;
-        s.haltedReason = '';
-        s.haltedAt = '';
-        s.haltedModel = '';
-        s.haltNotifiedAt = '';
+        clearHalt(s);
+        s.deliveredNoteHashes = []; // 换审查目标：新目标的意见不受旧去重环约束
       })) return;
       const parts = [];
       if (provider) parts.push(`服务商=${provider}`);
@@ -1582,11 +1671,8 @@ async function handleCtl(args) {
       if (!mutateCtlState((s) => {
         s.sessionProvider = provider;
         s.sessionModel = ''; // 换服务商后旧模型多半不属于它：一并清掉，回落新服务商清单
-        s.halted = false;     // 换目标清停机，理由同 set 分支
-        s.haltedReason = '';
-        s.haltedAt = '';
-        s.haltedModel = '';
-        s.haltNotifiedAt = '';
+        clearHalt(s);         // 换目标清停机，理由同 set 分支
+        s.deliveredNoteHashes = [];
       })) return;
       process.stdout.write(`advisor: 本会话服务商已固定为 ${provider}（模型已回落该服务商默认；用 model set <模型> 再指定）。恢复全局用 model reset。\n`);
       return;
@@ -1595,11 +1681,8 @@ async function handleCtl(args) {
       if (!mutateCtlState((s) => {
         s.sessionModel = '';
         s.sessionProvider = '';
-        s.halted = false;   // 回全局默认同样是换目标：清停机
-        s.haltedReason = '';
-        s.haltedAt = '';
-        s.haltedModel = '';
-        s.haltNotifiedAt = '';
+        clearHalt(s);       // 回全局默认同样是换目标：清停机
+        s.deliveredNoteHashes = [];
       })) return;
       const eff = resolveTarget(cfg, null, process.env);
       process.stdout.write(`advisor: 已清除本会话覆盖，回到全局默认（${eff.providerName || '（未解析出服务商）'} / ${eff.model || '（未定模型）'}）。\n`);
@@ -1620,7 +1703,6 @@ async function handleCtl(args) {
 // state 可选：传入后按**会话生效值**评估门禁（与 /advisor-status 同口径）；
 // 不传则只看全局解析结果（CI 无会话场景）。
 async function ctlDoctor(cfg, args, state) {
-  const apiKeyInfo = resolveApiKey(cfg, process.env);
   const eff = resolveTarget(cfg, state || null, process.env);
   const lines = [];
   lines.push('advisor 体检');
@@ -1720,6 +1802,7 @@ async function main() {
 
   const input = readStdinJson();
   const cfg = loadConfig(PLUGIN_ROOT, process.env);
+  setRebuildDefaults({ startEnabled: cfg.startEnabled });
   const apiKeyInfo = resolveApiKey(cfg, process.env);
   const stateDir = resolveStateDir(cfg);
   const sessionId = input.session_id || input.sessionId

@@ -105,8 +105,9 @@ function readStandby(env, now) {
 //              双击启动的裸 ZCode（companion 已按 attach-only 语义安静退场，留了待命标记）
 //   down     = companion 不在，且没有待命证据（锁缺失/心跳过期/pid 已死）
 function deriveBadgeState(lock, standby) {
-  if (lock && lock.present && lock.fresh) return lock.cdp > 0 ? 'attached' : 'waiting';
-  if (standby && standby.present && standby.fresh) return 'waiting';
+  // fresh 蕴含 present（readCompanionLock/readStandby 中 fresh 恒以 valid/present 为前提）
+  if (lock && lock.fresh) return lock.cdp > 0 ? 'attached' : 'waiting';
+  if (standby && standby.fresh) return 'waiting';
   return 'down';
 }
 

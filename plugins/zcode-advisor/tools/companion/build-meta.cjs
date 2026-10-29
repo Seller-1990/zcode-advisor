@@ -31,7 +31,7 @@ const COMPANION_DIR = __dirname;
 // 入口：发行包内必须存在的运行时文件（inject.js 是 controller 运行时 readFileSync 读取的）
 const ENTRY_FILES = ['controller.cjs', 'inject.js'];
 
-// 扫描源文件里的相对 require 与 readFileSync(__dirname, '...')，推导运行时依赖闭包。
+// 扫描源文件里的相对 require('./x')，推导运行时依赖闭包（不扫描 readFileSync；运行时读取的文件需列入 ENTRY_FILES）。
 // 只跟随相对路径（'./x'），忽略内置模块与第三方包（本项目零依赖）。
 function childDependencies(source) {
   const deps = new Set();
@@ -63,6 +63,10 @@ function companionRuntimeFiles() {
   while (queue.length > 0) {
     const file = queue.shift();
     const rel = path.relative(COMPANION_DIR, file);
+    // 依赖若落在 companion 目录之外（如 require('../x')），打包时会以 '..' 路径逃逸出包目录
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`companion 运行时依赖越出 companion 目录：${rel}——发行包无法包含该文件`);
+    }
     if (found.has(rel)) continue;
     found.add(rel);
 
@@ -81,8 +85,8 @@ function companionRuntimeFiles() {
     }
   }
 
-  // 只纳入 .cjs/.js 代码文件；inject.js 是页面脚本，由 controller 运行时读取，也算运行时文件。
-  return [...found].filter((f) => /\.(cjs|js)$/.test(f)).sort();
+  // 纳入 .cjs/.js 代码与被 require 的 .json；inject.js 是页面脚本，由 controller 运行时读取，也算运行时文件。
+  return [...found].filter((f) => /\.(cjs|js|json)$/.test(f)).sort();
 }
 
 const COMPANION_FILES = companionRuntimeFiles();

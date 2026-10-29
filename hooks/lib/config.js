@@ -342,14 +342,25 @@ function applyZcodeTarget(cfg, problems, sources, notices, env) {
 }
 
 // 占位符样式的 key（REPLACE_YOUR_KEY / your-api-key / test-key 等）视为未配置。
-// 注意：以 test 开头的真实 key 会被误判——这是有意的安全默认，README 已说明。
+// 整值匹配而非前缀：`test-abc123realkey`、`your-co-gw-77aa`、`none-9f8e` 这类真实 key 不得被误判。
+const PLACEHOLDER_KEY_RE = new RegExp('^(?:'
+  + 'replace(?:[_-]?(?:me|your|with|this|key|api|token|here))*'   // REPLACE_ME / REPLACE_YOUR_KEY
+  // your-api-key / your_key_here / your-openai-api-key / your_deepseek_key / sk-your-key / YOUR_API_KEY
+  // 中间段只允许纯字母词（openai/deepseek/own…），`your-co-gw-77aa` 这类含数字的真实 key 不命中。
+  + '|(?:sk-(?:proj-)?)?your(?:[_-][a-z]+)*?[_-]?(?:key|token|secret)(?:[_-]?here)?'
+  + '|(?:sk-(?:proj-)?)?(?:x{3,}|\\.{3,})'                          // xxx / sk-xxxx / sk-proj-xxxx / sk-...
+  + '|(?:[a-z]+[_-])*(?:key|token|secret)[_-]here'                  // api-key-here / key_here
+  + '|key|api[_-]?key|token|secret'                                 // <key> 去括号后 / 裸词
+  + '|test(?:[_-]?(?:api))?(?:[_-]?(?:key|token))?'                 // test / test-key / test_api_key
+  + '|placeholder|changeme|change[_-]me|none|null|empty|undefined|todo|dummy|fake'
+  + ')$', 'i');
+
 function isPlaceholderKey(value) {
   if (typeof value !== 'string') return true;
   const v = value.trim();
   if (!v) return true;
   if (/^<.*>$/.test(v)) return true;
-  if (/^(replace|your|xxx+|test|placeholder|changeme|sk-xxx+|none|null|empty)/i.test(v)) return true;
-  if (/your[_-]?api/i.test(v)) return true;
+  if (PLACEHOLDER_KEY_RE.test(v)) return true;
   if (/[\u4e00-\u9fff]/.test(v)) return true; // 含中文 = 未替换的模板文案
   return false;
 }
@@ -386,11 +397,27 @@ function readConfigFile(file, problems, label) {
 // 只拷贝 DEFAULTS 里登记的键：旧版配置残留（apiSource/baseUrl/apiKey/zcodeModel 等）
 // 自动失效、不再参与解析——0.2.17 起端点/key 一律来自 ZCode 服务商，插件配置里的旧值
 // 若继续生效会造成"key 与端点交叉"（手动 key 发往服务商端点）。
+// 键判定用 Object.hasOwn：`k in DEFAULTS` 会放行 __proto__/constructor 等原型链键。
+// 类型与 env 层同口径：手写 JSON 常把布尔/数字写成字符串（"startEnabled": "false" 是真值）。
+// maxTokens 不在此转换——它有专用守卫（接受字符串数字、0 哨兵、垃圾值登记回退）。
 function applyLayer(cfg, raw, problems) {
   if (!raw || typeof raw !== 'object') return;
   for (const [k, v] of Object.entries(raw)) {
-    if (!(k in DEFAULTS)) continue;
-    cfg[k] = v;
+    if (!Object.hasOwn(DEFAULTS, k)) continue;
+    if (BOOL_KEYS.includes(k) && typeof v !== 'boolean') {
+      const b = toBool(v, null);
+      if (b === null) {
+        problems.push(`config_normalized: ${k}=${JSON.stringify(v)} 不是布尔值，已忽略（保持 ${cfg[k]}）`);
+        continue;
+      }
+      cfg[k] = b;
+    } else if (INT_KEYS.includes(k) && k !== 'maxTokens' && typeof v === 'string') {
+      cfg[k] = toInt(v, NaN); // 非数字串 → NaN，交由下方范围守卫登记并回退默认
+    } else if (FLOAT_KEYS.includes(k) && typeof v === 'string') {
+      cfg[k] = toFloat(v, cfg[k]);
+    } else {
+      cfg[k] = v;
+    }
   }
 }
 
@@ -405,12 +432,12 @@ function loadConfig(pluginRoot, env) {
 
   const pluginCfg = readConfigFile(path.join(pluginRoot, 'advisor.config.json'), problems, '插件目录 advisor.config.json');
   if (pluginCfg) {
-    applyLayer(cfg, pluginCfg);
+    applyLayer(cfg, pluginCfg, problems);
     sources.push('plugin:advisor.config.json');
   }
   const userCfg = readConfigFile(userConfigPath(env), problems, '用户级 ~/.zcode/advisor.config.json');
   if (userCfg) {
-    applyLayer(cfg, userCfg);
+    applyLayer(cfg, userCfg, problems);
     sources.push('user:~/.zcode/advisor.config.json');
   }
 
@@ -546,14 +573,21 @@ function gate(cfg, apiKeyInfo) {
   return reasons;
 }
 
+// 本机端点判定：URL 解析后 hostname 精确比较（前缀匹配会放过 127.evil.com / localhost.attacker.com）。
+// WHATWG URL 已把 IPv4 规范化（如 0x7f.1 → 127.0.0.1），IPv6 hostname 带方括号。
+function isLoopbackUrl(url) {
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return false; }
+  if (host === 'localhost' || host === '[::1]') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
 // 非阻断性配置警告（发往任意端点的风险提示，由 status/注册行展示）。
 function configWarnings(cfg, apiKeyInfo) {
   const warnings = [];
   const url = String(cfg.baseUrl || '');
-  if (url.startsWith('http://')) {
-    const m = /^http:\/\/([^/:]+)/.exec(url);
-    const host = m ? m[1] : '';
-    if (!/^(localhost|127\.|::1|\[::1\])/i.test(host)) {
+  if (/^http:\/\//i.test(url)) {
+    if (!isLoopbackUrl(url)) {
       warnings.push('insecure_http_endpoint: 转录与 key 将明文发送到非本机 HTTP 端点');
     }
   }
