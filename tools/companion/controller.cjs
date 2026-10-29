@@ -452,6 +452,21 @@ function createLockExclusive(lockFile, cdpPort) {
 }
 
 let lockHeartbeat = null;
+// 本进程是否**真的**持有单实例锁。acquireLock 在写锁失败时会降级为「无锁继续启动」
+// 并返回 true——此时不能起心跳：读回的 pid 永远是 0 → unknown → lost → 约 40s 后
+// 自杀退出，受监督时被 launchd 拉起又自杀，形成重启循环。
+let lockHeld = false;
+// 退出时清理自己持有的锁；acquireLock 首次真正拿到锁或心跳重新夺回锁时注册一次。
+let lockExitHookInstalled = false;
+function installLockExitHook(lockFile) {
+  if (lockExitHookInstalled) return;
+  lockExitHookInstalled = true;
+  process.on('exit', () => {
+    try {
+      if (readLockInfo(lockFile).pid === process.pid) fs.unlinkSync(lockFile);
+    } catch (_) {}
+  });
+}
 // 心跳决策（纯函数，便于单测）：
 //   renew   = 锁仍是自己的 → 续租
 //   lost    = 锁属于另一个 pid → 已被接管，本进程必须退场（否则成为继续 rescan/注入/
@@ -463,17 +478,64 @@ function heartbeatDecision(curPid, myPid, prevUnknown) {
   return prevUnknown ? 'lost' : 'unknown';
 }
 
+// 心跳单拍（可单测）：返回 renew / retaken / unknown / lost。
+// 只有「锁明确属于另一个 pid」才返回 lost（heartbeatDecision 的 curPid>0 语义不变）；
+// 读不到 pid（锁文件被外部删除 / 空或损坏内容）时先尝试把锁夺回来，而不是自杀：
+//   - 文件不存在 → createLockExclusive 排他重建（并发下仍只有一个赢家）；
+//   - 文件存在但无 pid → 第一拍按 unknown 跳过（可能是对手 O_EXCL 刚建未写完），
+//     连续第二拍仍是垃圾 → writeLock 原子覆盖夺回；
+//   - 夺回时 EEXIST / 回读发现别人的 pid → lost；IO 错误 → unknown（保持运行）。
+function lockHeartbeatTick(state, lockFile, cdpPort) {
+  const me = process.pid;
+  const cur = readLockInfo(lockFile);
+  const decision = heartbeatDecision(cur.pid, me, state.prevUnknown);
+  if (decision === 'renew') {
+    state.prevUnknown = false;
+    writeLock(lockFile, cdpPort);
+    return 'renew';
+  }
+  if (cur.pid > 0) return 'lost'; // 另一个 pid 持锁：已被接管
+  let retaken = false;
+  try {
+    if (!fs.existsSync(lockFile)) {
+      retaken = createLockExclusive(lockFile, cdpPort);
+    } else if (state.prevUnknown) {
+      retaken = writeLock(lockFile, cdpPort);
+    } else {
+      state.prevUnknown = true;
+      return 'unknown';
+    }
+  } catch (_) {
+    state.prevUnknown = true;
+    return 'unknown';
+  }
+  const after = readLockInfo(lockFile).pid;
+  if (retaken && after === me) {
+    state.prevUnknown = false;
+    lockHeld = true;
+    installLockExitHook(lockFile);
+    return 'retaken';
+  }
+  if (after > 0 && after !== me) return 'lost';
+  state.prevUnknown = true;
+  return 'unknown';
+}
+
 // 持锁者心跳：续租（刷新 started）并把当前 CDP 端口写进租约——证明服务确实可用。
+// 未真正持锁（acquireLock 降级为无锁模式）时不起心跳：否则读回 pid=0 → lost → 自杀。
 function startLockHeartbeat(cdpPortRef) {
   if (lockHeartbeat) clearInterval(lockHeartbeat);
-  let prevUnknown = false;
+  lockHeartbeat = null;
+  if (!lockHeld) {
+    log('未持有单实例锁（无锁降级模式）——不启动锁心跳');
+    return false;
+  }
+  const state = { prevUnknown: false };
   lockHeartbeat = setInterval(() => {
     let decision = 'renew';
     try {
-      const cur = readLockInfo(LOCK_FILE);
-      decision = heartbeatDecision(cur.pid, process.pid, prevUnknown);
-      prevUnknown = decision === 'unknown';
-      if (decision === 'renew') writeLock(LOCK_FILE, cdpPortRef.value);
+      decision = lockHeartbeatTick(state, LOCK_FILE, cdpPortRef.value);
+      if (decision === 'retaken') log('单实例锁文件丢失/损坏——已重新持锁');
     } catch (_) {}
     // 长时间运行也要控日志体积：启动点截断之外，每拍心跳复查一次（stat 一次，开销可忽略）。
     rotateLogIfLarge();
@@ -538,6 +600,8 @@ function acquireLock() {
       try {
         writeLock(LOCK_FILE, cur.cdp || 0);
       } catch (_) {}
+      lockHeld = true;
+      installLockExitHook(LOCK_FILE);
       return true;
     }
     if (cur.pid && !isStale(cur)) {
@@ -616,17 +680,16 @@ function acquireLock() {
       }
     } catch (e) {
       // 写锁失败不应致命（如 tmpdir 只读）：记录后继续，行为退化为旧版（无锁保护）
+      // 注意：此时并未持锁（lockHeld=false）→ startLockHeartbeat 不会起心跳，避免自杀重启循环。
       log(`写单实例锁失败（${String(e).slice(0, 80)}）——继续启动，但可能多实例`);
+      lockHeld = false;
       return true;
     } finally {
       releaseStealGuard();
     }
     if (won) {
-      process.on('exit', () => {
-        try {
-          if (readLockInfo(LOCK_FILE).pid === process.pid) fs.unlinkSync(LOCK_FILE);
-        } catch (_) {}
-      });
+      lockHeld = true;
+      installLockExitHook(LOCK_FILE);
       return true;
     }
   }
@@ -2185,4 +2248,4 @@ module.exports = { findZcodePath, normalizeChatEndpoint, normalizeMessagesEndpoi
   CDP_RISK_NOTICE, USER_ACTIONS, HISTORY_MAX_LINES,
   // 供单测直接验证单实例锁与主实例探测（不启动进程）
   _internal: { readLockInfo, isStale, writeLock, acquireLock, hostInstanceRunning, exitCodeFor, classifySpawnError, RETRY_EXIT_CODE, SUPERVISED, LOCK_FILE, LOCK_TTL_MS, LOCK_ZOMBIE_GRACE_MS,
-    isGarbageLockStale, heartbeatDecision, rotateLogIfLarge, runNodeScript, cdpLostDecision, withConfigLock, sanitizeSessionIdForState } };
+    isGarbageLockStale, heartbeatDecision, lockHeartbeatTick, startLockHeartbeat, isLockHeld: () => lockHeld, rotateLogIfLarge, runNodeScript, cdpLostDecision, withConfigLock, sanitizeSessionIdForState } };

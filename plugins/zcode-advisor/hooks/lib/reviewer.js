@@ -542,14 +542,42 @@ async function callReviewer(params) {
     return { error: 'llm_error', detail: `response_too_large: content-length=${lenHeader}` };
   }
 
+  // 流式读取：分块传输无 content-length 时，resp.text() 会把整个 body 先缓冲进内存才能复核，
+  // 上限形同虚设。有 body 流就按字节累加，一超限立即 cancel；长度一律按 UTF-8 字节计
+  // （String.length 是 UTF-16 码元，多字节内容会被低估）。超限不走 abort 信号——
+  // 那会让 timedOut() 误判为截止超时。
+  const readCapped = async () => {
+    const reader = resp.body && typeof resp.body.getReader === 'function' ? resp.body.getReader() : null;
+    if (!reader) {
+      const raw = String((await resp.text()) ?? '');
+      const bytes = Buffer.byteLength(raw, 'utf8');
+      return bytes > MAX_RESPONSE_BYTES ? { tooLarge: bytes } : { raw };
+    }
+    const decoder = new TextDecoder('utf-8');
+    let total = 0;
+    let raw = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        try { await reader.cancel(); } catch (_) { /* 取消失败不影响返回 */ }
+        return { tooLarge: total };
+      }
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+    return { raw };
+  };
+
   try {
     let data;
-    if (typeof resp.text === 'function') {
-      const r = await consumeBody(resp.text());
+    if (typeof resp.text === 'function' || (resp.body && typeof resp.body.getReader === 'function')) {
+      const r = await consumeBody(readCapped());
       if (!r.ok) return { error: 'llm_timeout' };
-      const raw = String(r.value == null ? '' : r.value);
-      if (raw.length > MAX_RESPONSE_BYTES) return { error: 'llm_error', detail: `response_too_large: length=${raw.length}` };
-      data = JSON.parse(raw);
+      if (r.value.tooLarge) return { error: 'llm_error', detail: `response_too_large: length=${r.value.tooLarge}` };
+      data = JSON.parse(r.value.raw);
     } else {
       // 仅测试桩可能缺 text()；真实 fetch Response 必有。
       const parsed = await consumeBody(resp.json());
@@ -769,7 +797,7 @@ async function probeModel(target, opts, deps) {
     batchMs: batchCap,
     passed,
     failed: ran - passed,
-    passRate: n > 0 ? passed / n : 0,
+    passRate: ran > 0 ? passed / ran : 0, // 按实际跑完的次数算：整批预算截断时不把没跑的算作失败
     ms: { min: sorted[0] || 0, median: percentile(sorted, 50), p90: percentile(sorted, 90), max: sorted[sorted.length - 1] || 0 },
     failures,
     severities

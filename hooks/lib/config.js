@@ -345,8 +345,12 @@ function applyZcodeTarget(cfg, problems, sources, notices, env) {
 // 整值匹配而非前缀：`test-abc123realkey`、`your-co-gw-77aa`、`none-9f8e` 这类真实 key 不得被误判。
 const PLACEHOLDER_KEY_RE = new RegExp('^(?:'
   + 'replace(?:[_-]?(?:me|your|with|this|key|api|token|here))*'   // REPLACE_ME / REPLACE_YOUR_KEY
-  + '|your[_-]?(?:own[_-]?)?(?:api[_-]?)?(?:key|token|secret)(?:[_-]?here)?' // your-api-key / your_key_here
-  + '|(?:sk-)?x{3,}'                                                // xxx / sk-xxxx
+  // your-api-key / your_key_here / your-openai-api-key / your_deepseek_key / sk-your-key / YOUR_API_KEY
+  // 中间段只允许纯字母词（openai/deepseek/own…），`your-co-gw-77aa` 这类含数字的真实 key 不命中。
+  + '|(?:sk-(?:proj-)?)?your(?:[_-][a-z]+)*?[_-]?(?:key|token|secret)(?:[_-]?here)?'
+  + '|(?:sk-(?:proj-)?)?(?:x{3,}|\\.{3,})'                          // xxx / sk-xxxx / sk-proj-xxxx / sk-...
+  + '|(?:[a-z]+[_-])*(?:key|token|secret)[_-]here'                  // api-key-here / key_here
+  + '|key|api[_-]?key|token|secret'                                 // <key> 去括号后 / 裸词
   + '|test(?:[_-]?(?:api))?(?:[_-]?(?:key|token))?'                 // test / test-key / test_api_key
   + '|placeholder|changeme|change[_-]me|none|null|empty|undefined|todo|dummy|fake'
   + ')$', 'i');

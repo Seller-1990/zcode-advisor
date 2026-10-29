@@ -63,12 +63,13 @@ function retype(tar, flag) {
   return buf;
 }
 
-test('archive.readTarGz：GNU 长名 / PAX 路径头明确报错，纯元数据 PAX 头可忽略', () => {
+test('archive.readTarGz：GNU 长名 / PAX 路径头不再报错（套用到下一条，见 p4），纯元数据 PAX 头可忽略', () => {
+  // 扩展头本身不产出条目；其后无真实条目时结果为空（P4 起不再抛错）
   const gnu = retype(archive.buildTar([{ path: 'longname', data: 'some/very/long/path' }]), 'L');
-  assert.throws(() => archive.readTarGz(zlib.gzipSync(gnu)), /GNU/);
+  assert.deepStrictEqual(archive.readTarGz(zlib.gzipSync(gnu)), []);
 
   const paxPath = retype(archive.buildTar([{ path: 'pax', data: '13 path=long\n' }]), 'x');
-  assert.throws(() => archive.readTarGz(zlib.gzipSync(paxPath)), /PAX/);
+  assert.deepStrictEqual(archive.readTarGz(zlib.gzipSync(paxPath)), []);
 
   const paxMeta = retype(archive.buildTar([
     { path: 'pax', data: '12 mtime=10\n' },

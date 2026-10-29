@@ -252,8 +252,12 @@ HOP_TIMEOUT="${OCR_REVIEW_HOP_TIMEOUT:-900}"
 TOTAL_BUDGET="${OCR_REVIEW_TOTAL_BUDGET:-5400}"
 # 非正整数（如 "15m"、空串、0）会让 run_with_deadline 的算术比较失效 → 等于没有超时。
 # 一律回落默认值并提示，不让一个手滑的环境变量把挂起保护悄悄关掉。
-case "$HOP_TIMEOUT" in ''|*[!0-9]*|0) echo "（OCR_REVIEW_HOP_TIMEOUT=${HOP_TIMEOUT} 非正整数，改用 900）" >&2; HOP_TIMEOUT=900 ;; esac
-case "$TOTAL_BUDGET" in ''|*[!0-9]*|0) echo "（OCR_REVIEW_TOTAL_BUDGET=${TOTAL_BUDGET} 非正整数，改用 5400）" >&2; TOTAL_BUDGET=5400 ;; esac
+# 全零（"00"）也拒：GNU timeout 把 0 当"不限时"。合法值再用 10# 归一化去前导零——
+# 否则 "08"/"09" 在 bash 算术里按八进制解析直接报错。
+case "$HOP_TIMEOUT" in ''|*[!0-9]*|*[!0]*) ;; *) HOP_TIMEOUT=0 ;; esac
+case "$HOP_TIMEOUT" in ''|*[!0-9]*|0) echo "（OCR_REVIEW_HOP_TIMEOUT=${OCR_REVIEW_HOP_TIMEOUT:-} 非正整数，改用 900）" >&2; HOP_TIMEOUT=900 ;; *) HOP_TIMEOUT=$((10#$HOP_TIMEOUT)) ;; esac
+case "$TOTAL_BUDGET" in ''|*[!0-9]*|*[!0]*) ;; *) TOTAL_BUDGET=0 ;; esac
+case "$TOTAL_BUDGET" in ''|*[!0-9]*|0) echo "（OCR_REVIEW_TOTAL_BUDGET=${OCR_REVIEW_TOTAL_BUDGET:-} 非正整数，改用 5400）" >&2; TOTAL_BUDGET=5400 ;; *) TOTAL_BUDGET=$((10#$TOTAL_BUDGET)) ;; esac
 CHAIN_START="$(date +%s)"
 
 # 上游限流与资产噪音的稳定参数（都是实测踩出来的教训，不是默认值拍脑袋）：

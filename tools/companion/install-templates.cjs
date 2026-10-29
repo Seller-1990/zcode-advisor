@@ -255,11 +255,44 @@ fi
 APP_TMP="$APP_DST.installing.$$"
 rm -rf "$APP_TMP"
 if cp -R "$APP_SRC" "$APP_TMP" 2>/dev/null; then
-  if [ -d "$APP_DST" ]; then
+  # 旧版先整体挪到旁边（同目录 rename，原子），新版就位后再删；新版就位失败则把旧版放回。
+  # 不能直接 rm -rf 旧版：删到一半失败会留下残目录，随后 mv 会把新包挪进旧包**里面**
+  # （mv 目标是已存在目录时语义变成「移入」），脚本却照样报告安装成功。
+  APP_OLD=""
+  if [ -e "$APP_DST" ] || [ -L "$APP_DST" ]; then
     echo "检测到已安装的旧版本，正在替换…"
-    rm -rf "$APP_DST"
+    APP_OLD="$APP_DST.old.$$"
+    rm -rf "$APP_OLD" 2>/dev/null || true
+    if ! mv "$APP_DST" "$APP_OLD" 2>/dev/null; then
+      APP_OLD=""
+      # 挪不走旧版：退回直接删除（新版已在临时位置备好），但必须确认删干净才继续。
+      rm -rf "$APP_DST" 2>/dev/null || true
+      if [ -e "$APP_DST" ] || [ -L "$APP_DST" ]; then
+        rm -rf "$APP_TMP" 2>/dev/null || true
+        echo "[错误] 无法移除 /Applications 中的旧版本（可能没有写权限或应用正在运行）。" >&2
+        read -r -p "按回车关闭…" _ || true
+        exit 1
+      fi
+    fi
   fi
-  mv "$APP_TMP" "$APP_DST" || { rm -rf "$APP_TMP"; echo "[错误] 替换 /Applications 中的旧版本失败。" >&2; read -r -p "按回车关闭…" _ || true; exit 1; }
+  if ! mv "$APP_TMP" "$APP_DST" 2>/dev/null; then
+    rm -rf "$APP_TMP" 2>/dev/null || true
+    if [ -n "$APP_OLD" ]; then
+      rm -rf "$APP_DST" 2>/dev/null || true
+      if mv "$APP_OLD" "$APP_DST" 2>/dev/null; then
+        echo "[错误] 新版本就位失败，已恢复原有版本。" >&2
+      else
+        echo "[错误] 新版本就位失败，且旧版本未能放回；旧版本保留在：$APP_OLD" >&2
+      fi
+    else
+      echo "[错误] 替换 /Applications 中的旧版本失败。" >&2
+    fi
+    read -r -p "按回车关闭…" _ || true
+    exit 1
+  fi
+  if [ -n "$APP_OLD" ]; then
+    rm -rf "$APP_OLD" 2>/dev/null || echo "[提示] 旧版本残留未能清理：$APP_OLD（可手动删除）" >&2
+  fi
   echo "已安装到 /Applications"
 else
   rm -rf "$APP_TMP" 2>/dev/null || true

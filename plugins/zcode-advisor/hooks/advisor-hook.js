@@ -344,6 +344,13 @@ const NOTE_DEDUPE_RING = 20;
 function noteDedupeHash(note) {
   return hashId(String(note || '').replace(/\s+/g, ' ').trim().toLowerCase());
 }
+// 被 enqueueNote 挤掉的意见从未送达：撤回其去重哈希，允许下一轮快照重审时重新入队。
+// 入参是带严重级前缀的完整意见（`[advisor:<sev>[:deferred]] 正文`），哈希只按正文算。
+function forgetNoteHash(s, fullNote) {
+  if (!Array.isArray(s.deliveredNoteHashes)) return;
+  const h = noteDedupeHash(String(fullNote || '').replace(/^\[advisor:[^\]]*\]/, ''));
+  s.deliveredNoteHashes = s.deliveredNoteHashes.filter((x) => x !== h);
+}
 
 // 清停机（成功审查 / ctl on / model set|provider|reset 共用）。真正从停机态恢复时
 // bump haltEpoch：在飞 worker 据此识别「派发后发生过停机/恢复」并丢弃过期结果。
@@ -1140,7 +1147,7 @@ async function onStopSync(ctx) {
         return;
       }
       const note = `${prefix} ${frame.note}`;
-      queued = enqueueNote(s, note, cfg, (reason) => bumpDrop(s, reason));
+      queued = enqueueNote(s, note, cfg, (reason) => bumpDrop(s, reason), (ev) => forgetNoteHash(s, ev));
       if (queued && decision.deferred === true) s.deferred = (s.deferred || 0) + 1;
       // 队列满被丢弃时不计入 steer/deferred（不设"幻影冷却"）。
       applyDeliveryToState(s, false, cfg);
@@ -1365,7 +1372,7 @@ async function handleReviewWorker(args) {
         s.lastAction = `deduped:${frame.severity}`;
         return;
       }
-      const queued = enqueueNote(s, note, cfg, (reason) => bumpDrop(s, reason));
+      const queued = enqueueNote(s, note, cfg, (reason) => bumpDrop(s, reason), (ev) => forgetNoteHash(s, ev));
       if (queued && noteHash) {
         const ring = Array.isArray(s.deliveredNoteHashes) ? s.deliveredNoteHashes : [];
         ring.push(noteHash);
@@ -1595,6 +1602,7 @@ async function handleCtl(args) {
       // 状态行，重置 halt 让 Stop 重新派发；审查本身会再次验证端点。
       wasHalted = s.halted === true;
       clearHalt(s);
+      s.deliveredNoteHashes = []; // 重新启用：去重环一并重置（不在 clearHalt 里清——它每次成功审查都会调用）
       s.enabled = true;
       const r = gateWithSession(cfg, s);
       reasons = r.reasons;
@@ -1646,6 +1654,7 @@ async function handleCtl(args) {
         // 换审查目标 = 停机原因（旧模型对端点 404）多半不再成立：一并清除停机。
         // 若新目标同样 404，worker 会重新停机并再次告知——代价可控，不赌用户的判断。
         clearHalt(s);
+        s.deliveredNoteHashes = []; // 换审查目标：新目标的意见不受旧去重环约束
       })) return;
       const parts = [];
       if (provider) parts.push(`服务商=${provider}`);
@@ -1663,6 +1672,7 @@ async function handleCtl(args) {
         s.sessionProvider = provider;
         s.sessionModel = ''; // 换服务商后旧模型多半不属于它：一并清掉，回落新服务商清单
         clearHalt(s);         // 换目标清停机，理由同 set 分支
+        s.deliveredNoteHashes = [];
       })) return;
       process.stdout.write(`advisor: 本会话服务商已固定为 ${provider}（模型已回落该服务商默认；用 model set <模型> 再指定）。恢复全局用 model reset。\n`);
       return;
@@ -1672,6 +1682,7 @@ async function handleCtl(args) {
         s.sessionModel = '';
         s.sessionProvider = '';
         clearHalt(s);       // 回全局默认同样是换目标：清停机
+        s.deliveredNoteHashes = [];
       })) return;
       const eff = resolveTarget(cfg, null, process.env);
       process.stdout.write(`advisor: 已清除本会话覆盖，回到全局默认（${eff.providerName || '（未解析出服务商）'} / ${eff.model || '（未定模型）'}）。\n`);

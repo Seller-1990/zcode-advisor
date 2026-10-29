@@ -71,7 +71,8 @@ const URGENT_PREFIX_RE = /^\[advisor:(?:concern|blocker)(?::deferred)?\]/;
 // 顺延入队。返回 false 表示队列已满被丢弃（调用方不得将其计为 steer/deferred）。
 // 队列满且新意见是 concern/blocker 时，挤掉最旧的一条 nit 给它让位（被挤掉的 nit 计 queue_overflow）；
 // 没有 nit 可挤或新意见本身不紧急时，照旧丢弃新意见。
-function enqueueNote(state, note, cfg, bumpDrop) {
+// onEvict(evictedNote)：可选，通知调用方被挤掉的意见（用于撤回其去重哈希——它从未送达）。
+function enqueueNote(state, note, cfg, bumpDrop, onEvict) {
   state.pendingNotes = Array.isArray(state.pendingNotes) ? state.pendingNotes : [];
   if (state.pendingNotes.length >= (cfg.pendingNotesCap || 5)) {
     const evictAt = URGENT_PREFIX_RE.test(String(note))
@@ -79,7 +80,8 @@ function enqueueNote(state, note, cfg, bumpDrop) {
       : -1;
     if (typeof bumpDrop === 'function') bumpDrop('queue_overflow');
     if (evictAt === -1) return false;
-    state.pendingNotes.splice(evictAt, 1);
+    const [evicted] = state.pendingNotes.splice(evictAt, 1);
+    if (typeof onEvict === 'function') onEvict(evicted);
   }
   state.pendingNotes.push(note);
   return true;

@@ -279,7 +279,7 @@ function computeTarChecksum(header) {
 }
 
 // 解析（可能 gzip 压缩的）tar，返回 [{ path, data, mode, type }]。
-// 只支持 ustar 普通文件与目录；遇到改写路径的 PAX/GNU 长名扩展直接抛错（官方 Node 发行包是 ustar）。
+// 只提取普通文件与目录；GNU L 长名与 PAX x 的 path= 套用到下一条，K/linkpath/g 忽略。
 //
 // 完整性（R16）：先验头校验和，再验 size 是否超出实际数据。缺了这两步，`subarray` 在
 // 数据不足时会**静默返回短 buffer**，于是损坏/截断的发行包会被当成好包提取出半截 node
@@ -288,6 +288,7 @@ function readTarGz(input) {
   const buf = zlib.gunzipSync(input);
   const entries = [];
   let pos = 0;
+  let pendingName = null; // 上一条 GNU L / PAX x 头给出的完整路径
   while (pos + TAR_BLOCK <= buf.length) {
     const header = buf.subarray(pos, pos + TAR_BLOCK);
     // 双零块 → 结束
@@ -312,22 +313,24 @@ function readTarGz(input) {
     if (size > 0 && pos + size > buf.length) {
       throw new Error(`archive: tar 数据区被截断（${name || '?'}：声明 ${size} 字节，实际仅剩 ${buf.length - pos}）—— 归档已损坏`);
     }
-    // GNU 长名（L/K）与 PAX 头（x 单条 / g 全局）会改写后续条目的路径；不支持就必须报错，
-    // 否则下一条会用截断的 ustar 名提取，找不到目标文件时只表现为"缺 node"。
-    if (type === 'L' || type === 'K') {
-      throw new Error(`archive: 不支持 GNU 长文件名扩展（typeflag ${type}，${name || '?'}）`);
-    }
-    if (type === 'x' || type === 'g') {
-      // 只带 mtime/uid 等元数据的 PAX 头可安全忽略；一旦改写 path/linkpath 就无法正确提取
+    // GNU 长名（L）与 PAX 单条头（x 的 path=）改写**下一条**的路径：记下来套到下一条上，
+    // 否则下一条会用截断的 ustar 名提取。K/linkpath 只影响链接目标（我们不提取链接），忽略。
+    // g（全局 PAX）的 path 无标准语义，同样忽略。最终名仍经 sanitizeEntryPath 防穿越。
+    if (type === 'L') {
+      pendingName = buf.subarray(pos, pos + size).toString('utf8').replace(/\0.*$/s, '');
+    } else if (type === 'x') {
       const pax = buf.subarray(pos, pos + size).toString('utf8');
-      if (/(^|\n)\d+ (path|linkpath)=/.test(pax)) {
-        throw new Error(`archive: 不支持 PAX 路径扩展（typeflag ${type}，${name || '?'}）`);
+      const m = /(?:^|\n)\d+ path=([^\n]*)\n/.exec(pax);
+      if (m) pendingName = m[1];
+    } else if (type !== 'K' && type !== 'g') {
+      const finalName = pendingName !== null ? pendingName : name;
+      pendingName = null;
+      if (type === '0' || type === '\0' || type === '') {
+        entries.push({ path: sanitizeEntryPath(finalName), data: buf.subarray(pos, pos + size), mode, type: 'file' });
+      } else if (type === '5' && finalName.replace(/[./]/g, '') !== '') {
+        // 根目录条目（"./"）规整后为空，跳过而不是报错
+        entries.push({ path: sanitizeEntryPath(finalName), data: Buffer.alloc(0), mode, type: 'dir' });
       }
-    }
-    if (type === '0' || type === '\0' || type === '') {
-      entries.push({ path: name, data: buf.subarray(pos, pos + size), mode, type: 'file' });
-    } else if (type === '5') {
-      entries.push({ path: name, data: Buffer.alloc(0), mode, type: 'dir' });
     }
     // 数据区按 512 对齐
     pos += Math.ceil(size / TAR_BLOCK) * TAR_BLOCK;

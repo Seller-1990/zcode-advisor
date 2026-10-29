@@ -122,7 +122,8 @@ test('icon-alpha：main 中自检位于写盘之前', () => {
 test('NSIS：安装目录必须以 \\ZCodeAdvisor 结尾，卸载递归删除受同一条件保护', () => {
   const { nsisScript } = require('../tools/companion/packagers.cjs');
   const nsi = nsisScript({ outFile: 'out.exe', iconPath: 'a.ico', srcDirName: 'stage', version: '1.2.3' });
-  assert.match(nsi, /Function \.onVerifyInstDir\n\s+StrCpy \$0 "\$INSTDIR" "" -13\n\s+StrCmp \$0 "\\ZCodeAdvisor" \+2 0\n\s+Abort\nFunctionEnd/);
+  // 先去掉末尾反斜杠（$1 为去尾后的副本），再比较后 13 位
+  assert.match(nsi, /Function \.onVerifyInstDir\n\s+StrCpy \$1 "\$INSTDIR"\n\s+StrCpy \$0 "\$1" "" -1\n\s+StrCmp \$0 "\\" 0 \+2\n\s+StrCpy \$1 "\$1" -1\n\s+StrCpy \$0 "\$1" "" -13\n\s+StrCmp \$0 "\\ZCodeAdvisor" \+2 0\n\s+Abort\nFunctionEnd/);
   assert.equal('\\ZCodeAdvisor'.length, 13);
   const un = nsi.slice(nsi.indexOf('Section "Uninstall"'), nsi.indexOf('SectionEnd', nsi.indexOf('Section "Uninstall"')));
   // 只统计指令行（NSIS 注释以 ; 开头，注释里提及旧行为不算）
